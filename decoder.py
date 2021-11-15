@@ -1,8 +1,10 @@
+from collections import namedtuple
 from .nvcuvid import * 
 from .cuda import call as CUDAcall
 import pycuda.driver as cuda
 from . import utils
 import numpy as np
+from time import sleep
 import sys
 
 import logging
@@ -27,28 +29,49 @@ answer: we should handle it. Because it HAS to be the same context throughout th
 '''
 
 class Surface:
-    def __init__(self, devptr, pitch, decoder, ctx):
-        self.devptr = devptr
-        self.pitch = pitch
+    Plane = namedtuple('Plane', ['name', 'devptr', 'pitch', 'height', 'width', 'dtype'])
+    def __init__(self, devptr, pitch, decoder):
+        self.devptr = devptr.value
+        self.pitch = pitch.value
         self.decoder = decoder
-        self.ctx = ctx
 
     def __del__(self):
-        self.ctx.push()
-        CUDAcall(nvcuvid.cuvidUnmapVideoFrame, self.decoder.decoder, self.devptr)
-        self.ctx.pop()
+        self.decoder.ctx.push()
+        devptr = c_ulonglong(self.devptr)
+        log.warning(f'trying to unmap {devptr}')
+        CUDAcall(nvcuvid.cuvidUnmapVideoFrame64, self.decoder.decoder, devptr)
+        self.decoder.ctx.pop()
+
+    def planes(self):
+        if self.decoder.decode_create_info.OutputFormat == cudaVideoSurfaceFormat.NV12:
+            return (
+                Surface.Plane('Y', self.devptr, self.pitch, self.decoder.decode_create_info.ulTargetHeight, self.decoder.decode_create_info.ulTargetWidth, np.uint8),
+                Surface.Plane('UV', self.devptr + self.pitch * self.decoder.decode_create_info.ulTargetHeight, self.pitch, self.decoder.decode_create_info.ulTargetHeight // 2, self.decoder.decode_create_info.ulTargetWidth, np.uint8)
+            )
+        else:
+            raise NotImplementedError()
+        
+class Picture:
+    def __init__(self, index, params, timestamp, decoder):
+        self.index = index
+        self.params = params
+        self.timestamp = timestamp
+        self.decoder = decoder
+    
+    def __del__(self):
+        self.decoder.pictures[self.index] = False
+
+    def map(self, stream = None):
+        p = self.params
+        log.warning(f'using stream {stream.handle}')
+        p.stream = stream.handle if stream else None
+        pointer = c_ulonglong() # according to cuviddec, the argument type of cuvidmapvideoframe64
+        pitch = c_uint()
+        CUDAcall(nvcuvid.cuvidMapVideoFrame64, self.decoder.decoder, self.index, byref(pointer), byref(pitch), byref(p))
+        return Surface(pointer, pitch, self.decoder)
 
 class Decoder:
     cuda.init()
-    class Picture:
-        def __init__(self, index, params, timestamp, pictures):
-            self.index = index
-            self.params = params
-            self.timestamp = timestamp
-            self.pictures = pictures
-        
-        def __del__(self):
-            self.pictures[self.index] = False
 
     '''
     wrapper for callbacks, so they return the error code as expected by cuvid
@@ -113,14 +136,17 @@ class Decoder:
             DeinterlaceMode = cudaVideoDeinterlaceMode.Weave if vf.progressive_sequence else cudaVideoDeinterlaceMode.Adaptive,
             ulTargetWidth = vf.coded_width,
             ulTargetHeight = vf.coded_height,
-            ulNumOutputSurfaces = 2,
+            ulNumOutputSurfaces = self.surfaces,
             vidLock = None,
             enableHistogram = 0
         )
 
+        # for field_name, filed_type in p._fields_:
+        #     print(field_name, getattr(p, field_name))
+
         CUDAcall(nvcuvid.cuvidCreateDecoder, byref(self.decoder), byref(p))
         log.debug(f'created decoder: {p}')
-        self.pictures = [False] * vf.min_num_decode_surfaces        
+        self.pictures = [False] * ulNumDecodeSurfaces      
         self.decode_create_info = p # save for user use
         self.ctx.pop()
         log.debug('sequence successful')
@@ -130,6 +156,7 @@ class Decoder:
         log.debug('decode')
         pp = cast(pPicParams, POINTER(CUVIDPICPARAMS)).contents
         assert self.decoder, "decoder not initialized"
+        log.warning(f'decode picture index: {pp.CurrPicIdx}')
         if self.pictures[pp.CurrPicIdx]:
             # picture still refered
             raise Exception("old picture still refered, consider increasing extra_pictures")
@@ -141,6 +168,7 @@ class Decoder:
 
     def handlePictureDisplay(self, pUserData, pDispInfo):
         log.debug('display')
+        self.ctx.push() # context pushed for the user callback
         di = cast(pDispInfo, POINTER(CUVIDPARSERDISPINFO)).contents
         p = CUVIDPROCPARAMS(
             progressive_frame=di.progressive_frame,
@@ -149,7 +177,8 @@ class Decoder:
             unpaired_field=di.repeat_first_field < 0
         )
 
-        self.display_callback(Decoder.Picture(di.picture_index, p, di.timestamp, self.pictures))
+        self.display_callback(Picture(di.picture_index, p, di.timestamp, self))
+        self.ctx.pop()
         return 1
 
     '''
@@ -164,10 +193,11 @@ class Decoder:
                 return self.operating_point | (1 << 10 if self.disp_all_layers else 0)
         return -1
 
-    def __init__(self, ctx: cuda.Context, display_callback, select_surface_format = utils.select_surface_format, extra_pictures = 0):
+    def __init__(self, ctx: cuda.Context, display_callback, select_surface_format = utils.select_surface_format, extra_pictures = 0, surfaces = 2):
         self.ctx = ctx
         assert extra_pictures >= 0, "extra pictures must be non-negative"
         self.extra_pictures = extra_pictures
+        self.surfaces = surfaces
         self.exception = None
 
         self.display_callback = display_callback
@@ -219,17 +249,11 @@ class Decoder:
             self.exception = None
             raise e
 
-    def map(self, picture, stream = None):
-        p = picture.params
-        p.stream = stream.handle if stream else None
-        pointer = c_uint() # according to cuviddec, the argument type of cuvidmapvideoframe
-        pitch = c_uint()
-        CUDAcall(nvcuvid.cuvidMapVideoFrame, self.decoder, picture.index, byref(pointer), byref(pitch), byref(p))
-        return Surface(pointer, pitch)
+
 
     def __del__(self):
         if self.parser:
             CUDAcall(nvcuvid.cuvidDestroyVideoParser, self.parser)
         if self.decoder:
-            CUDAcall(nvcuvid.cuvidDestroyVideoDecoder, self.decoder)
+            CUDAcall(nvcuvid.cuvidDestroyDecoder, self.decoder)
 
