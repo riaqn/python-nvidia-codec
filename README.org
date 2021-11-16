@@ -17,3 +17,6 @@ Comparison to Video-Processing-Framework
 - TODO Cropping and scaling support in postprocessing
 - TODO Color space conversion from YUV (bt. 601/709, full-range/limit-range) to RGB using =pycuda=
 - Encoder
+
+* Acknowledgements
+Many thanks to @rarzumanyan for all the helps and explanations!
