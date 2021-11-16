@@ -27,7 +27,7 @@ def test(path):
         nonlocal idx
         idx += 1
         pts = picture.timestamp
-        log.warning(f"display_callback: {pts}")
+        log.info(f"display_callback: {pts}")
         
         if idx % 60 > 0: # only save for every 60 frames
             return
@@ -38,9 +38,9 @@ def test(path):
         #custr.synchronize()
         # log.warning(time.time())
         y, uv = surface.planes()
-        print(y)
+        # print(y)
         arr_y = cuda.pagelocked_empty((y.height, y.width), dtype=y.dtype)# mem_flags=cuda.host_alloc_flags.DEVICEMAP)
-        print(arr_y.shape, arr_y.dtype)
+        # print(arr_y.shape, arr_y.dtype)
         memcpy = cuda.Memcpy2D()
         memcpy.set_src_device(y.devptr)
         memcpy.src_pitch = y.pitch
@@ -48,7 +48,7 @@ def test(path):
         memcpy.dst_pitch = y.width * np.dtype(y.dtype).itemsize
         memcpy.width_in_bytes = y.width * np.dtype(y.dtype).itemsize
         memcpy.height = y.height
-        print(memcpy.src_pitch, memcpy.dst_pitch, memcpy.width_in_bytes, memcpy.height)
+        # print(memcpy.src_pitch, memcpy.dst_pitch, memcpy.width_in_bytes, memcpy.height)
         memcpy(custr)
         # log.warning(time.time())
         custr.synchronize()
