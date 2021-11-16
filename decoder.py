@@ -37,8 +37,10 @@ class Surface:
 
     def __del__(self):
         self.decoder.ctx.push()
+        # catch: when interacting with C functions, for arguments must convert numbers to corresponding ctypes,
+        # for otherwise python just pass the pointers and cause errors
         devptr = c_ulonglong(self.devptr)
-        log.warning(f'trying to unmap {devptr}')
+        log.debug(f'trying to unmap {devptr}')
         CUDAcall(nvcuvid.cuvidUnmapVideoFrame64, self.decoder.decoder, devptr)
         self.decoder.ctx.pop()
 
@@ -63,7 +65,7 @@ class Picture:
 
     def map(self, stream = None):
         p = self.params
-        log.warning(f'using stream {stream.handle}')
+        log.debug(f'using stream {stream.handle}')
         p.stream = stream.handle if stream else None
         pointer = c_ulonglong() # according to cuviddec, the argument type of cuvidmapvideoframe64
         pitch = c_uint()
@@ -74,16 +76,18 @@ class Decoder:
     cuda.init()
 
     '''
-    wrapper for callbacks, so they return the error code as expected by cuvid
+    wrapper for callbacks, so they return the error code as expected by cuvid; 
+
     '''
     def catch_exception(self, func, return_on_error = 0):
         def wrapper(*args, **kwargs):
             try:
                 return func(*args, **kwargs)
             except BaseException as e: # catch keyboard interrupt as well
-                log.debug(f'callback exception logged {e}')
+                log.warning(f'callback exception logged {e}')
+                # we record the exception; to be checked when nvcuvid propagate the error return code
                 self.exception = e
-                log.debug(f'returning error code {return_on_error}')
+                log.warning(f'returning error code {return_on_error}')
                 return return_on_error
         return wrapper
 
@@ -156,7 +160,7 @@ class Decoder:
         log.debug('decode')
         pp = cast(pPicParams, POINTER(CUVIDPICPARAMS)).contents
         assert self.decoder, "decoder not initialized"
-        log.warning(f'decode picture index: {pp.CurrPicIdx}')
+        log.info(f'decode picture index: {pp.CurrPicIdx}')
         if self.pictures[pp.CurrPicIdx]:
             # picture still refered
             raise Exception("old picture still refered, consider increasing extra_pictures")
@@ -207,7 +211,7 @@ class Decoder:
         self.parser = CUvideoparser() # NULL, to be filled in next 
         self.decoder = CUvideodecoder() # NULL, to be filled in later        
 
-        self.handleVideoSequenceCallback = PFNVIDSEQUENCECALLBACK(self.catch_exception(self.handleVideoSequence, return_on_error=-1))
+        self.handleVideoSequenceCallback = PFNVIDSEQUENCECALLBACK(self.catch_exception(self.handleVideoSequence))
         self.handlePictureDecodeCallback = PFNVIDDECODECALLBACK(self.catch_exception(self.handlePictureDecode))
         self.handlePictureDisplayCallback = PFNVIDDISPLAYCALLBACK(self.catch_exception(self.handlePictureDisplay))
         self.handleOperatingPointCallback = PFNVIDOPPOINTCALLBACK(self.catch_exception(self.handleOperatingPoint, -1))
@@ -242,14 +246,15 @@ class Decoder:
             payload = arr.ctypes.data_as(POINTER(c_uint8)),
             timestamp = timestamp
             )
-        self.exception = None
         CUDAcall(nvcuvid.cuvidParseVideoData, self.parser, byref(p))
+        # catch: cuvidParseVideoData will not propagate error return code 0 of HandleVideoSequenceCallback
+        # it still returns CUDA_SUCCESS and simply ignore all future incoming packets
+        # therefore we must check the exception here, even if the last call succeeded
         if self.exception:
+            # the exception is caused by our callback, not by cuvid
             e = self.exception
             self.exception = None
             raise e
-
-
 
     def __del__(self):
         if self.parser:
