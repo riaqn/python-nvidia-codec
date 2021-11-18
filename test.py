@@ -20,7 +20,7 @@ def test(deviceID, path):
     container = av.open(path)
     stream = container.streams.video[0]
     trans = StreamTranslate(stream)
-    decoder = Decoder(ctx, trans.translate_codec(), extra_pictures=8)
+    decoder = Decoder(ctx, trans.translate_codec())
 
     # container.seek(int(600/stream.time_base), stream=stream)
     bar = tqdm(decoder.decode(trans.translate_packets(container.demux(stream), False)))
