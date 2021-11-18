@@ -16,11 +16,12 @@ def test(deviceID, path):
     cuda.init()    
     ctx = cuda.Device(deviceID).retain_primary_context()
 
-    decoder = Decoder(ctx)
 
     container = av.open(path)
     stream = container.streams.video[0]
     trans = StreamTranslate(stream)
+    decoder = Decoder(ctx, trans.translate_codec(), extra_pictures=8)
+
     # container.seek(int(600/stream.time_base), stream=stream)
     bar = tqdm(decoder.decode(trans.translate_packets(container.demux(stream), False)))
     for picture, pts in bar:

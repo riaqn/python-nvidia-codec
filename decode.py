@@ -110,10 +110,10 @@ class Decoder:
             try:
                 return func(*args, **kwargs)
             except BaseException as e: # catch keyboard interrupt as well
-                log.warning(f'callback exception logged {e}')
+                log.debug(f'callback exception logged {e}')
                 # we record the exception; to be checked when nvcuvid propagate the error return code
                 self.exception = e
-                log.warning(f'returning error code {return_on_error}')
+                log.debug(f'returning error code {return_on_error}')
                 return return_on_error
         return wrapper
 
@@ -236,7 +236,7 @@ class Decoder:
     note that both pictures and surfaces are pre-allocated when decoder is created.
     '''        
 
-    def __init__(self, ctx: cuda.Context, select_surface_format = select_surface_format, extra_pictures = 0, surfaces = 2):
+    def __init__(self, ctx: cuda.Context, codec: cudaVideoCodec, select_surface_format = select_surface_format, extra_pictures = 0, surfaces = 2):
         self.dirty = False
         self.on_recv = None
         self.ctx = ctx
@@ -255,7 +255,7 @@ class Decoder:
         self.handlePictureDisplayCallback = PFNVIDDISPLAYCALLBACK(self.catch_exception(self.handlePictureDisplay))
         self.handleOperatingPointCallback = PFNVIDOPPOINTCALLBACK(self.catch_exception(self.handleOperatingPoint, -1))
         p = CUVIDPARSERPARAMS(
-            CodecType=cudaVideoCodec.HEVC,
+            CodecType=codec,
             ulMaxNumDecodeSurfaces=0,
             pUserData=None,
             pfnSequenceCallback=self.handleVideoSequenceCallback,
