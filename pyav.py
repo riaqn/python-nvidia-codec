@@ -1,6 +1,10 @@
 import io
 import av
 
+'''
+depends on bitstream filters; not yet in pyav main branch
+only in https://github.com/PyAV-Org/PyAV/tree/bitstream
+'''
 class StreamTranslate:
     def __init__(self, stream):
         self.stream = stream
@@ -20,11 +24,13 @@ class StreamTranslate:
         self.out_container.start_encoding()
 
     '''
-    convert a pyav packet to iterator of (pts, bytes) where bytes is annex B packet that can be passed to decoder
+    convert a pyav packet to an iterator of (pts, bytes) where bytes is annex B packet that can be passed to decoder
 
-    bytes instead of memoryview, because then the packet can 
+    if copy is True, the result is copied to a new bytes and returned
+    if copy is False, the underlying buffer is returned directly; 
+    the caller must drop the returned reference before the next iteration
     '''
-    def translate_packet(self, packet):
+    def translate_packet(self, packet, copy = True):
         if packet.dts is None:
             # pyav generate NULL packet to flush we don't need
             return # empty iterator
@@ -35,4 +41,15 @@ class StreamTranslate:
                                     
             self.out_container.mux_one(bs)
             self.b.flush()
-            yield (bs.pts, self.b.getvalue())
+            buf = self.b.getbuffer()
+            yield (buf.getvalue() if copy else buf, bs.pts)
+            del buf # drop reference so b can be resized
+
+    '''
+    convert an iterator of pyav packets to an iterator of (pts, bytes) 
+    where bytes is annex B packet that can be passed to decoder
+    See translate_packet for copy parameter
+    '''
+    def translate_packets(self, packets, copy = True):
+        for packet in packets:
+            yield from self.translate_packet(packet, copy = copy)

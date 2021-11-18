@@ -2,7 +2,7 @@ from collections import namedtuple
 from .nvcuvid import * 
 from .cuda import call as CUDAcall
 import pycuda.driver as cuda
-from . import utils
+from queue import Queue
 import numpy as np
 from time import sleep
 import sys
@@ -11,7 +11,6 @@ import logging
 log = logging.getLogger(__name__)
 
 nvcuvid = cdll.LoadLibrary('libnvcuvid.so')
-
 
 '''
 Question: how do we utilize cuda streams for parallelism?
@@ -29,52 +28,79 @@ answer: we should handle it. Because it HAS to be the same context throughout th
 '''
 
 class Surface:
-    Plane = namedtuple('Plane', ['name', 'devptr', 'pitch', 'height', 'width', 'dtype'])
-    def __init__(self, devptr, pitch, decoder):
-        self.devptr = devptr.value
-        self.pitch = pitch.value
-        self.decoder = decoder
+    '''
+    don't call this yourself; call Picture.map
+    '''
+    def __init__(self, decoder, index, p):
+        self.decoder = decoder        
+        self.devptr = c_ulonglong() # according to cuviddec, the argument type of cuvidmapvideoframe64
+        self.pitch = c_uint()
+        CUDAcall(nvcuvid.cuvidMapVideoFrame64, decoder.decoder, index, byref(self.devptr), byref(self.pitch), byref(p))
 
     def __del__(self):
-        self.decoder.ctx.push()
         # catch: when interacting with C functions, for arguments must convert numbers to corresponding ctypes,
         # for otherwise python just pass the pointers and cause errors
-        devptr = c_ulonglong(self.devptr)
-        log.debug(f'trying to unmap {devptr}')
-        CUDAcall(nvcuvid.cuvidUnmapVideoFrame64, self.decoder.decoder, devptr)
-        self.decoder.ctx.pop()
+        log.debug(f'trying to unmap {self.devptr}')
+        if self.devptr:
+            self.decoder.ctx.push()
+            CUDAcall(nvcuvid.cuvidUnmapVideoFrame64, self.decoder.decoder, self.devptr)
+            self.decoder.ctx.pop()
 
-    def planes(self):
-        if self.decoder.decode_create_info.OutputFormat == cudaVideoSurfaceFormat.NV12:
-            return (
-                Surface.Plane('Y', self.devptr, self.pitch, self.decoder.decode_create_info.ulTargetHeight, self.decoder.decode_create_info.ulTargetWidth, np.uint8),
-                Surface.Plane('UV', self.devptr + self.pitch * self.decoder.decode_create_info.ulTargetHeight, self.pitch, self.decoder.decode_create_info.ulTargetHeight // 2, self.decoder.decode_create_info.ulTargetWidth, np.uint8)
-            )
-        else:
-            raise NotImplementedError()
+    @property
+    def format(self):
+        return self.decoder.decode_create_info.OutputFormat
         
+    @property
+    def width(self):
+        return self.decoder.decode_create_info.ulTargetWidth
+
+    @property
+    def height(self):
+        return self.decoder.decode_create_info.ulTargetHeight
+
 class Picture:
-    def __init__(self, index, params, timestamp, decoder):
-        self.index = index
+    def __init__(self, decoder, params):
+        self.decoder = decoder        
+        self.index = params.CurrPicIdx
+        assert self.index not in self.decoder.pictures, "old picture still refered, consider increasing extra_pictures"
+        self.decoder.pictures.add(self.index)
+        CUDAcall(nvcuvid.cuvidDecodePicture, self.decoder.decoder, byref(params))
+
+    def on_display(self, params):
         self.params = params
-        self.timestamp = timestamp
-        self.decoder = decoder
     
     def __del__(self):
-        self.decoder.pictures[self.index] = False
+        self.decoder.pictures.remove(self.index)
 
     def map(self, stream = None):
-        p = self.params
         log.debug(f'using stream {stream.handle}')
-        p.stream = stream.handle if stream else None
-        pointer = c_ulonglong() # according to cuviddec, the argument type of cuvidmapvideoframe64
-        pitch = c_uint()
-        CUDAcall(nvcuvid.cuvidMapVideoFrame64, self.decoder.decoder, self.index, byref(pointer), byref(pitch), byref(p))
-        return Surface(pointer, pitch, self.decoder)
+        self.params.stream = stream.handle if stream else None
+        return Surface(self.decoder, self.index, self.params)
+
+# the default when initializing decoder
+def select_surface_format(chroma_format, bit_depth, supported_surface_formats):
+    if chroma_format in [cudaVideoChromaFormat.YUV420, cudaVideoChromaFormat.MONOCHROME]:
+        f = cudaVideoSurfaceFormat.P016 if bit_depth > 8 else cudaVideoSurfaceFormat.NV12
+    elif chroma_format == cudaVideoChromaFormat.YUV444:
+        f = cudaVideoSurfaceFormat.YUV444_16Bit if bit_depth > 8 else cudaVideoSurfaceFormat.YUV444
+    elif chroma_format == cudaVideoChromaFormat.YUV422:
+        f = cudaVideoSurfaceFormat.NV12
+    
+    # check if the selected format is supported. If not, check fallback options
+    if f not in supported_surface_formats:
+        if cudaVideoSurfaceFormat.NV12 in supported_surface_formats:
+            f = cudaVideoSurfaceFormat.NV12
+        elif cudaVideoSurfaceFormat.P016 in supported_surface_formats:
+            f = cudaVideoSurfaceFormat.P016
+        elif cudaVideoSurfaceFormat.YUV444 in supported_surface_formats:
+            f = cudaVideoSurfaceFormat.YUV444
+        elif cudaVideoSurfaceFormat.YUV444_16Bit in supported_surface_formats:
+            f = cudaVideoSurfaceFormat.YUV444_16Bit
+        else:
+            raise Exception("No supported surface format")
+    return f
 
 class Decoder:
-    cuda.init()
-
     '''
     wrapper for callbacks, so they return the error code as expected by cuvid; 
 
@@ -150,7 +176,13 @@ class Decoder:
 
         CUDAcall(nvcuvid.cuvidCreateDecoder, byref(self.decoder), byref(p))
         log.debug(f'created decoder: {p}')
-        self.pictures = [False] * ulNumDecodeSurfaces      
+
+        # this mirrors parser's reorder buffer
+        # maps picture index to pictures
+        self.reorder_buffer = {}
+        # this contains all picture indices that are still being used
+        # including the ones in above, and the ones passed to user via on_recv
+        self.pictures = set()
         self.decode_create_info = p # save for user use
         self.ctx.pop()
         log.debug('sequence successful')
@@ -161,27 +193,26 @@ class Decoder:
         pp = cast(pPicParams, POINTER(CUVIDPICPARAMS)).contents
         assert self.decoder, "decoder not initialized"
         log.info(f'decode picture index: {pp.CurrPicIdx}')
-        if self.pictures[pp.CurrPicIdx]:
-            # picture still refered
-            raise Exception("old picture still refered, consider increasing extra_pictures")
+
         self.ctx.push()
-        CUDAcall(nvcuvid.cuvidDecodePicture, self.decoder, byref(pp))
+        p = Picture(self, pp)
+        self.reorder_buffer[p.index] = p
         self.ctx.pop()
-        self.pictures[pp.CurrPicIdx] = True
         return 1  
 
     def handlePictureDisplay(self, pUserData, pDispInfo):
         log.debug('display')
-        self.ctx.push() # context pushed for the user callback
         di = cast(pDispInfo, POINTER(CUVIDPARSERDISPINFO)).contents
-        p = CUVIDPROCPARAMS(
+        params = CUVIDPROCPARAMS(
             progressive_frame=di.progressive_frame,
             second_field=di.repeat_first_field + 1,
             top_field_first=di.top_field_first,
             unpaired_field=di.repeat_first_field < 0
         )
-
-        self.display_callback(Picture(di.picture_index, p, di.timestamp, self))
+        picture = self.reorder_buffer.pop(di.picture_index) # remove this reference
+        picture.on_display(params)
+        self.ctx.push() # context pushed for the user callback        
+        self.on_recv(picture, di.timestamp)
         self.ctx.pop()
         return 1
 
@@ -197,15 +228,23 @@ class Decoder:
                 return self.operating_point | (1 << 10 if self.disp_all_layers else 0)
         return -1
 
-    def __init__(self, ctx: cuda.Context, display_callback, select_surface_format = utils.select_surface_format, extra_pictures = 0, surfaces = 2):
+
+    '''
+    select_surface_format: a function that returns the surface format to use; see the default for an example
+    extra_pictures: extra pictures to allocate (in addition to the ones needed for correct decoding); can be used for lookback
+    surfaces: number of surfaces to allocate
+    note that both pictures and surfaces are pre-allocated when decoder is created.
+    '''        
+
+    def __init__(self, ctx: cuda.Context, select_surface_format = select_surface_format, extra_pictures = 0, surfaces = 2):
+        self.dirty = False
+        self.on_recv = None
         self.ctx = ctx
         assert extra_pictures >= 0, "extra pictures must be non-negative"
         self.extra_pictures = extra_pictures
         self.surfaces = surfaces
         self.exception = None
 
-        self.display_callback = display_callback
-        # self.free_picture_callback = free_picture_callback
         self.operating_point = 0
         self.disp_all_layers = False
         self.parser = CUvideoparser() # NULL, to be filled in next 
@@ -228,21 +267,61 @@ class Decoder:
         self.select_surface_format = select_surface_format
         CUDAcall(nvcuvid.cuvidCreateVideoParser, byref(self.parser), byref(p))
 
-    # TODO: currently packet is memoryview
-    # need more efficient way to convert to pointer
-    def send(self, packet, timestamp = None):
+    '''
+    on_recv: will be called back with (picture, timestamp), in presentation order,
+    in suitable cuda context
+    '''
+    def set_on_recv(self, on_recv):
+        assert not self.dirty, "packets already in pipeline, unsafe change of on_recv; flush first"
+        self.on_recv = on_recv
+
+    '''
+    flush the pipeline. do this before sending new packets to avoid old pictures
+    '''
+    def flush(self):
+        p = CUVIDSOURCEDATAPACKET(
+            flags = CUvideopacketflags.ENDOFSTREAM,
+            payload_size = 0,
+            payload = None,
+            timestamp = 0
+        )
+        # this reset the parser internal state
+        CUDAcall(nvcuvid.cuvidParseVideoData, self.parser, byref(p))
+
+        # frees reorder buffer
+        self.reorder_buffer = {}
+        # no need to set self.pictures - should be set by the previous line
+        # some will remain because user still holds them.
+        
+        self.dirty = False
+
+    '''
+    packet is expected to be of buffer protocol; None means end of stream
+    packet can be reused after the call
+
+    the caller does't have to set up cuda context.
+
+    Currently CUVID parser doesn't tell us in display callback whether a timestamp is attached,
+    default to zero; therefore here we are always passing timestamp, default to zero
+
+    There is no need to signal end-of-stream - 
+    the parser eagerly invokes display callback on pictures as soon as their turn in reorder buffer
+    so if you have used send on all packet you have and returned, then garanteed your on_recv
+    is called for all packets. However, if your stream is malformed, there might be leftover packets
+    in parser's reorder buffer; these have been (or will be) decoded, but their display callback 
+    will never be called. In this case flush() should be called
+    
+    '''
+    def send(self, packet, timestamp = 0):
+        self.dirty = True
         flags = 0
-        if timestamp:
-            flags |= CUvideopacketflags.TIMESTAMP
-        if packet is None:
-            flags |= CUvideopacketflags.ENDOFSTREAM
+        flags |= CUvideopacketflags.TIMESTAMP
 
         arr = np.frombuffer(packet, dtype=np.uint8)
-        log.debug(f'sending {arr.shape}')
 
         p = CUVIDSOURCEDATAPACKET(
             flags = flags,
-            payload_size = len(packet),
+            payload_size = arr.shape[0],
             payload = arr.ctypes.data_as(POINTER(c_uint8)),
             timestamp = timestamp
             )
@@ -256,9 +335,25 @@ class Decoder:
             self.exception = None
             raise e
 
+    '''
+    takes an iterator of (annex.b packets, timestamp)
+    returns an iterator of (pictures, timestamp)
+    '''
+    def decode(self, packets):
+        self.flush()
+        on_recv = self.on_recv        
+
+        pictures = Queue()
+        self.set_on_recv(lambda pts, p: pictures.put((pts, p)))        
+        for packet, pts in packets:
+            self.send(packet, pts)
+            while not pictures.empty():
+                yield pictures.get()
+            del packet # to allow buffer reuse
+        self.on_recv = on_recv
+
     def __del__(self):
         if self.parser:
             CUDAcall(nvcuvid.cuvidDestroyVideoParser, self.parser)
         if self.decoder:
             CUDAcall(nvcuvid.cuvidDestroyDecoder, self.decoder)
-
