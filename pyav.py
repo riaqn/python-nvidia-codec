@@ -1,6 +1,8 @@
 import io
 import av
 
+from .cuviddec import cudaVideoCodec
+
 '''
 depends on bitstream filters; not yet in pyav main branch
 only in https://github.com/PyAV-Org/PyAV/tree/bitstream
@@ -22,6 +24,14 @@ class StreamTranslate:
         self.out_container = av.open(self.b, 'wb')
         self.out_stream = self.out_container.add_stream(template=stream)            
         self.out_container.start_encoding()
+
+    def translate_codec(self):
+        if self.stream.codec.name == 'h264':
+            return cudaVideoCodec.H264
+        elif self.stream.codec.name == 'hevc':
+            return cudaVideoCodec.HEVC
+        else:
+            raise Exception('codec not supported')
 
     '''
     convert a pyav packet to an iterator of (pts, bytes) where bytes is annex B packet that can be passed to decoder
