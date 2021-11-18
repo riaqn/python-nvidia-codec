@@ -139,7 +139,7 @@ class Decoder:
         for surface_format in cudaVideoSurfaceFormat:
             if caps.nOutputFormatMask & (1 << surface_format):
                 supported_output_formats.add(surface_format)
-        ulNumDecodeSurfaces = vf.min_num_decode_surfaces + self.extra_pictures
+        ulNumDecodeSurfaces = vf.min_num_decode_surfaces + self.extra_pictures if self.extra_pictures >= 0 else 32
 
         p = CUVIDDECODECREATEINFO(
             ulWidth = vf.coded_width,
@@ -231,16 +231,15 @@ class Decoder:
 
     '''
     select_surface_format: a function that returns the surface format to use; see the default for an example
-    extra_pictures: extra pictures to allocate (in addition to the ones needed for correct decoding); can be used for lookback
+    extra_pictures: extra pictures to allocate (in addition to the ones needed for correct decoding); can be used for lookback; -1 for maxiumum (32)
     surfaces: number of surfaces to allocate
     note that both pictures and surfaces are pre-allocated when decoder is created.
     '''        
 
-    def __init__(self, ctx: cuda.Context, codec: cudaVideoCodec, select_surface_format = select_surface_format, extra_pictures = 0, surfaces = 2):
+    def __init__(self, ctx: cuda.Context, codec: cudaVideoCodec, select_surface_format = select_surface_format, extra_pictures = -1, surfaces = 2):
         self.dirty = False
         self.on_recv = None
         self.ctx = ctx
-        assert extra_pictures >= 0, "extra pictures must be non-negative"
         self.extra_pictures = extra_pictures
         self.surfaces = surfaces
         self.exception = None
