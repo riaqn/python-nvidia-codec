@@ -36,7 +36,7 @@ class StreamTranslate:
     '''
     convert a pyav packet to an iterator of (pts, bytes) where bytes is annex B packet that can be passed to decoder
 
-    if copy is True, the result is copied to a new bytes and returned
+    if copy is True, return a copy that the caller can use as long as it wants
     if copy is False, the underlying buffer is returned directly; 
     the caller must drop the returned reference before the next iteration
     '''

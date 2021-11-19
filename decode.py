@@ -62,7 +62,7 @@ class Picture:
     def __init__(self, decoder, params):
         self.decoder = decoder        
         self.index = params.CurrPicIdx
-        assert self.index not in self.decoder.pictures, "old picture still refered, consider increasing extra_pictures"
+        assert self.index not in self.decoder.pictures, "picture slots depleted; try to drop old pictures or increase extra_pictures"
         self.decoder.pictures.add(self.index)
         CUDAcall(nvcuvid.cuvidDecodePicture, self.decoder.decoder, byref(params))
 
@@ -140,7 +140,15 @@ class Decoder:
             if caps.nOutputFormatMask & (1 << surface_format):
                 supported_output_formats.add(surface_format)
         ulNumDecodeSurfaces = vf.min_num_decode_surfaces + self.extra_pictures if self.extra_pictures >= 0 else 32
+        assert ulNumDecodeSurfaces <= 32, f"number of pictures {ulNumDecodeSurfaces} > 32 max"
 
+        OutputFormat = self.select_surface_format(
+                vf.chroma_format, 
+                vf.bit_depth_luma_minus8 + 8, 
+                supported_output_formats
+        )
+        assert OutputFormat in supported_output_formats, f"surface format {OutputFormat} not supported for codec {caps.eCodecType} chroma {caps.eChromaFormat} depth {caps.nBitDepthMinus8 + 8}"
+        assert self.surfaces >= 0, "number of surfaces must be non-negative"
         p = CUVIDDECODECREATEINFO(
             ulWidth = vf.coded_width,
             ulHeight = vf.coded_height,
@@ -158,11 +166,7 @@ class Decoder:
                 right=vf.display_area.right, 
                 bottom=vf.display_area.bottom
                 ),
-            OutputFormat = self.select_surface_format(
-                vf.chroma_format, 
-                vf.bit_depth_luma_minus8 + 8, 
-                supported_output_formats
-                ),
+            OutputFormat = OutputFormat,
             DeinterlaceMode = cudaVideoDeinterlaceMode.Weave if vf.progressive_sequence else cudaVideoDeinterlaceMode.Adaptive,
             ulTargetWidth = vf.coded_width,
             ulTargetHeight = vf.coded_height,
@@ -231,12 +235,12 @@ class Decoder:
 
     '''
     select_surface_format: a function that returns the surface format to use; see the default for an example
-    extra_pictures: extra pictures to allocate (in addition to the ones needed for correct decoding); can be used for lookback; -1 for maxiumum (32)
+    extra_pictures: extra pictures to allocate (in addition to the ones needed for correct decoding); can be used for lookback; negative for maxiumum (32)
     surfaces: number of surfaces to allocate
     note that both pictures and surfaces are pre-allocated when decoder is created.
     '''        
 
-    def __init__(self, ctx: cuda.Context, codec: cudaVideoCodec, select_surface_format = select_surface_format, extra_pictures = -1, surfaces = 2):
+    def __init__(self, ctx: cuda.Context, codec: cudaVideoCodec, select_surface_format = select_surface_format, extra_pictures = 0, surfaces = 1):
         self.dirty = False
         self.on_recv = None
         self.ctx = ctx
