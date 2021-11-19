@@ -20,12 +20,14 @@ def test(deviceID, path):
     container = av.open(path)
     stream = container.streams.video[0]
     trans = StreamTranslate(stream)
-    decoder = Decoder(ctx, trans.translate_codec())
+    decoder = Decoder(ctx, trans.translate_codec(), extra_pictures=0)
 
     # container.seek(int(600/stream.time_base), stream=stream)
     bar = tqdm(decoder.decode(trans.translate_packets(container.demux(stream), False)))
     for picture, pts in bar:
         bar.set_description(f'{pts}')
+        # drop the picture reference to free up picture slot to be used for new pictures
+        del picture 
 
 if __name__ == '__main__':
     import sys
