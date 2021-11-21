@@ -1,11 +1,9 @@
-from collections import namedtuple
-from .nvcuvid import * 
 from .cuda import call as CUDAcall
+from .nvcuvid import *
 import pycuda.driver as cuda
 from queue import Queue
 import numpy as np
-from time import sleep
-import sys
+from ctypes import *
 
 import logging
 log = logging.getLogger(__name__)
@@ -33,9 +31,11 @@ class Surface:
     '''
     def __init__(self, decoder, index, p):
         self.decoder = decoder        
-        self.devptr = c_ulonglong() # according to cuviddec, the argument type of cuvidmapvideoframe64
-        self.pitch = c_uint()
-        CUDAcall(nvcuvid.cuvidMapVideoFrame64, decoder.decoder, index, byref(self.devptr), byref(self.pitch), byref(p))
+        self.c_devptr = c_ulonglong() # according to cuviddec, the argument type of cuvidmapvideoframe64
+        self.c_pitch = c_uint()
+        CUDAcall(nvcuvid.cuvidMapVideoFrame64, decoder.decoder, index, byref(self.c_devptr), byref(self.c_pitch), byref(p))
+        self.devptr = self.c_devptr.value # ctypes is pain to handle, so we convert it to python int
+        self.pitch = self.c_pitch.value
 
     def __del__(self):
         # catch: when interacting with C functions, for arguments must convert numbers to corresponding ctypes,
@@ -43,12 +43,8 @@ class Surface:
         log.debug(f'trying to unmap {self.devptr}')
         if self.devptr:
             self.decoder.ctx.push()
-            CUDAcall(nvcuvid.cuvidUnmapVideoFrame64, self.decoder.decoder, self.devptr)
+            CUDAcall(nvcuvid.cuvidUnmapVideoFrame64, self.decoder.decoder, self.c_devptr)
             self.decoder.ctx.pop()
-
-    @property
-    def format(self):
-        return self.decoder.decode_create_info.OutputFormat
         
     @property
     def width(self):
@@ -57,6 +53,30 @@ class Surface:
     @property
     def height(self):
         return self.decoder.decode_create_info.ulTargetHeight
+
+    def download(self, stream = None):
+        assert self.height % 2 == 0
+        arr = cuda.pagelocked_empty((self.height_in_rows, self.width_in_bytes), dtype=np.uint8)
+        m = cuda.Memcpy2D()
+        m.set_src_device(self.devptr)
+        m.src_pitch = self.pitch
+        m.set_dst_host(arr)
+        m.dst_pitch = arr.strides[0]
+        m.width_in_bytes = self.width_in_bytes
+        m.height = self.height_in_rows
+        CUDAcall(m, stream)
+        return arr        
+
+
+class SurfaceNV12(Surface):
+    @property
+    def width_in_bytes(self):
+        return self.width 
+
+    @property
+    def height_in_rows(self):
+        # assert self.height % 2 == 0
+        return self.height // 2 * 3
 
 class Picture:
     def __init__(self, decoder, params):
@@ -72,10 +92,16 @@ class Picture:
     def __del__(self):
         self.decoder.pictures.remove(self.index)
 
+    '''
+    should call within approapriate cuda context
+    '''
     def map(self, stream = None):
         log.debug(f'using stream {stream.handle}')
         self.params.stream = stream.handle if stream else None
-        return Surface(self.decoder, self.index, self.params)
+        if self.decoder.surface_format == cudaVideoSurfaceFormat.NV12:
+            return SurfaceNV12(self.decoder, self.index, self.params)
+        else:
+            raise NotImplementedError(f'unsupported surface format to map {self.decoder.surface_format}')
 
 # the default when initializing decoder
 def select_surface_format(chroma_format, bit_depth, supported_surface_formats):
@@ -192,11 +218,27 @@ class Decoder:
         log.debug('sequence successful')
         return ulNumDecodeSurfaces
 
+    @property
+    def codec(self):
+        return self.decode_create_info.CodecType
+
+    @property
+    def target_width(self):
+        return self.decode_create_info.ulTargetWidth
+
+    @property
+    def target_height(self):
+        return self.decode_create_info.ulTargetHeight
+
+    @property
+    def surface_format(self):
+        return self.decode_create_info.OutputFormat
+
     def handlePictureDecode(self, pUserData, pPicParams):
         log.debug('decode')
         pp = cast(pPicParams, POINTER(CUVIDPICPARAMS)).contents
         assert self.decoder, "decoder not initialized"
-        log.info(f'decode picture index: {pp.CurrPicIdx}')
+        log.debug(f'decode picture index: {pp.CurrPicIdx}')
 
         self.ctx.push()
         p = Picture(self, pp)
@@ -215,9 +257,7 @@ class Decoder:
         )
         picture = self.reorder_buffer.pop(di.picture_index) # remove this reference
         picture.on_display(params)
-        self.ctx.push() # context pushed for the user callback        
         self.on_recv(picture, di.timestamp)
-        self.ctx.pop()
         return 1
 
     '''
@@ -238,6 +278,7 @@ class Decoder:
     extra_pictures: extra pictures to allocate (in addition to the ones needed for correct decoding); can be used for lookback; negative for maxiumum (32)
     surfaces: number of surfaces to allocate
     note that both pictures and surfaces are pre-allocated when decoder is created.
+    the __init__ itself doesn't involves any cuda operations or cuda context 
     '''        
 
     def __init__(self, ctx: cuda.Context, codec: cudaVideoCodec, select_surface_format = select_surface_format, extra_pictures = 0, surfaces = 1):
@@ -272,7 +313,7 @@ class Decoder:
 
     '''
     on_recv: will be called back with (picture, timestamp), in presentation order,
-    in suitable cuda context
+    caller must setup CUDA context if needed
     '''
     def set_on_recv(self, on_recv):
         assert not self.dirty, "packets already in pipeline, unsafe change of on_recv; flush first"
