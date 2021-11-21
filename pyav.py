@@ -3,11 +3,11 @@ import av
 
 from .cuviddec import cudaVideoCodec
 
+
 '''
-depends on bitstream filters; not yet in pyav main branch
-only in https://github.com/PyAV-Org/PyAV/tree/bitstream
+Adapts PyAV stream for CUVID decoding
 '''
-class StreamTranslate:
+class PyAVStreamAdaptor:
     def __init__(self, stream):
         self.stream = stream
         self.b = io.BytesIO()            
@@ -63,3 +63,9 @@ class StreamTranslate:
     def translate_packets(self, packets, copy = True):
         for packet in packets:
             yield from self.translate_packet(packet, copy = copy)
+
+def test():
+    pass
+
+if __name__ == '__main__':
+    test()
