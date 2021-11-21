@@ -19,6 +19,8 @@ class PyAVStreamAdaptor:
             self.b.name = 'muxed.hevc'
         else:
             raise Exception(f'unsupported codec {stream.codec.name} for bitstream')
+        # the following line relies on certain patch of PyAV
+        # https://github.com/PyAV-Org/PyAV/tree/bitstream
         self.bsf = av.BitStreamFilterContext(bsf_name)        
 
         self.out_container = av.open(self.b, 'wb')

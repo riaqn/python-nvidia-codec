@@ -24,7 +24,8 @@ Please open issues if you have ideas for improvement.
             - [X] BT. 709
             - [ ] BT. 2020
     - [ ] P016 to RGB24
-- [ ] support for built-in cropping and scaling provided by NV decoder
+- [X] support for built-in cropping and scaling provided by NV decoder
+- [ ] make the library thread-safe; release GIL when waiting for GPU
 - [ ] Encoder
 - [ ] interpolation with deep learning frameworks
 

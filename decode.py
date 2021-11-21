@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from .cuda import call as CUDAcall
 from .nvcuvid import *
 import pycuda.driver as cuda
@@ -103,8 +104,7 @@ class Picture:
         else:
             raise NotImplementedError(f'unsupported surface format to map {self.decoder.surface_format}')
 
-# the default when initializing decoder
-def select_surface_format(chroma_format, bit_depth, supported_surface_formats):
+def decide_surface_format(chroma_format, bit_depth, supported_surface_formats):
     if chroma_format in [cudaVideoChromaFormat.YUV420, cudaVideoChromaFormat.MONOCHROME]:
         f = cudaVideoSurfaceFormat.P016 if bit_depth > 8 else cudaVideoSurfaceFormat.NV12
     elif chroma_format == cudaVideoChromaFormat.YUV444:
@@ -124,7 +124,15 @@ def select_surface_format(chroma_format, bit_depth, supported_surface_formats):
             f = cudaVideoSurfaceFormat.YUV444_16Bit
         else:
             raise Exception("No supported surface format")
+
     return f
+
+def decide(p):
+    return SimpleNamespace(
+        surface_format = decide_surface_format(p.chroma_format, p.bit_depth, p.supported_surface_formats),
+        num_pictures = p.min_num_pictures,
+        num_surfaces = 1
+    )
 
 class Decoder:
     '''
@@ -159,26 +167,54 @@ class Decoder:
         assert caps.bIsSupported == 1, "Codec not supported"
         assert vf.coded_width <= caps.nMaxWidth, "width too large"
         assert vf.coded_height <= caps.nMaxHeight, "height too large"
+        assert vf.coded_width >= caps.nMinWidth, "width too small"
+        assert vf.coded_height >= caps.nMinHeight, "height too small"
         assert (vf.coded_width >> 4) * (vf.coded_height >> 4) <= caps.nMaxMBCount, "too many macroblocks"
         
-        supported_output_formats = set()
+        supported_surface_formats = set()
         for surface_format in cudaVideoSurfaceFormat:
             if caps.nOutputFormatMask & (1 << surface_format):
-                supported_output_formats.add(surface_format)
-        ulNumDecodeSurfaces = vf.min_num_decode_surfaces + self.extra_pictures if self.extra_pictures >= 0 else 32
-        assert ulNumDecodeSurfaces <= 32, f"number of pictures {ulNumDecodeSurfaces} > 32 max"
+                supported_surface_formats.add(surface_format)
 
-        OutputFormat = self.select_surface_format(
-                vf.chroma_format, 
-                vf.bit_depth_luma_minus8 + 8, 
-                supported_output_formats
-        )
-        assert OutputFormat in supported_output_formats, f"surface format {OutputFormat} not supported for codec {caps.eCodecType} chroma {caps.eChromaFormat} depth {caps.nBitDepthMinus8 + 8}"
-        assert self.surfaces >= 0, "number of surfaces must be non-negative"
+        decision = self.decide(SimpleNamespace(
+            chroma_format = vf.chroma_format,
+            bit_depth = vf.bit_depth_luma_minus8 + 8,
+            width = vf.display_area.right - vf.display_area.left,
+            height = vf.display_area.bottom - vf.display_area.top,
+            supported_surface_formats = supported_surface_formats,
+            min_num_pictures = vf.min_num_decode_surfaces,
+            ))
+
+        assert decision.num_pictures <= 32, f"number of pictures {decision.num_pictures} > 32 max"
+
+        assert decision.surface_format in supported_surface_formats, f"surface format {decision.surface_format} not supported for codec {caps.eCodecType} chroma {caps.eChromaFormat} depth {caps.nBitDepthMinus8 + 8}"
+        assert decision.num_surfaces >= 0, "number of surfaces must be non-negative"
+        if hasattr(decision, 'cropping'):
+            # the provided cropping is offsetted 
+            display_area = SRECT(
+                left = vf.display_area.left + decision.cropping.left,
+                top = vf.display_area.top + decision.cropping.top,
+                right = vf.display_area.left + decision.cropping.right,
+                bottom = vf.display_area.top + decision.cropping.bottom
+            )
+        else:
+            display_area = SRECT(
+                left=vf.display_area.left, 
+                top=vf.display_area.top, 
+                right=vf.display_area.right, 
+                bottom=vf.display_area.bottom
+                )
+        if hasattr(decision, 'target_size'):
+            target_size = decision.target_size
+        else:
+            target_size = SimpleNamespace(
+                width = display_area.right - display_area.left, 
+                height = display_area.bottom - display_area.top)
+   
         p = CUVIDDECODECREATEINFO(
             ulWidth = vf.coded_width,
             ulHeight = vf.coded_height,
-            ulNumDecodeSurfaces = ulNumDecodeSurfaces,
+            ulNumDecodeSurfaces = decision.num_pictures,
             CodecType = vf.codec,
             ChromaFormat = vf.chroma_format,
             ulCreationFlags = cudaVideoCreateFlags.PreferCUVID,
@@ -186,17 +222,12 @@ class Decoder:
             ulIntraDecodeOnly = 0,
             ulMaxWidth = vf.coded_width,
             ulMaxHeight = vf.coded_height,
-            display_area = SRECT(
-                left=vf.display_area.left, 
-                top=vf.display_area.top, 
-                right=vf.display_area.right, 
-                bottom=vf.display_area.bottom
-                ),
-            OutputFormat = OutputFormat,
+            display_area = display_area,
+            OutputFormat = decision.surface_format,
             DeinterlaceMode = cudaVideoDeinterlaceMode.Weave if vf.progressive_sequence else cudaVideoDeinterlaceMode.Adaptive,
-            ulTargetWidth = vf.coded_width,
-            ulTargetHeight = vf.coded_height,
-            ulNumOutputSurfaces = self.surfaces,
+            ulTargetWidth = target_size.width,
+            ulTargetHeight = target_size.height,
+            ulNumOutputSurfaces = decision.num_surfaces,
             vidLock = None,
             enableHistogram = 0
         )
@@ -216,19 +247,19 @@ class Decoder:
         self.decode_create_info = p # save for user use
         self.ctx.pop()
         log.debug('sequence successful')
-        return ulNumDecodeSurfaces
+        return decision.num_pictures
 
     @property
     def codec(self):
         return self.decode_create_info.CodecType
 
     @property
-    def target_width(self):
-        return self.decode_create_info.ulTargetWidth
+    def coded_size(self):
+        return (self.decode_create_info.ulWidth, self.decode_create_info.ulHeight)
 
     @property
-    def target_height(self):
-        return self.decode_create_info.ulTargetHeight
+    def target_size(self):
+        return (self.decode_create_info.ulTargetWidth, self.decode_create_info.ulTargetHeight)
 
     @property
     def surface_format(self):
@@ -281,12 +312,11 @@ class Decoder:
     the __init__ itself doesn't involves any cuda operations or cuda context 
     '''        
 
-    def __init__(self, ctx: cuda.Context, codec: cudaVideoCodec, select_surface_format = select_surface_format, extra_pictures = 0, surfaces = 1):
+    def __init__(self, ctx: cuda.Context, codec: cudaVideoCodec, decide = decide):
         self.dirty = False
         self.on_recv = None
         self.ctx = ctx
-        self.extra_pictures = extra_pictures
-        self.surfaces = surfaces
+        self.decide = decide
         self.exception = None
 
         self.operating_point = 0
@@ -308,7 +338,6 @@ class Decoder:
             pfnGetOperatingPoint=self.handleOperatingPointCallback
             )
 
-        self.select_surface_format = select_surface_format
         CUDAcall(nvcuvid.cuvidCreateVideoParser, byref(self.parser), byref(p))
 
     '''
