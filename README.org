@@ -6,17 +6,28 @@ The project is still in active development; expect breaking changes.
 
 Comparison to Video-Processing-Framework
 
-- Methodologies :: VPF is written fully in C++ and uses =pybind= to expose Python interfaces. PNC is written fully in Python and uses =ctypes= to access Nvidia C interfaces. Our codes tends to be more concise, less duplicative and easier to read and write.
+- Methodologies :: VPF is written fully in C++ and uses =pybind= to expose Python interfaces. PNC is written fully in Python and uses =ctypes= to access Nvidia C interfaces. Our codes tends to be more concise, less duplicative and easier to read and write. It also allows us better interpolation with other python libraries.
 - Performance :: Preliminary tests shows little to no difference in terms of performance, because the heavy lifting is done on the GPU anyway. Both library can saturate GPU decoder. PNC uses more CPU than VPF as expected from Python vs. C++, but still negligible (less than 10% of Ryzen 3100 single core for 8K*4K HEVC)
 - Resource Management ::
     - In VPF =Surface= given to user are not owned by the user. It will be overwritten by new frames which is counter-intuitive; =Picture= are not exposed to user at all - they are always mapped (post-processed and copied) to =Surface= so the picture can be ready for new frames. The latter is inefficient when only a subset of =Pictures= are needed (e.g. screenshots).
     - The above is because VPF allocates the bare minimum of resources needed for most decoding tasks. PNC allows the user to specify the amount of resources to be allocated for advanced applications. Users own the resources and decide when and whether to deal with them. 
     - Managing resources is not painful: similar to =pycuda=, we shift the burden of managing host/device resources to the Python garbage collector. Resources (such as =Picture= and =Surface=) are automatically freed when the user drops the reference.
 
-* Things to come
-- TODO Cropping and scaling support in postprocessing
-- TODO Color space conversion from YUV (bt. 601/709, full-range/limit-range) to RGB using =pycuda=
-- Encoder
+* Roadmap
+Please open issues if you have ideas for improvement.
+- [X] Decoding
+- [-] Color Conversion
+    - [-] NV12 to RGB24
+        - [X] Color Range (both MPEG and JPEG)
+        - [-] Color Space
+            - [X] BT. 601
+            - [X] BT. 709
+            - [ ] BT. 2020
+    - [ ] P016 to RGB24
+- [ ] support for built-in cropping and scaling provided by NV decoder
+- [ ] Encoder
+- [ ] interpolation with deep learning frameworks
 
 * Acknowledgements
-Many thanks to @rarzumanyan for all the helps and explanations!
+- Many thanks to @rarzumanyan for all the helps and explanations!
+- The blog posts (https://mymusing.co/tag/color/) from myMusing is very helpful.
