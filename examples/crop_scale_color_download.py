@@ -1,6 +1,6 @@
 import pycuda.driver as cuda
 from types import SimpleNamespace
-from ..decode import Decoder
+from ..decode import Decoder, decide_surface_format
 import logging
 import av
 from ..pyav import PyAVStreamAdaptor
@@ -28,14 +28,35 @@ def test(deviceID, path):
     container = av.open(path)
     stream = container.streams.video[0]
     trans = PyAVStreamAdaptor(stream)
-    decoder = Decoder(ctx, trans.translate_codec(), extra_pictures=1) # headroom for release bugs
+    def decide(p):
+        # cropping: we only want the left half of the picture
+        cropping = SimpleNamespace(
+            left = 0,
+            top = 0,
+            right = p.width // 2,
+            bottom = p.height
+        )
+        # resize to 1/8 in both dimensions
+        target_size = SimpleNamespace(
+            width = (cropping.right - cropping.left)//8,
+            height = (cropping.bottom - cropping.top)//8
+        )
+
+        return SimpleNamespace(
+            surface_format = decide_surface_format(p.chroma_format, p.bit_depth, p.supported_surface_formats),
+            cropping = cropping,
+            target_size = target_size,
+            num_pictures = p.min_num_pictures,
+            num_surfaces = 1
+        )
+        
+    decoder = Decoder(ctx, trans.translate_codec(), decide)
 
     # container.seek(int(600/stream.time_base), stream=stream)
     bar = tqdm(decoder.decode(trans.translate_packets(container.demux(stream), False)))
     cvt = None
     for i, (picture, pts) in enumerate(bar):
         bar.set_description(f'{pts}')
-        # drop the picture reference to free up picture slot to be used for new pictures
         if i % 60 == 0:
             surface = picture.map(stream=s)
             if cvt is None:
