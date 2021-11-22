@@ -79,6 +79,15 @@ class SurfaceNV12(Surface):
         # assert self.height % 2 == 0
         return self.height // 2 * 3
 
+class SurfaceP016(Surface):
+    @property
+    def width_in_bytes(self):
+        return self.width * 2
+
+    @property
+    def height_in_rows(self):
+        return self.height // 2 * 3
+
 class Picture:
     def __init__(self, decoder, params):
         self.decoder = decoder        
@@ -101,14 +110,19 @@ class Picture:
         self.params.stream = stream.handle if stream else None
         if self.decoder.surface_format == cudaVideoSurfaceFormat.NV12:
             return SurfaceNV12(self.decoder, self.index, self.params)
+        elif self.decoder.surface_format == cudaVideoSurfaceFormat.P016:
+            return SurfaceP016(self.decoder, self.index, self.params)
         else:
-            raise NotImplementedError(f'unsupported surface format to map {self.decoder.surface_format}')
+            raise NotImplementedError(f'unsupported surface format to map: {self.decoder.surface_format}')
 
-def decide_surface_format(chroma_format, bit_depth, supported_surface_formats):
+'''
+allow_high: do we allow high-bit-depth? default to False
+'''
+def decide_surface_format(chroma_format, bit_depth, supported_surface_formats, allow_high = False):
     if chroma_format in [cudaVideoChromaFormat.YUV420, cudaVideoChromaFormat.MONOCHROME]:
-        f = cudaVideoSurfaceFormat.P016 if bit_depth > 8 else cudaVideoSurfaceFormat.NV12
+        f = cudaVideoSurfaceFormat.P016 if bit_depth > 8 and allow_high else cudaVideoSurfaceFormat.NV12
     elif chroma_format == cudaVideoChromaFormat.YUV444:
-        f = cudaVideoSurfaceFormat.YUV444_16Bit if bit_depth > 8 else cudaVideoSurfaceFormat.YUV444
+        f = cudaVideoSurfaceFormat.YUV444_16Bit if bit_depth > 8 and allow_high else cudaVideoSurfaceFormat.YUV444
     elif chroma_format == cudaVideoChromaFormat.YUV422:
         f = cudaVideoSurfaceFormat.NV12
     
@@ -116,11 +130,11 @@ def decide_surface_format(chroma_format, bit_depth, supported_surface_formats):
     if f not in supported_surface_formats:
         if cudaVideoSurfaceFormat.NV12 in supported_surface_formats:
             f = cudaVideoSurfaceFormat.NV12
-        elif cudaVideoSurfaceFormat.P016 in supported_surface_formats:
+        elif cudaVideoSurfaceFormat.P016 in supported_surface_formats and allow_high:
             f = cudaVideoSurfaceFormat.P016
         elif cudaVideoSurfaceFormat.YUV444 in supported_surface_formats:
             f = cudaVideoSurfaceFormat.YUV444
-        elif cudaVideoSurfaceFormat.YUV444_16Bit in supported_surface_formats:
+        elif cudaVideoSurfaceFormat.YUV444_16Bit in supported_surface_formats and allow_high:
             f = cudaVideoSurfaceFormat.YUV444_16Bit
         else:
             raise Exception("No supported surface format")
