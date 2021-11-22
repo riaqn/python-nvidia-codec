@@ -29,6 +29,7 @@ def test(deviceID, path):
     stream = container.streams.video[0]
     trans = PyAVStreamAdaptor(stream)
     def decide(p):
+        log.info(p)
         # cropping: we only want the left half of the picture
         cropping = SimpleNamespace(
             left = 0,
@@ -36,10 +37,10 @@ def test(deviceID, path):
             right = p.width // 2,
             bottom = p.height
         )
-        # resize to 1/8 in both dimensions
+        # resize to 1/2 in both dimensions
         target_size = SimpleNamespace(
-            width = (cropping.right - cropping.left)//8,
-            height = (cropping.bottom - cropping.top)//8
+            width = (cropping.right - cropping.left)//2,
+            height = (cropping.bottom - cropping.top)//2
         )
 
         return SimpleNamespace(
