@@ -2,15 +2,15 @@
 
 from ctypes import *
 from .cuda import *
-from enum import Enum, IntEnum, auto
+from enum import Enum, auto
 
-class cudaVideoSurfaceFormat(IntEnum):
+class cudaVideoSurfaceFormat(Enum):
     NV12 = 0
-    P016 = 1
-    YUV444 = 2
-    YUV444_16Bit = 3
+    P016 = auto()
+    YUV444 = auto()
+    YUV444_16Bit = auto()
 
-class cudaVideoCodec(IntEnum):
+class cudaVideoCodec(Enum):
     MPEG1 = 0
     MPEG2 = auto()
     MPEG4 = auto()
@@ -24,19 +24,19 @@ class cudaVideoCodec(IntEnum):
     VP9 = auto()
     AV1 = auto()
 
-class cudaVideoChromaFormat(IntEnum):
+class cudaVideoChromaFormat(Enum):
     MONOCHROME = 0
     YUV420 = auto()
     YUV422 = auto()
     YUV444 = auto()
 
-class cudaVideoCreateFlags(IntEnum):
+class cudaVideoCreateFlags(Enum):
     Default = 0
     PreferCUDA = auto()
     PreferDXVA = auto()
     PreferCUVID = auto()
 
-class cudaVideoDeinterlaceMode(IntEnum):
+class cudaVideoDeinterlaceMode(Enum):
     Weave = 0
     Bob = auto()
     Adaptive = auto()

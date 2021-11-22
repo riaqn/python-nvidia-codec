@@ -3,7 +3,7 @@
 from .cuviddec import *
 from ctypes import *
 
-from enum import Enum, Flag, IntFlag, auto
+from enum import Flag, auto
 
 
 # class CUVIDAV1SEQHDR(Structure):
@@ -132,12 +132,12 @@ class CUVIDPROCPARAMS(Structure):
                 ('Reserved', c_uint * 46),
                 ('histogram_dptr', POINTER(c_ulonglong)),
                 ('Reserved2', c_void_p*1) ]
-class CUvideopacketflags(IntFlag):
+class CUvideopacketflags(Flag):
     ENDOFSTREAM = 1
-    TIMESTAMP = 2
-    DISCOUNTINUITY = 4
-    ENDOFPICTURE = 8
-    NOTIFY_EOS = 16
+    TIMESTAMP = auto()
+    DISCOUNTINUITY = auto()
+    ENDOFPICTURE = auto()
+    NOTIFY_EOS = auto()
 
 CUvideotimestamp = c_longlong
 class CUVIDSOURCEDATAPACKET(Structure):
