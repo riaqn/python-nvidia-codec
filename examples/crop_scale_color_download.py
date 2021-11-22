@@ -51,7 +51,7 @@ def test(deviceID, path):
             num_surfaces = 1
         )
         
-    decoder = Decoder(ctx, trans.translate_codec(), decide)
+    decoder = Decoder(trans.translate_codec(), decide)
 
     # container.seek(int(600/stream.time_base), stream=stream)
     bar = tqdm(decoder.decode(trans.translate_packets(container.demux(stream), False)))
