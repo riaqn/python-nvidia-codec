@@ -88,6 +88,15 @@ class SurfaceP016(Surface):
     def height_in_rows(self):
         return self.height // 2 * 3
 
+class SurfaceYUV444(Surface):
+    @property
+    def width_in_bytes(self):
+        return self.width
+
+    @property
+    def height_in_rows(self):
+        return self.height * 3
+
 class Picture:
     def __init__(self, decoder, params):
         self.decoder = decoder        
@@ -108,10 +117,12 @@ class Picture:
     def map(self, stream = None):
         log.debug(f'using stream {stream.handle}')
         self.params.stream = stream.handle if stream else None
-        if self.decoder.surface_format == cudaVideoSurfaceFormat.NV12:
+        if self.decoder.surface_format is cudaVideoSurfaceFormat.NV12:
             return SurfaceNV12(self.decoder, self.index, self.params)
-        elif self.decoder.surface_format == cudaVideoSurfaceFormat.P016:
+        elif self.decoder.surface_format is cudaVideoSurfaceFormat.P016:
             return SurfaceP016(self.decoder, self.index, self.params)
+        elif self.decoder.surface_format is cudaVideoSurfaceFormat.YUV444:
+            return SurfaceYUV444(self.decoder, self.index, self.params)
         else:
             raise NotImplementedError(f'unsupported surface format to map: {self.decoder.surface_format}')
 
@@ -121,10 +132,12 @@ allow_high: do we allow high-bit-depth? default to False
 def decide_surface_format(chroma_format, bit_depth, supported_surface_formats, allow_high = False):
     if chroma_format in [cudaVideoChromaFormat.YUV420, cudaVideoChromaFormat.MONOCHROME]:
         f = cudaVideoSurfaceFormat.P016 if bit_depth > 8 and allow_high else cudaVideoSurfaceFormat.NV12
-    elif chroma_format == cudaVideoChromaFormat.YUV444:
+    elif chroma_format is cudaVideoChromaFormat.YUV444:
         f = cudaVideoSurfaceFormat.YUV444_16Bit if bit_depth > 8 and allow_high else cudaVideoSurfaceFormat.YUV444
-    elif chroma_format == cudaVideoChromaFormat.YUV422:
+    elif chroma_format is cudaVideoChromaFormat.YUV422:
         f = cudaVideoSurfaceFormat.NV12
+    else:
+        raise Exception(f'unexpected chroma format {chroma_format}')
     
     # check if the selected format is supported. If not, check fallback options
     if f not in supported_surface_formats:
@@ -187,11 +200,11 @@ class Decoder:
         
         supported_surface_formats = set()
         for surface_format in cudaVideoSurfaceFormat:
-            if caps.nOutputFormatMask & (1 << surface_format):
+            if caps.nOutputFormatMask & (1 << surface_format.value):
                 supported_surface_formats.add(surface_format)
 
         decision = self.decide(SimpleNamespace(
-            chroma_format = vf.chroma_format,
+            chroma_format = cudaVideoChromaFormat(vf.chroma_format),
             bit_depth = vf.bit_depth_luma_minus8 + 8,
             width = vf.display_area.right - vf.display_area.left,
             height = vf.display_area.bottom - vf.display_area.top,
@@ -231,14 +244,14 @@ class Decoder:
             ulNumDecodeSurfaces = decision.num_pictures,
             CodecType = vf.codec,
             ChromaFormat = vf.chroma_format,
-            ulCreationFlags = cudaVideoCreateFlags.PreferCUVID,
+            ulCreationFlags = cudaVideoCreateFlags.PreferCUVID.value,
             bitDepthMinus8 = vf.bit_depth_luma_minus8,
             ulIntraDecodeOnly = 0,
             ulMaxWidth = vf.coded_width,
             ulMaxHeight = vf.coded_height,
             display_area = display_area,
-            OutputFormat = decision.surface_format,
-            DeinterlaceMode = cudaVideoDeinterlaceMode.Weave if vf.progressive_sequence else cudaVideoDeinterlaceMode.Adaptive,
+            OutputFormat = decision.surface_format.value,
+            DeinterlaceMode = (cudaVideoDeinterlaceMode.Weave if vf.progressive_sequence else cudaVideoDeinterlaceMode.Adaptive).value,
             ulTargetWidth = target_size.width,
             ulTargetHeight = target_size.height,
             ulNumOutputSurfaces = decision.num_surfaces,
@@ -265,7 +278,7 @@ class Decoder:
 
     @property
     def codec(self):
-        return self.decode_create_info.CodecType
+        return cudaVideoCodec(self.decode_create_info.CodecType)
 
     @property
     def coded_size(self):
@@ -277,7 +290,7 @@ class Decoder:
 
     @property
     def surface_format(self):
-        return self.decode_create_info.OutputFormat
+        return cudaVideoSurfaceFormat(self.decode_create_info.OutputFormat)
 
     def handlePictureDecode(self, pUserData, pPicParams):
         log.debug('decode')
@@ -343,7 +356,7 @@ class Decoder:
         self.handlePictureDisplayCallback = PFNVIDDISPLAYCALLBACK(self.catch_exception(self.handlePictureDisplay))
         self.handleOperatingPointCallback = PFNVIDOPPOINTCALLBACK(self.catch_exception(self.handleOperatingPoint, -1))
         p = CUVIDPARSERPARAMS(
-            CodecType=codec,
+            CodecType=codec.value,
             ulMaxNumDecodeSurfaces=0,
             pUserData=None,
             pfnSequenceCallback=self.handleVideoSequenceCallback,
@@ -367,7 +380,7 @@ class Decoder:
     '''
     def flush(self):
         p = CUVIDSOURCEDATAPACKET(
-            flags = CUvideopacketflags.ENDOFSTREAM,
+            flags = CUvideopacketflags.ENDOFSTREAM.value,
             payload_size = 0,
             payload = None,
             timestamp = 0
@@ -401,13 +414,13 @@ class Decoder:
     '''
     def send(self, packet, timestamp = 0):
         self.dirty = True
-        flags = 0
+        flags = CUvideopacketflags(0)
         flags |= CUvideopacketflags.TIMESTAMP
 
         arr = np.frombuffer(packet, dtype=np.uint8)
 
         p = CUVIDSOURCEDATAPACKET(
-            flags = flags,
+            flags = flags.value,
             payload_size = arr.shape[0],
             payload = arr.ctypes.data_as(POINTER(c_uint8)),
             timestamp = timestamp
