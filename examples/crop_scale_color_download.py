@@ -1,10 +1,10 @@
 import pycuda.driver as cuda
 from types import SimpleNamespace
-from ..decode import Decoder, decide_surface_format
+from nvidia_codec.decode import Decoder, decide_surface_format
 import logging
 import av
-from ..pyav import PyAVStreamAdaptor
-from .. import color
+from nvidia_codec.pyav import PyAVStreamAdaptor
+from nvidia_codec import color
 import faulthandler
 from tqdm import tqdm
 
@@ -31,25 +31,22 @@ def test(deviceID, path):
     def decide(p):
         log.info(p)
         # cropping: we only want the left half of the picture
-        cropping = SimpleNamespace(
-            left = 0,
-            top = 0,
-            right = p.width // 2,
-            bottom = p.height
-        )
+        cropping = {
+            'left' : 0,
+            'top' : 0,
+            'right' : p['size']['width'] // 2,
+            'bottom' : p['size']['height']
+        }
         # resize to 1/2 in both dimensions
-        target_size = SimpleNamespace(
-            width = (cropping.right - cropping.left)//2,
-            height = (cropping.bottom - cropping.top)//2
-        )
+        target_size = {
+            'width' : (cropping['right'] - cropping['left'])//2,
+            'height' : (cropping['bottom'] - cropping['top'])//2
+        }
 
-        return SimpleNamespace(
-            surface_format = decide_surface_format(p.chroma_format, p.bit_depth, p.supported_surface_formats),
-            cropping = cropping,
-            target_size = target_size,
-            num_pictures = p.min_num_pictures,
-            num_surfaces = 1
-        )
+        return {
+            'cropping' : cropping,
+            'target_size' : target_size,
+        }
         
     decoder = Decoder(trans.translate_codec(), decide)
 

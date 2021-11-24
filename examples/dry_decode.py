@@ -1,8 +1,8 @@
 import pycuda.driver as cuda
-from ..decode import Decoder
+from nvidia_codec.decode import Decoder
 import logging
 import av
-from ..pyav import PyAVStreamAdaptor
+from nvidia_codec.pyav import PyAVStreamAdaptor
 import faulthandler
 from tqdm import tqdm
 
