@@ -18,14 +18,18 @@ Please open issues if you have ideas for improvement.
 - [X] Decoding
 - [-] Color Conversion
     - [-] NV12 to RGB24
-        - [X] Color Range (both MPEG and JPEG)
-        - [-] Color Space
-            - [X] BT. 601
-            - [X] BT. 709
-            - [ ] BT. 2020
-    - [ ] P016 to RGB24
+    - [ ] P016 to RGB24/RGB48
+    - [ ] YUV444 to RGB24
+    - [ ] YUV444_16Bit to RGB24/RGB48
+    - [X] Color Ranges
+        - [X] MPEG (limited range)
+        - [X] JPEG (full range)
+    - [-] Color Space
+        - [X] BT. 601
+        - [X] BT. 709
+        - [ ] ...You tell me
 - [X] support for built-in cropping and scaling provided by NV decoder
-- [ ] make the library thread-safe; release GIL when waiting for GPU
+- [X] make the library thread-safe and usable for threading applications
 - [ ] Encoder
 - [ ] interpolation with deep learning frameworks
 
