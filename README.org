@@ -17,7 +17,7 @@ Comparison to Video-Processing-Framework
 Please open issues if you have ideas for improvement.
 - [X] Decoding
 - [-] Color Conversion
-    - [-] NV12 to RGB24
+    - [X] NV12 to RGB24
     - [ ] P016 to RGB24/RGB48
     - [ ] YUV444 to RGB24
     - [ ] YUV444_16Bit to RGB24/RGB48
@@ -29,7 +29,7 @@ Please open issues if you have ideas for improvement.
         - [X] BT. 709
         - [ ] ...You tell me
 - [X] support for built-in cropping and scaling provided by NV decoder
-- [X] make the library thread-safe and usable for threading applications
+- [X] make the library thread-safe and thread-friendly
 - [ ] Encoder
 - [ ] interpolation with deep learning frameworks
 
