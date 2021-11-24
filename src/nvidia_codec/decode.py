@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from collections import namedtuple
 from .cuda import call as CUDAcall
 from .nvcuvid import *
 import pycuda.driver as cuda
@@ -186,13 +187,8 @@ def decide_surface_format(chroma_format, bit_depth, supported_surface_formats, a
 
     return f
 
-def decide(p):
-    return SimpleNamespace(
-        surface_format = decide_surface_format(p.chroma_format, p.bit_depth, p.supported_surface_formats),
-        num_pictures = p.min_num_pictures,
-        num_surfaces = 1
-    )
-
+# DecideIn = namedtuple('DecideIn', ['chroma_format', 'bit_depth', 'size', 'supported_surface_formats', 'min_num_pictures'])
+# DecideOut = namedtuple('DecideOut', ['surface_format', 'num_surfaces', 'num_pictuers', 'cropping', 'target_size'
 class BaseDecoder:
     '''
     wrapper for callbacks, so they return the error code as expected by cuvid; 
@@ -233,45 +229,54 @@ class BaseDecoder:
             if caps.nOutputFormatMask & (1 << surface_format.value):
                 supported_surface_formats.add(surface_format)
 
-        decision = self.decide(SimpleNamespace(
-            chroma_format = cudaVideoChromaFormat(vf.chroma_format),
-            bit_depth = vf.bit_depth_luma_minus8 + 8,
-            width = vf.display_area.right - vf.display_area.left,
-            height = vf.display_area.bottom - vf.display_area.top,
-            supported_surface_formats = supported_surface_formats,
-            min_num_pictures = vf.min_num_decode_surfaces,
-            ))
+        p = {
+            'chroma_format': cudaVideoChromaFormat(vf.chroma_format),
+            'bit_depth' : vf.bit_depth_luma_minus8 + 8,
+            'size' : {
+                'width' : vf.display_area.right - vf.display_area.left,
+                'height' : vf.display_area.bottom - vf.display_area.top
+            },
+            'supported_surface_formats' : supported_surface_formats,
+            'min_num_pictures' : vf.min_num_decode_surfaces,
+        }
 
-        assert decision.num_pictures <= 32, f"number of pictures {decision.num_pictures} > 32 max"
+        # the default values 
+        decision = {
+            'num_pictures' : p['min_num_pictures'],
+            'num_surfaces' : 1,
+            'surface_format' : decide_surface_format(p['chroma_format'], p['bit_depth'], p['supported_surface_formats']),
+            'cropping' : {
+                'left': 0,
+                'right' : p['size']['width'],
+                'top': 0,
+                'bottom' : p['size']['height']
+            },
+            'target_size': {
+                'width' : p['size']['width'],
+                'height' : p['size']['height']
+            }
+        }
 
-        assert decision.surface_format in supported_surface_formats, f"surface format {decision.surface_format} not supported for codec {caps.eCodecType} chroma {caps.eChromaFormat} depth {caps.nBitDepthMinus8 + 8}"
-        assert decision.num_surfaces >= 0, "number of surfaces must be non-negative"
-        if hasattr(decision, 'cropping'):
-            # the provided cropping is offsetted 
-            display_area = SRECT(
-                left = vf.display_area.left + decision.cropping.left,
-                top = vf.display_area.top + decision.cropping.top,
-                right = vf.display_area.left + decision.cropping.right,
-                bottom = vf.display_area.top + decision.cropping.bottom
-            )
-        else:
-            display_area = SRECT(
-                left=vf.display_area.left, 
-                top=vf.display_area.top, 
-                right=vf.display_area.right, 
-                bottom=vf.display_area.bottom
-                )
-        if hasattr(decision, 'target_size'):
-            target_size = decision.target_size
-        else:
-            target_size = SimpleNamespace(
-                width = display_area.right - display_area.left, 
-                height = display_area.bottom - display_area.top)
-   
+        decision |= self.decide(p)
+
+        assert decision['num_pictures'] <= 32, f"number of pictures {decision['num_pictures']} > 32 max"
+
+        assert decision['surface_format'] in supported_surface_formats, f"surface format {decision['surface_format']} not supported for codec {caps.eCodecType} chroma {caps.eChromaFormat} depth {caps.nBitDepthMinus8 + 8}"
+        assert decision['num_surfaces'] >= 0, "number of surfaces must be non-negative"
+        da = vf.display_area
+        c = decision['cropping']        
+        # the provided cropping is offsetted 
+        display_area = SRECT(
+            left = da.left + c['left'],
+            top = da.top + c['top'],
+            right = da.left + c['right'],
+            bottom = da.top + c['bottom']
+        )
+
         p = CUVIDDECODECREATEINFO(
             ulWidth = vf.coded_width,
             ulHeight = vf.coded_height,
-            ulNumDecodeSurfaces = decision.num_pictures,
+            ulNumDecodeSurfaces = decision['num_pictures'],
             CodecType = vf.codec,
             ChromaFormat = vf.chroma_format,
             ulCreationFlags = cudaVideoCreateFlags.PreferCUVID.value,
@@ -280,11 +285,11 @@ class BaseDecoder:
             ulMaxWidth = vf.coded_width,
             ulMaxHeight = vf.coded_height,
             display_area = display_area,
-            OutputFormat = decision.surface_format.value,
+            OutputFormat = decision['surface_format'].value,
             DeinterlaceMode = (cudaVideoDeinterlaceMode.Weave if vf.progressive_sequence else cudaVideoDeinterlaceMode.Adaptive).value,
-            ulTargetWidth = target_size.width,
-            ulTargetHeight = target_size.height,
-            ulNumOutputSurfaces = decision.num_surfaces,
+            ulTargetWidth = decision['target_size']['width'],
+            ulTargetHeight = decision['target_size']['height'],
+            ulNumOutputSurfaces = decision['num_surfaces'],
             vidLock = None,
             enableHistogram = 0
         )
@@ -303,11 +308,11 @@ class BaseDecoder:
         self.pictures_used = set() 
         self.pictures_cond = Condition()
         self.surfaces_to_unmap = set() # surfaces waiting to be unmap 
-        self.surfaces_avail = decision.num_surfaces # number of surfaces available
+        self.surfaces_avail = decision['num_surfaces'] # number of surfaces available
         self.surfaces_cond = Condition()
         self.decode_create_info = p # save for user use
         log.debug('sequence successful')
-        return decision.num_pictures
+        return decision['num_pictures']
 
     @property
     def codec(self):
@@ -370,7 +375,7 @@ class BaseDecoder:
     the __init__ itself doesn't involves any cuda operations or cuda context 
     '''        
 
-    def __init__(self, codec: cudaVideoCodec, on_recv, decide = decide):
+    def __init__(self, codec: cudaVideoCodec, on_recv, decide = lambda p: {}):
         self.dirty = False
         self.on_recv = on_recv
         self.decide = decide
@@ -486,7 +491,7 @@ class Decoder(BaseDecoder):
             del packet # to allow buffer reuse
 
 
-    def __init__(self, codec: cudaVideoCodec, decide = decide):
+    def __init__(self, codec: cudaVideoCodec, decide=lambda p: {}):
         self.pictures = Queue()
         on_recv = lambda pic,pts : self.pictures.put((pic, pts))
         super().__init__(codec, on_recv, decide)
