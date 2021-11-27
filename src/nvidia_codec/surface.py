@@ -7,7 +7,6 @@ log = logging.getLogger(__name__)
 
 # extra surface formats
 class Surface:
-    
     def calculate_pitch(self):
         device = cuda.Context.get_device()
         texture_alignment = device.get_attribute(cuda.device_attribute.TEXTURE_ALIGNMENT)
@@ -24,23 +23,14 @@ class Surface:
     width and height are in pixels
     dry_run: if True, don't actually allocate memory, just calculate the pitch
     '''
-    def __init__(self, width, height, pitch = None, dry_run = False):
+    def __init__(self, width, height):
         self.width = width
         self.height = height
-
-        if pitch is None:
-            self.pitch = self.calculate_pitch()
-        else:
-            self.pitch = pitch
-
-        if not dry_run:
-            self.dev_alloc = cuda.mem_alloc(self.pitch * self.height_in_rows)
-            self.devptr = int(self.dev_alloc)
 
     def download(self, stream = None):
         arr = cuda.pagelocked_empty((self.height_in_rows, self.width_in_bytes), dtype=np.uint8)
         m = cuda.Memcpy2D()
-        m.set_src_device(self.devptr)
+        m.set_src_device(self.alloc)
         m.src_pitch = self.pitch
         m.set_dst_host(arr)
         m.dst_pitch = arr.strides[0]
@@ -67,6 +57,43 @@ class SurfaceRGB444P(Surface):
     def width_in_bytes(self):
         return self.width
 
+    @property
+    def height_in_rows(self):
+        return self.height * 3
+
+class SurfaceNV12(Surface):
+    @property
+    def width_in_bytes(self):
+        return self.width 
+
+    @property
+    def height_in_rows(self):
+        # assert self.height % 2 == 0
+        return self.height // 2 * 3
+
+class SurfaceP016(Surface):
+    @property
+    def width_in_bytes(self):
+        return self.width * 2
+
+    @property
+    def height_in_rows(self):
+        return self.height // 2 * 3
+
+class SurfaceYUV444(Surface):
+    @property
+    def width_in_bytes(self):
+        return self.width
+
+    @property
+    def height_in_rows(self):
+        return self.height * 3
+
+class SurfaceYUV444_16Bit(Surface):
+    @property
+    def width_in_bytes(self):
+        return self.width * 2
+    
     @property
     def height_in_rows(self):
         return self.height * 3

@@ -47,10 +47,10 @@ class CUVIDEOFORMAT(Structure):
                 ('coded_height', c_uint),
                 ('display_area', IRECT),
                 ('chroma_format', c_int), # should be cudaVideoChromaFormat
-                ('bitrate', c_uint),
-                ('display_aspect_ratio', DISPLAYASPECTRATIO),
-                ('video_signal_description', VIDEO_SIGNAL_DESCRIPTION),
-                ('seqhdr_data_length', c_uint)
+                # ('bitrate', c_uint),
+                # ('display_aspect_ratio', DISPLAYASPECTRATIO),
+                # ('video_signal_description', VIDEO_SIGNAL_DESCRIPTION),
+                # ('seqhdr_data_length', c_uint)
                 ]
 
 
