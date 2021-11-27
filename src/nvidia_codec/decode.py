@@ -11,21 +11,6 @@ log = logging.getLogger(__name__)
 
 nvcuvid = cdll.LoadLibrary('libnvcuvid.so')
 
-'''
-Question: how do we utilize cuda streams for parallelism?
-operations that requires CUstream as parameters:
-1. mapsurface: copy from decoder picture to CUDA surface
-2. all following operations on the surface (color transform, filtering, etc)
-
-solution: require the user to provide stream on which the mapsurface operation is performed. This way the user can choose where to insert mapsurface operation between their own operations, maximize parallism.
-'''
-
-'''
-Question: should we take cuda context on init, and make it current on every operations? Or do we do nothing in our function, and expect the user to handle the context well?
-
-answer: we should handle it. Because it HAS to be the same context throughout the process anyway, no need to bother user with context management everytime they call our function. The user also don't know our thread/callback structure, so it's hard to manage context. 
-'''
-
 class DecoderSurfaceAllocation(cuda.PointerHolderBase):
     '''
     don't call this yourself; call Picture.map
@@ -46,30 +31,6 @@ class DecoderSurfaceAllocation(cuda.PointerHolderBase):
                 self.decoder.surfaces_to_unmap.add(int(self))
                 self.decoder.surfaces_cond.notify_all()
         
-    # @property
-    # def width(self):
-    #     return self.decoder.decode_create_info.ulTargetWidth
-
-    # @property
-    # def height(self):
-    #     return self.decoder.decode_create_info.ulTargetHeight
-
-    # '''
-    # must be called with appropriate cuda context
-    # '''
-    # def download(self, stream = None):
-    #     assert self.height % 2 == 0
-    #     arr = cuda.pagelocked_empty((self.height_in_rows, self.width_in_bytes), dtype=np.uint8)
-    #     m = cuda.Memcpy2D()
-    #     m.set_src_device(self.devptr)
-    #     m.src_pitch = self.pitch
-    #     m.set_dst_host(arr)
-    #     m.dst_pitch = arr.strides[0]
-    #     m.width_in_bytes = self.width_in_bytes
-    #     m.height = self.height_in_rows
-    #     CUDAcall(m, stream)
-    #     return arr        
-
 format2class = {
     cudaVideoSurfaceFormat.NV12 : SurfaceNV12,
     cudaVideoSurfaceFormat.P016 : SurfaceP016,
@@ -160,8 +121,6 @@ def decide_surface_format(chroma_format, bit_depth, supported_surface_formats, a
 
     return f
 
-# DecideIn = namedtuple('DecideIn', ['chroma_format', 'bit_depth', 'size', 'supported_surface_formats', 'min_num_pictures'])
-# DecideOut = namedtuple('DecideOut', ['surface_format', 'num_surfaces', 'num_pictuers', 'cropping', 'target_size'
 class BaseDecoder:
     '''
     wrapper for callbacks, so they return the error code as expected by cuvid; 
@@ -184,18 +143,18 @@ class BaseDecoder:
         if self.decoder:
             def cmp(a,b):
                 if type(a) is not type(b):
-                    log.warning(f'{type(a)} {type(b)}')
+                    log.debug(f'{type(a)} {type(b)}')
                     return False
                 for k,_ in a._fields_:
-                    log.warning(f'checking {k}')
+                    log.debug(f'checking {k}')
                     va = getattr(a, k) 
                     vb = getattr(b, k)
                     if isinstance(va, Structure) and isinstance(vb, Structure):
                         if not cmp(va, vb):
-                            log.warning(f'{va} not equal to {vb}')
+                            log.debug(f'{va} not equal to {vb}')
                             return False
                     elif va != vb:
-                        log.warning(f'{va} not equal to {vb}')
+                        log.debug(f'{va} not equal to {vb}')
                         return False
                 return True
 
@@ -369,15 +328,6 @@ class BaseDecoder:
                     self.operating_point = 0
                 return self.operating_point | (1 << 10 if self.disp_all_layers else 0)
         return -1
-
-
-    '''
-    select_surface_format: a function that returns the surface format to use; see the default for an example
-    extra_pictures: extra pictures to allocate (in addition to the ones needed for correct decoding); can be used for lookback; negative for maxiumum (32)
-    surfaces: number of surfaces to allocate
-    note that both pictures and surfaces are pre-allocated when decoder is created.
-    the __init__ itself doesn't involves any cuda operations or cuda context 
-    '''        
 
     def __init__(self, codec: cudaVideoCodec, on_recv, decide = lambda p: {}):
         self.dirty = False
