@@ -3,7 +3,7 @@ import pycuda.driver as cuda
 from . import decode
 import numpy as np
 from .cuda import call as CUDAcall
-from .extras import *
+from .surface import *
 from .decode import *
 
 import cppyy
@@ -55,16 +55,14 @@ class Converter:
         else:
             f = True # source is full range
 
-        os = target_format(w, h, dry_run=True)
+        os = target_format(w, h)
         tf = self.target_format = target_format
-        tp = self.target_pitch = os.pitch
+        tp = self.target_pitch = os.calculate_pitch()
         log.debug(f'target pitch = {tp}')
 
         self.mod =  SourceModule(f"""
         #include <stdint.h>
-    __global__ void convert(unsigned long long src_, unsigned long long dst_) {{
-        uint8_t *src = (uint8_t*)src_;
-        uint8_t *dst = (uint8_t*)dst_;
+    __global__ void convert(uint8_t *src, uint8_t *dst) {{
         int x = blockIdx.x * blockDim.x + threadIdx.x; // row
         if (x >= {h}) return;
         int y = blockIdx.y * blockDim.y + threadIdx.y; // column
@@ -98,8 +96,10 @@ class Converter:
             assert type(surface) is self.source_format, "Surface format mismatch"
 
         grid = ((surface.height - 1) // block[0] + 1, (surface.width - 1) // block[1] + 1)
-        os = self.target_format(self.width, self.height, self.target_pitch)
-        log.debug(f'{type(surface.devptr)}, {type(os.devptr)}')
-        # src = cuda.from_device(surface.devptr, (surface.pitch.value * surface.height_in_rows, ), np.uint8)
-        self.convert(np.ulonglong(surface.devptr), np.ulonglong(os.devptr), block=block, grid = grid, **kwargs)
+        os = self.target_format(self.width, self.height)
+        alloc = cuda.mem_alloc(self.target_pitch * os.height_in_rows)
+        os.alloc = alloc
+        os.pitch = self.target_pitch
+        log.debug(f'{type(surface.alloc)}, {type(os.alloc)}')
+        self.convert(np.ulonglong(surface.alloc), np.ulonglong(os.alloc), block=block, grid = grid, **kwargs)
         return os

@@ -54,8 +54,7 @@ class PyAVStreamAdaptor:
             self.out_container.mux_one(bs)
             self.b.flush()
             buf = self.b.getbuffer()
-            yield (buf.getvalue() if copy else buf, bs.pts)
-            del buf # drop reference so b can be resized
+            yield (self.b.getvalue() if copy else self.b.getbuffer(), bs.pts)
 
     '''
     convert an iterator of pyav packets to an iterator of (pts, bytes) 

@@ -1,12 +1,10 @@
-from types import SimpleNamespace
-from collections import namedtuple
 from .cuda import call as CUDAcall
 from .nvcuvid import *
-import pycuda.driver as cuda
-from queue import Empty, Queue
+from .surface import *
+from queue import Queue
 import numpy as np
 from ctypes import *
-from threading import Condition, RLock
+from threading import Condition
 
 import logging
 log = logging.getLogger(__name__)
@@ -28,83 +26,49 @@ Question: should we take cuda context on init, and make it current on every oper
 answer: we should handle it. Because it HAS to be the same context throughout the process anyway, no need to bother user with context management everytime they call our function. The user also don't know our thread/callback structure, so it's hard to manage context. 
 '''
 
-class Surface:
+class DecoderSurfaceAllocation(cuda.PointerHolderBase):
     '''
     don't call this yourself; call Picture.map
     '''
-    def __init__(self, decoder, c_devptr, c_pitch):
+    def __init__(self, decoder, c_devptr):
+        super().__init__()
         self.decoder = decoder
         # ctypes is pain to handle, so we convert it to python int        
-        self.devptr = c_devptr.value 
-        self.pitch = c_pitch.value
+        self.c_devptr = c_devptr
+
+    def get_pointer(self):
+        return self.c_devptr.value
 
     def __del__(self):
-        log.debug(f'trying to unmap {self.devptr}')
-        if self.devptr:
+        log.debug(f'trying to unmap {self.c_devptr}')
+        if self.c_devptr:
             with self.decoder.surfaces_cond:
-                self.decoder.surfaces_to_unmap.add(self.devptr)
+                self.decoder.surfaces_to_unmap.add(int(self))
                 self.decoder.surfaces_cond.notify_all()
         
-    @property
-    def width(self):
-        return self.decoder.decode_create_info.ulTargetWidth
+    # @property
+    # def width(self):
+    #     return self.decoder.decode_create_info.ulTargetWidth
 
-    @property
-    def height(self):
-        return self.decoder.decode_create_info.ulTargetHeight
+    # @property
+    # def height(self):
+    #     return self.decoder.decode_create_info.ulTargetHeight
 
-    '''
-    must be called with appropriate cuda context
-    '''
-    def download(self, stream = None):
-        assert self.height % 2 == 0
-        arr = cuda.pagelocked_empty((self.height_in_rows, self.width_in_bytes), dtype=np.uint8)
-        m = cuda.Memcpy2D()
-        m.set_src_device(self.devptr)
-        m.src_pitch = self.pitch
-        m.set_dst_host(arr)
-        m.dst_pitch = arr.strides[0]
-        m.width_in_bytes = self.width_in_bytes
-        m.height = self.height_in_rows
-        CUDAcall(m, stream)
-        return arr        
-
-class SurfaceNV12(Surface):
-    @property
-    def width_in_bytes(self):
-        return self.width 
-
-    @property
-    def height_in_rows(self):
-        # assert self.height % 2 == 0
-        return self.height // 2 * 3
-
-class SurfaceP016(Surface):
-    @property
-    def width_in_bytes(self):
-        return self.width * 2
-
-    @property
-    def height_in_rows(self):
-        return self.height // 2 * 3
-
-class SurfaceYUV444(Surface):
-    @property
-    def width_in_bytes(self):
-        return self.width
-
-    @property
-    def height_in_rows(self):
-        return self.height * 3
-
-class SurfaceYUV444_16Bit(Surface):
-    @property
-    def width_in_bytes(self):
-        return self.width * 2
-    
-    @property
-    def height_in_rows(self):
-        return self.height * 3
+    # '''
+    # must be called with appropriate cuda context
+    # '''
+    # def download(self, stream = None):
+    #     assert self.height % 2 == 0
+    #     arr = cuda.pagelocked_empty((self.height_in_rows, self.width_in_bytes), dtype=np.uint8)
+    #     m = cuda.Memcpy2D()
+    #     m.set_src_device(self.devptr)
+    #     m.src_pitch = self.pitch
+    #     m.set_dst_host(arr)
+    #     m.dst_pitch = arr.strides[0]
+    #     m.width_in_bytes = self.width_in_bytes
+    #     m.height = self.height_in_rows
+    #     CUDAcall(m, stream)
+    #     return arr        
 
 format2class = {
     cudaVideoSurfaceFormat.NV12 : SurfaceNV12,
@@ -119,7 +83,9 @@ class Picture:
         self.index = params.CurrPicIdx
         with self.decoder.pictures_cond:
             # wait until picture slot is available again
+            log.debug('wait_for_pictures started')
             self.decoder.pictures_cond.wait_for(lambda:self.index not in self.decoder.pictures_used)
+            log.debug('wait_for_pictures finished')
             self.decoder.pictures_used.add(self.index)
 
         CUDAcall(nvcuvid.cuvidDecodePicture, self.decoder.decoder, byref(params))
@@ -141,7 +107,9 @@ class Picture:
 
         with self.decoder.surfaces_cond:
             if self.decoder.surfaces_avail == 0:
+                log.debug('wait_for surface started')
                 self.decoder.surfaces_cond.wait_for(lambda: len(self.decoder.surfaces_to_unmap) > 0)
+                log.debug('wait_for surface finished')
                 # we now make sure we at least have one surface to unmap
                 try:
                     while True:
@@ -156,8 +124,13 @@ class Picture:
             CUDAcall(nvcuvid.cuvidMapVideoFrame64, self.decoder.decoder, self.index, byref(c_devptr), byref(c_pitch), byref(self.params))
             self.decoder.surfaces_avail -= 1
 
+            alloc = DecoderSurfaceAllocation(self.decoder, c_devptr)
+
             cls = format2class[self.decoder.surface_format]
-            return cls(self.decoder, c_devptr, c_pitch)
+            surface = cls(**self.decoder.target_size)
+            surface.alloc = alloc
+            surface.pitch = c_pitch.value
+            return surface
 
 '''
 allow_high: do we allow high-bit-depth? default to False
@@ -207,8 +180,31 @@ class BaseDecoder:
 
     def handleVideoSequence(self, pUserData, pVideoFormat):
         log.debug('sequence')
-        assert not self.decoder, "decoder already initialized, please create a new decoder for new video sequence"
         vf = cast(pVideoFormat, POINTER(CUVIDEOFORMAT)).contents
+        if self.decoder:
+            def cmp(a,b):
+                if type(a) is not type(b):
+                    log.warning(f'{type(a)} {type(b)}')
+                    return False
+                for k,_ in a._fields_:
+                    log.warning(f'checking {k}')
+                    va = getattr(a, k) 
+                    vb = getattr(b, k)
+                    if isinstance(va, Structure) and isinstance(vb, Structure):
+                        if not cmp(va, vb):
+                            log.warning(f'{va} not equal to {vb}')
+                            return False
+                    elif va != vb:
+                        log.warning(f'{va} not equal to {vb}')
+                        return False
+                return True
+
+            # initlized before
+            if cmp(vf, self.video_format):
+                return self.decode_create_info.ulNumDecodeSurfaces
+            else:
+                raise Exception("decoder already initialized, please create a new decoder for new video sequence")
+
 
         caps = CUVIDDECODECAPS(
             eCodecType=vf.codec,
@@ -307,10 +303,11 @@ class BaseDecoder:
         # including the ones in above, and the ones passed to user via on_recv
         self.pictures_used = set() 
         self.pictures_cond = Condition()
-        self.surfaces_to_unmap = set() # surfaces waiting to be unmap 
+        self.surfaces_to_unmap = set() # surfaces waiting to be unmap (their devptr)
         self.surfaces_avail = decision['num_surfaces'] # number of surfaces available
         self.surfaces_cond = Condition()
         self.decode_create_info = p # save for user use
+        memmove(byref(self.video_format), byref(vf), sizeof(CUVIDEOFORMAT))
         log.debug('sequence successful')
         return decision['num_pictures']
 
@@ -320,11 +317,17 @@ class BaseDecoder:
 
     @property
     def coded_size(self):
-        return (self.decode_create_info.ulWidth, self.decode_create_info.ulHeight)
+        return {
+            'width' : self.decode_create_info.ulWidth,
+            'height' : self.decode_create_info.ulHeight
+        }
 
     @property
     def target_size(self):
-        return (self.decode_create_info.ulTargetWidth, self.decode_create_info.ulTargetHeight)
+        return {
+            'width' : self.decode_create_info.ulTargetWidth, 
+            'height' : self.decode_create_info.ulTargetHeight
+        }
 
     @property
     def surface_format(self):
@@ -343,13 +346,14 @@ class BaseDecoder:
     def handlePictureDisplay(self, pUserData, pDispInfo):
         log.debug('display')
         di = cast(pDispInfo, POINTER(CUVIDPARSERDISPINFO)).contents
+        picture = self.reorder_buffer.pop(di.picture_index) # remove this reference        
+
         params = CUVIDPROCPARAMS(
             progressive_frame=di.progressive_frame,
             second_field=di.repeat_first_field + 1,
             top_field_first=di.top_field_first,
             unpaired_field=di.repeat_first_field < 0
         )
-        picture = self.reorder_buffer.pop(di.picture_index) # remove this reference
         picture.on_display(params)
         self.on_recv(picture, di.timestamp)
         return 1
@@ -385,6 +389,7 @@ class BaseDecoder:
         self.disp_all_layers = False
         self.parser = CUvideoparser() # NULL, to be filled in next 
         self.decoder = CUvideodecoder() # NULL, to be filled in later        
+        self.video_format = CUVIDEOFORMAT() # NULL, to be filled in later
 
         self.handleVideoSequenceCallback = PFNVIDSEQUENCECALLBACK(self.catch_exception(self.handleVideoSequence))
         self.handlePictureDecodeCallback = PFNVIDDECODECALLBACK(self.catch_exception(self.handlePictureDecode))
@@ -393,6 +398,8 @@ class BaseDecoder:
         p = CUVIDPARSERPARAMS(
             CodecType=codec.value,
             ulMaxNumDecodeSurfaces=0,
+            ulErrorThreshold=0,
+            ulMaxDisplayDelay=0,
             pUserData=None,
             pfnSequenceCallback=self.handleVideoSequenceCallback,
             pfnDecodePicture=self.handlePictureDecodeCallback,
@@ -402,25 +409,7 @@ class BaseDecoder:
 
         CUDAcall(nvcuvid.cuvidCreateVideoParser, byref(self.parser), byref(p))
 
-    '''
-    flush the pipeline. do this before sending new packets to avoid old pictures
-    '''
-    def flush(self):
-        p = CUVIDSOURCEDATAPACKET(
-            flags = CUvideopacketflags.ENDOFSTREAM.value,
-            payload_size = 0,
-            payload = None,
-            timestamp = 0
-        )
-        # this reset the parser internal state
-        CUDAcall(nvcuvid.cuvidParseVideoData, self.parser, byref(p))
 
-        # frees reorder buffer
-        self.reorder_buffer = {}
-        # no need to set self.pictures - should be set by the previous line
-        # some will remain because user still holds them.
-        
-        self.dirty = False
 
     '''
     packet is expected to be of buffer protocol; None means end of stream
@@ -462,7 +451,24 @@ class BaseDecoder:
             self.exception = None
             raise e
 
+    '''
+    flush the pipeline. do this before sending new packets to avoid old pictures
+    '''
+    def flush(self):
+        p = CUVIDSOURCEDATAPACKET(
+            flags = CUvideopacketflags.ENDOFSTREAM.value,
+            payload_size = 0,
+            payload = None,
+            timestamp = 0
+        )
+        # this reset the parser internal state
+        CUDAcall(nvcuvid.cuvidParseVideoData, self.parser, byref(p))
 
+        # frees reorder buffer
+        self.reorder_buffer = {}
+        # no need to set self.pictures - should be set by the previous line
+        # some will remain because user still holds them.
+                            
 
     def __del__(self):
         if self.parser:
@@ -478,7 +484,7 @@ class Decoder(BaseDecoder):
     def recv(self):
         return self.pictures.get()
     '''
-    takes an iterator of (annex.b packets, timestamp)
+    takes an iterator of (annex.b packets buffer, timestamp)
     returns an iterator of (pictures, timestamp)
     '''
     def decode(self, packets):
@@ -490,6 +496,15 @@ class Decoder(BaseDecoder):
                 yield self.pictures.get()
             del packet # to allow buffer reuse
 
+    def warmup(self, packets):
+        self.flush()
+        for packet, pts in packets:
+            self.send(packet, pts)
+            while not self.pictures.empty():
+                self.pictures.get()
+            if self.decoder:
+                break
+            del packet
 
     def __init__(self, codec: cudaVideoCodec, decide=lambda p: {}):
         self.pictures = Queue()
