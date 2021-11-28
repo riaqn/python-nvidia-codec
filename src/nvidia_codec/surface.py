@@ -52,10 +52,28 @@ class SurfaceRGB24(Surface):
     def height_in_rows(self):
         return self.height
 
+class SurfaceRGB48(Surface):
+    @property
+    def width_in_bytes(self):
+        return self.width * 6
+
+    @property
+    def height_in_rows(self):
+        return self.height
+
 class SurfaceRGB444P(Surface):
     @property
     def width_in_bytes(self):
         return self.width
+
+    @property
+    def height_in_rows(self):
+        return self.height * 3
+
+class SurfaceRGB444P16(Surface):
+    @property
+    def width_in_bytes(self):
+        return self.width * 2
 
     @property
     def height_in_rows(self):
