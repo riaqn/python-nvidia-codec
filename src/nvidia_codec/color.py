@@ -79,6 +79,12 @@ class Converter:
             {stype} U = (({stype}*)(src_uv + x/2 * {sp}))[y/2*2];
             {stype} V = (({stype}*)(src_uv + x/2 * {sp}))[y/2*2 + 1];
             '''
+        elif sf in [SurfaceYUV444, SurfaceYUV444_16Bit]:
+            load_yuv = f'''
+            {stype} Y = (({ttype}*)(src + x * {sp}))[y];
+            {stype} U = (({ttype}*)(src + h * {sp} + x * {sp}))[y];
+            {stype} V = (({ttype}*)(src + h * {sp} * 2 + x * {sp}))[y];
+            '''
         else:
             raise Exception(f"Unsupported source format {sf}")
 
