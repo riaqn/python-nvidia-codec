@@ -16,17 +16,24 @@ Comparison to Video-Processing-Framework
 * Roadmap
 Please open issues if you have ideas for improvement.
 - [X] Decoding
-- [-] Color Conversion
-    - [X] NV12 to RGB24
-    - [ ] P016 to RGB24/RGB48
-    - [ ] YUV444 to RGB24
-    - [ ] YUV444_16Bit to RGB24/RGB48
-    - [X] Color Ranges
+- Color Conversion
+    - Source Format:
+        - [X] NV12
+        - [X] P016
+        - [X] YUV444
+        - [X] YUV444_16Bit
+    - Target Format:
+        - [X] RGB24
+        - [X] RGB48
+        - [X] RGB444P
+        - [X] RGB444P16
+    - Color Ranges
         - [X] MPEG (limited range)
         - [X] JPEG (full range)
-    - [-] Color Space
+    - Color Space
         - [X] BT. 601
         - [X] BT. 709
+        - [X] BT. 2020
         - [ ] ...You tell me
 - [X] support for built-in cropping and scaling provided by NV decoder
 - [X] make the library thread-safe and thread-friendly
