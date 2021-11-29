@@ -30,13 +30,13 @@ class DecoderSurfaceAllocation(cuda.PointerHolderBase):
             with self.decoder.surfaces_cond:
                 self.decoder.surfaces_to_unmap.add(int(self))
                 self.decoder.surfaces_cond.notify_all()
-        
-format2class = {
-    cudaVideoSurfaceFormat.NV12 : SurfaceNV12,
-    cudaVideoSurfaceFormat.P016 : SurfaceP016,
-    cudaVideoSurfaceFormat.YUV444 : SurfaceYUV444,
-    cudaVideoSurfaceFormat.YUV444_16Bit : SurfaceYUV444_16Bit
-}
+
+format2format = {
+    cudaVideoSurfaceFormat.NV12 : SurfaceFormat.YUV420P,
+    cudaVideoSurfaceFormat.P016 : SurfaceFormat.YUV420P16,
+    cudaVideoSurfaceFormat.YUV444 : SurfaceFormat.YUV444P,
+    cudaVideoSurfaceFormat.YUV444_16Bit : SurfaceFormat.YUV444P16,
+}                
         
 class Picture:
     def __init__(self, decoder, params):
@@ -87,8 +87,8 @@ class Picture:
 
             alloc = DecoderSurfaceAllocation(self.decoder, c_devptr)
 
-            cls = format2class[self.decoder.surface_format]
-            surface = cls(**self.decoder.target_size)
+            format = format2format[self.decoder.surface_format]
+            surface = Surface(**self.decoder.target_size, format = format)
             surface.alloc = alloc
             surface.pitch = c_pitch.value
             return surface

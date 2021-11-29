@@ -1,12 +1,47 @@
-import pycuda.driver  as cuda
-from .cuda import call as CUDAcall
+from enum import Enum, auto
+import pycuda.driver as cuda
 import numpy as np
 import logging
 
 log = logging.getLogger(__name__)
 
+class SurfaceFormat(Enum):
+    RGB24 = auto()
+    RGB48 = auto()
+    RGB444P = auto()
+    RGB444P16 = auto()
+    RGB444P16F = auto()
+    YUV420P = auto()
+    YUV420P16 = auto()
+    YUV444P = auto()
+    YUV444P16 = auto()
+
 # extra surface formats
 class Surface:
+    format2wib = {
+        SurfaceFormat.RGB24 : 3,
+        SurfaceFormat.RGB48 : 6,
+        SurfaceFormat.RGB444P : 1,
+        SurfaceFormat.RGB444P16 : 2,
+        SurfaceFormat.RGB444P16F : 2,
+        SurfaceFormat.YUV420P : 1,
+        SurfaceFormat.YUV420P16 : 2,
+        SurfaceFormat.YUV444P : 1,
+        SurfaceFormat.YUV444P16 : 1,
+    }
+
+    format2hir = {
+        SurfaceFormat.RGB24 : 1,
+        SurfaceFormat.RGB48 : 1,
+        SurfaceFormat.RGB444P : 3,
+        SurfaceFormat.RGB444P16 : 3,
+        SurfaceFormat.RGB444P16F : 3,
+        SurfaceFormat.YUV420P : 1.5,
+        SurfaceFormat.YUV420P16 : 1.5,
+        SurfaceFormat.YUV444P : 3,
+        SurfaceFormat.YUV444P16 : 3,
+    }
+
     def calculate_pitch(self):
         device = cuda.Context.get_device()
         texture_alignment = device.get_attribute(cuda.device_attribute.TEXTURE_ALIGNMENT)
@@ -23,9 +58,10 @@ class Surface:
     width and height are in pixels
     dry_run: if True, don't actually allocate memory, just calculate the pitch
     '''
-    def __init__(self, width, height):
+    def __init__(self, width, height, format):
         self.width = width
         self.height = height
+        self.format = format
 
     def download(self, stream = None):
         arr = cuda.pagelocked_empty((self.height_in_rows, self.width_in_bytes), dtype=np.uint8)
@@ -39,79 +75,10 @@ class Surface:
         m(stream)
         return arr        
 
-    def __del__(self):
-        ## no need to free self.dev_alloc; ref-count anyway 
-        pass
-
-class SurfaceRGB24(Surface):
     @property
     def width_in_bytes(self):
-        return self.width * 3
+        return round(self.format2wib[self.format] * self.width)
 
     @property
     def height_in_rows(self):
-        return self.height
-
-class SurfaceRGB48(Surface):
-    @property
-    def width_in_bytes(self):
-        return self.width * 6
-
-    @property
-    def height_in_rows(self):
-        return self.height
-
-class SurfaceRGB444P(Surface):
-    @property
-    def width_in_bytes(self):
-        return self.width
-
-    @property
-    def height_in_rows(self):
-        return self.height * 3
-
-class SurfaceRGB444P16(Surface):
-    @property
-    def width_in_bytes(self):
-        return self.width * 2
-
-    @property
-    def height_in_rows(self):
-        return self.height * 3
-
-class SurfaceNV12(Surface):
-    @property
-    def width_in_bytes(self):
-        return self.width 
-
-    @property
-    def height_in_rows(self):
-        # assert self.height % 2 == 0
-        return self.height // 2 * 3
-
-class SurfaceP016(Surface):
-    @property
-    def width_in_bytes(self):
-        return self.width * 2
-
-    @property
-    def height_in_rows(self):
-        return self.height // 2 * 3
-
-class SurfaceYUV444(Surface):
-    @property
-    def width_in_bytes(self):
-        return self.width
-
-    @property
-    def height_in_rows(self):
-        return self.height * 3
-
-class SurfaceYUV444_16Bit(Surface):
-    @property
-    def width_in_bytes(self):
-        return self.width * 2
-    
-    @property
-    def height_in_rows(self):
-        return self.height * 3
+        return round(self.format2hir[self.format] * self.height)
