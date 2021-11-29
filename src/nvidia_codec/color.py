@@ -1,8 +1,6 @@
 from pycuda.compiler import SourceModule
 import pycuda.driver as cuda
-from . import decode
 import numpy as np
-from .cuda import call as CUDAcall
 from .surface import *
 from .decode import *
 
@@ -28,58 +26,63 @@ ensure it operates under the same context
 '''
 class Converter:
     def __init__(self, source_template, source_space, source_range, 
-    target_format = SurfaceRGB24, target_space = c.AVCOL_SPC_RGB, target_range = c.AVCOL_RANGE_JPEG):
+    target_format = SurfaceFormat.RGB24, target_space = c.AVCOL_SPC_RGB, target_range = c.AVCOL_RANGE_JPEG):
         # template is typically a Surface
         st = source_template
         w = self.width = st.width
         h = self.height = st.height
-        sf = self.source_format = type(source_template)
+        sf = self.source_format = st.format
         sp = self.source_pitch = st.pitch
 
-        os = target_format(w, h)
+        ts = Surface(w, h, target_format)
         tf = self.target_format = target_format
-        tp = self.target_pitch = os.calculate_pitch()        
+        tp = self.target_pitch = ts.calculate_pitch()        
         log.debug(f'source pitch {sp}')
 
         assert target_space == c.AVCOL_SPC_RGB, "Only support RGB as output"
+        assert target_range == c.AVCOL_RANGE_JPEG, "Only support JPEG (full range) as output"
 
-        if sf in [SurfaceP016, SurfaceYUV444_16Bit]:
+        if sf in [SurfaceFormat.YUV444P16, SurfaceFormat.YUV420P16]:
             stype = 'uint16_t'
-        elif sf in [SurfaceNV12, SurfaceYUV444]:
+        elif sf in [SurfaceFormat.YUV444P, SurfaceFormat.YUV420P]:
             stype = 'uint8_t'
         else:
             raise Exception(f"Unsupported source format {sf}")
 
-        if tf in [SurfaceRGB48, SurfaceRGB444P16]:
+        if tf in [SurfaceFormat.RGB48, SurfaceFormat.RGB444P16]:
             ttype = 'uint16_t'
             normalize_rgb = f'''
             {ttype} R = min(max(R_ * 65536, .5), 65536 - .5);
             {ttype} G = min(max(G_ * 65536, .5), 65536 - .5);
             {ttype} B = min(max(B_ * 65536, .5), 65536 - .5);
             '''
-        elif tf in [SurfaceRGB24, SurfaceRGB444P]:
+        elif tf in [SurfaceFormat.RGB24, SurfaceFormat.RGB444P]:
             ttype = 'uint8_t'
             normalize_rgb = f'''
             {ttype} R = min(max(R_ * 256, .5), 256 - .5);
             {ttype} G = min(max(G_ * 256, .5), 256 - .5);
             {ttype} B = min(max(B_ * 256, .5), 256 - .5);
             '''
+        elif tf in [SurfaceFormat.RGB444P16F]:
+            ttype = '__half'
+            normalize_rgb = f'''
+            {ttype} R = __float2half(min(max(R_, 0.0), 1.0));
+            {ttype} G = __float2half(min(max(G_, 0.0), 1.0));
+            {ttype} B = __float2half(min(max(B_, 0.0), 1.0));
+            '''
         else:
             raise Exception(f"Unsupported target format {tf}")
 
-        if stype == 'uint16_t' and ttype == 'uint16_t':
-            mtype = 'double'
-        else:
-            mtype = 'float'
+        mtype = 'float' # maybe use __half when either sf or tf is low res
 
-        if sf in [SurfaceNV12, SurfaceP016]:
+        if sf in [SurfaceFormat.YUV420P, SurfaceFormat.YUV420P16]:
             load_yuv = f'''
             {stype} Y = (({stype}*)(src + x * {sp}))[y];
             uint8_t *src_uv = src + {sp} * {h};
             {stype} U = (({stype}*)(src_uv + x/2 * {sp}))[y/2*2];
             {stype} V = (({stype}*)(src_uv + x/2 * {sp}))[y/2*2 + 1];
             '''
-        elif sf in [SurfaceYUV444, SurfaceYUV444_16Bit]:
+        elif sf in [SurfaceFormat.YUV444P, SurfaceFormat.YUV444P16]:
             load_yuv = f'''
             {stype} Y = (({ttype}*)(src + x * {sp}))[y];
             {stype} U = (({ttype}*)(src + h * {sp} + x * {sp}))[y];
@@ -119,13 +122,13 @@ class Converter:
         {mtype} B_ = {m[2][0]} * Y_ + {m[2][1]} * U_ + {m[2][2]} * V_;
         '''
 
-        if tf in [SurfaceRGB24, SurfaceRGB48]:
+        if tf in [SurfaceFormat.RGB24, SurfaceFormat.RGB48]:
             store_rgb = f'''
             (({ttype}*)(dst + x * {tp}))[y * 3] = R;
             (({ttype}*)(dst + x * {tp}))[y * 3 + 1] = G;
             (({ttype}*)(dst + x * {tp}))[y * 3 + 2] = B;
             '''
-        elif tf in [SurfaceRGB444P, SurfaceRGB444P16]:
+        elif tf in [SurfaceFormat.RGB444P, SurfaceFormat.RGB444P16, SurfaceFormat.RGB444P16F]:
             store_rgb = f'''
             (({ttype}*)(dst + x * {tp}))[y] = R;
             (({ttype}*)(dst + h * {tp} + x * {tp}))[y] = G;
@@ -150,18 +153,21 @@ class Converter:
     """)
         self.convert = self.mod.get_function("convert")
 
-    def __call__(self, surface, block = (32, 32, 1), check = True, **kwargs):
+    def __call__(self, surface, target = 'pycuda', check = True, block = (32, 32, 1), **kwargs):
         if check:
             assert surface.height == self.height, "Surface height mismatch"
             assert surface.width == self.width, "Surface width mismatch"
             assert surface.pitch == self.source_pitch, f"Surface pitch mismatch, {surface.pitch} {self.source_pitch}"
-            assert type(surface) is self.source_format, "Surface format mismatch"
+            assert surface.format is self.source_format, "Surface format mismatch"
 
         grid = ((surface.height - 1) // block[0] + 1, (surface.width - 1) // block[1] + 1)
-        os = self.target_format(self.width, self.height)
-        alloc = cuda.mem_alloc(self.target_pitch * os.height_in_rows)
-        os.alloc = alloc
-        os.pitch = self.target_pitch
-        log.debug(f'{type(surface.alloc)}, {type(os.alloc)}')
-        self.convert(np.ulonglong(surface.alloc), np.ulonglong(os.alloc), block=block, grid = grid, **kwargs)
-        return os
+        if target == 'pycuda':
+            ts = Surface(self.width, self.height, self.target_format)
+            alloc = cuda.mem_alloc(self.target_pitch * ts.height_in_rows)
+            ts.alloc = alloc
+            ts.pitch = self.target_pitch
+            log.debug(f'{type(surface.alloc)}, {type(ts.alloc)}')
+            self.convert(np.ulonglong(surface.alloc), np.ulonglong(ts.alloc), block=block, grid = grid, **kwargs)
+        else:
+            raise Exception(f"Unsupported target {target}")
+        return ts
