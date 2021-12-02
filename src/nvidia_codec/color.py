@@ -1,10 +1,11 @@
+from ctypes import c_ulonglong, c_void_p
 from pycuda.compiler import SourceModule
 import pycuda.driver as cuda
 import numpy as np
-from .surface import *
-from .decode import *
+from .common import *
 
 import cppyy
+
 
 cppyy.c_include('libavutil/avutil.h')
 
@@ -16,95 +17,130 @@ We are doing some metaprogramming; according to pycuda,
 constant is much faster than variable in e.g. multipllication
 it's therefore worthwhile to compile the specialized code
 this should be faster than the official color cvt in NPP
-
-source_template should be an object of a subclass of extras.Surface or decode.Surface
-
-color space and color ranges are defined as in ffmpeg pixfmt.h
-
-It doesn't handle cuda context switching - 
-ensure it operates under the same context
 '''
 class Converter:
-    def __init__(self, source_template, source_space, source_range, 
-    target_format = SurfaceFormat.RGB24, target_space = c.AVCOL_SPC_RGB, target_range = c.AVCOL_RANGE_JPEG):
-        # template is typically a Surface
-        st = source_template
-        w = self.width = st.width
-        h = self.height = st.height
-        sf = self.source_format = st.format
-        sp = self.source_pitch = st.pitch
 
-        ts = Surface(w, h, target_format)
-        tf = self.target_format = target_format
-        tp = self.target_pitch = ts.calculate_pitch()        
-        log.debug(f'source pitch {sp}')
+    @staticmethod
+    def idx(base, dtype, stride, *indices):
+        code = f'((uint8_t *)({base}))'
+        # index is string 
+        # stide is integer
+        assert len(indices) <= len(stride)
+        for index, strid in zip(indices, stride):
+            code += f'+ ({index}) * {strid}'
+        return f'(*({dtype} *)({code}))'
+        
+    def __init__(self, source_template, source_format, source_space, source_range, 
+    target_template = None, target_format = SurfaceFormat.RGB444P, target_space = c.AVCOL_SPC_RGB, target_range = c.AVCOL_RANGE_JPEG):
+        source = source_template.__cuda_array_interface__
+        self.source_shape = source['shape']
+        self.source_strides = source['strides']
+        self.source_typestr = source['typestr']
 
-        assert target_space == c.AVCOL_SPC_RGB, "Only support RGB as output"
-        assert target_range == c.AVCOL_RANGE_JPEG, "Only support JPEG (full range) as output"
+        self.size = shape2size(source_format, self.source_shape)
+        self.target_shape = size2shape(target_format, self.size)
 
-        if sf in [SurfaceFormat.YUV444P16, SurfaceFormat.YUV420P16]:
-            stype = 'uint16_t'
-        elif sf in [SurfaceFormat.YUV444P, SurfaceFormat.YUV420P]:
-            stype = 'uint8_t'
+        target = target_template.__cuda_array_interface__
+        assert self.target_shape == target['shape']
+        self.target_strides = target['strides']
+        self.target_typestr = target['typestr']        
+        
+        if self.source_typestr[1:] in ['f4', 'u2'] and self.target_typestr[1:] in ['f4', 'u2']:
+            mtype = 'float'
         else:
-            raise Exception(f"Unsupported source format {sf}")
+            # todo: use low precision 
+            mtype = 'float'
 
-        if tf in [SurfaceFormat.RGB48, SurfaceFormat.RGB444P16]:
+        if source['typestr'] == '|u1':
+            stype = 'uint8_t'
+            if source_range == c.AVCOL_RANGE_MPEG:
+                # partial range
+                normalize_yuv = f'''
+                    {mtype} Y_ = ({mtype})(Y - 16) / ({mtype})220;
+                    {mtype} U_ = ({mtype})(U - 128) / ({mtype})225;
+                    {mtype} V_ = ({mtype})(V - 128) / ({mtype})225;
+                '''
+            elif source_range == c.AVCOL_RANGE_JPEG:
+                # full range
+                normalize_yuv = f'''
+                    {mtype} Y_ = ({mtype})(Y) / ({mtype})256.0;
+                    {mtype} U_ = ({mtype})(U - 128) / ({mtype})256.0;
+                    {mtype} V_ = ({mtype})(V - 128) / ({mtype})256.0;
+                '''
+            else:
+                raise Exception(f"Unsupported source range {source_range}")
+        elif source['typestr'] == '<u2':
+            stype = 'uint16_t'
+            if source_range == c.AVCOL_RANGE_MPEG:
+                # partial range
+                normalize_yuv = f'''
+                    {mtype} Y_ = ({mtype})(Y - (16<<8)) / ({mtype})(220 << 8);
+                    {mtype} U_ = ({mtype})(U - (128<<8)) / ({mtype})(225 << 8);
+                    {mtype} V_ = ({mtype})(V - (128<<8)) / ({mtype})(225 << 8);
+                '''
+            elif source_range == c.AVCOL_RANGE_JPEG:
+                # full range
+                normalize_yuv = f'''
+                    {mtype} Y_ = ({mtype})(Y) / ({mtype})(256<<8);
+                    {mtype} U_ = ({mtype})(U - (128<<8)) / ({mtype})(256<<8);
+                    {mtype} V_ = ({mtype})(V - (128<<8)) / ({mtype})(256<<8);
+                '''
+            else:
+                raise Exception(f"Unsupported source range {source_range}")
+        else:
+            raise Exception(f"Unsupported source type {source['typestr']}")
+
+        def src(*indices):
+            return Converter.idx('src', stype, source['strides'], *indices)
+
+        if source_format is SurfaceFormat.YUV420P:
+            self.height, self.width = source['shape'] 
+            self.height = self.height // 3 * 2
+            load_yuv = f'''
+            {stype} Y = {src('x','y')};
+            {stype} U = {src(str(self.height) + ' + x/2', 'y/2*2')};
+            {stype} V = {src(str(self.height) + ' + x/2', 'y/2*2 + 1')};
+            '''
+        elif source_format in SurfaceFormat.YUV444P:
+            self.height, self.width = source['shape']
+            self.height = self.height // 3
+            load_yuv = f'''
+            {stype} Y = {src('0', 'x', 'y')};
+            {stype} U = {src('1', 'x', 'y')};
+            {stype} V = {src('2', 'x', 'y')};
+            '''
+        else:
+            raise Exception(f"Unsupported source format {source_format}")    
+
+        assert target_space == c.AVCOL_SPC_RGB, 'only support RGB space as target'
+        assert target_range == c.AVCOL_RANGE_JPEG, 'only support JPEG range as target'
+
+        if target['typestr'] == '<u2':
             ttype = 'uint16_t'
             normalize_rgb = f'''
-            {ttype} R = min(max(R_ * 65536, .5), 65536 - .5);
-            {ttype} G = min(max(G_ * 65536, .5), 65536 - .5);
-            {ttype} B = min(max(B_ * 65536, .5), 65536 - .5);
+            {ttype} R = min(max(R_ * ({mtype})65536, .5), 65536 - .5);
+            {ttype} G = min(max(G_ * ({mtype})65536, .5), 65536 - .5);
+            {ttype} B = min(max(B_ * ({mtype})65536, .5), 65536 - .5);
             '''
-        elif tf in [SurfaceFormat.RGB24, SurfaceFormat.RGB444P]:
+        elif target['typestr'] == '|u1':
             ttype = 'uint8_t'
             normalize_rgb = f'''
-            {ttype} R = min(max(R_ * 256, .5), 256 - .5);
-            {ttype} G = min(max(G_ * 256, .5), 256 - .5);
-            {ttype} B = min(max(B_ * 256, .5), 256 - .5);
+            {ttype} R = min(max(R_ * ({mtype})256, .5), 256 - .5);
+            {ttype} G = min(max(G_ * ({mtype})256, .5), 256 - .5);
+            {ttype} B = min(max(B_ * ({mtype})256, .5), 256 - .5);
             '''
-        elif tf in [SurfaceFormat.RGB444P16F]:
-            ttype = '__half'
+        elif target['typestr'] == '<f4':
+            ttype = 'float'
             normalize_rgb = f'''
-            {ttype} R = __float2half(min(max(R_, 0.0), 1.0));
-            {ttype} G = __float2half(min(max(G_, 0.0), 1.0));
-            {ttype} B = __float2half(min(max(B_, 0.0), 1.0));
+            {ttype} R = min(max(R_, 0.0), 1.0);
+            {ttype} G = min(max(G_, 0.0), 1.0);
+            {ttype} B = min(max(B_, 0.0), 1.0);
             '''
         else:
-            raise Exception(f"Unsupported target format {tf}")
+            raise Exception(f"Unsupported target type {target['typestr']}")
 
-        mtype = 'float' # maybe use __half when either sf or tf is low res
-
-        if sf in [SurfaceFormat.YUV420P, SurfaceFormat.YUV420P16]:
-            load_yuv = f'''
-            {stype} Y = (({stype}*)(src + x * {sp}))[y];
-            uint8_t *src_uv = src + {sp} * {h};
-            {stype} U = (({stype}*)(src_uv + x/2 * {sp}))[y/2*2];
-            {stype} V = (({stype}*)(src_uv + x/2 * {sp}))[y/2*2 + 1];
-            '''
-        elif sf in [SurfaceFormat.YUV444P, SurfaceFormat.YUV444P16]:
-            load_yuv = f'''
-            {stype} Y = (({ttype}*)(src + x * {sp}))[y];
-            {stype} U = (({ttype}*)(src + h * {sp} + x * {sp}))[y];
-            {stype} V = (({ttype}*)(src + h * {sp} * 2 + x * {sp}))[y];
-            '''
-        else:
-            raise Exception(f"Unsupported source format {sf}")
-
-        if source_range == c.AVCOL_RANGE_MPEG:
-            # partial range
-            normalize_yuv = f'''
-                {mtype} Y_ = ({mtype})(Y - 16) / 220;
-                {mtype} U_ = ({mtype})(U - 128) / 225;
-                {mtype} V_ = ({mtype})(V - 128) / 225;
-            '''
-        else:
-            # full range
-            normalize_yuv = f'''
-                {mtype} Y_ = ({mtype})(Y) / 256;
-                {mtype} U_ = ({mtype})(U - 128) / 256;
-                {mtype} V_ = ({mtype})(V - 128) / 256;
-            '''
+        def dst(*indices):
+            return Converter.idx('dst', ttype, target['strides'], *indices)
 
         if source_space in [c.AVCOL_SPC_BT470BG, c.AVCOL_SPC_SMPTE170M]:
             m = [[1, 0, 1.402], [1, -0.34414, -0.71414], [1, 1.772, 0]]
@@ -122,28 +158,22 @@ class Converter:
         {mtype} B_ = {m[2][0]} * Y_ + {m[2][1]} * U_ + {m[2][2]} * V_;
         '''
 
-        if tf in [SurfaceFormat.RGB24, SurfaceFormat.RGB48]:
+        if target_format is SurfaceFormat.RGB444P:
             store_rgb = f'''
-            (({ttype}*)(dst + x * {tp}))[y * 3] = R;
-            (({ttype}*)(dst + x * {tp}))[y * 3 + 1] = G;
-            (({ttype}*)(dst + x * {tp}))[y * 3 + 2] = B;
-            '''
-        elif tf in [SurfaceFormat.RGB444P, SurfaceFormat.RGB444P16, SurfaceFormat.RGB444P16F]:
-            store_rgb = f'''
-            (({ttype}*)(dst + x * {tp}))[y] = R;
-            (({ttype}*)(dst + h * {tp} + x * {tp}))[y] = G;
-            (({ttype}*)(dst + h * {tp} * 2 + x * {tp}))[y] = B;
+            {dst('0', 'x', 'y')} = R;
+            {dst('1', 'x', 'y')} = G;
+            {dst('2', 'x', 'y')} = B;
             '''
         else:
-            raise Exception(f"Unsupported target format {tf}")
+            raise Exception(f"Unsupported target format {target_format}")
 
         self.mod =  SourceModule(f"""
         #include <stdint.h>
     __global__ void convert(uint8_t *src, uint8_t *dst) {{
         int x = blockIdx.x * blockDim.x + threadIdx.x; // row
-        if (x >= {h}) return;
+        if (x >= {self.height}) return;
         int y = blockIdx.y * blockDim.y + threadIdx.y; // column
-        if (y >= {w}) return;
+        if (y >= {self.width}) return;
         {load_yuv}
         {normalize_yuv}
         {yuv_to_rgb}
@@ -153,21 +183,14 @@ class Converter:
     """)
         self.convert = self.mod.get_function("convert")
 
-    def __call__(self, surface, target = 'pycuda', check = True, block = (32, 32, 1), **kwargs):
+    def __call__(self, source, target, check = True, block = (32, 32, 1), **kwargs):
         if check:
-            assert surface.height == self.height, "Surface height mismatch"
-            assert surface.width == self.width, "Surface width mismatch"
-            assert surface.pitch == self.source_pitch, f"Surface pitch mismatch, {surface.pitch} {self.source_pitch}"
-            assert surface.format is self.source_format, "Surface format mismatch"
+            assert source.__cuda_array_interface__['shape'] == self.source_shape
+            assert target.__cuda_array_interface__['shape'] == self.target_shape
+            assert source.__cuda_array_interface__['typestr'] == self.source_typestr
+            assert target.__cuda_array_interface__['typestr'] == self.target_typestr
+            assert source.__cuda_array_interface__['strides'] == self.source_strides
+            assert target.__cuda_array_interface__['strides'] == self.target_strides
 
-        grid = ((surface.height - 1) // block[0] + 1, (surface.width - 1) // block[1] + 1)
-        if target == 'pycuda':
-            ts = Surface(self.width, self.height, self.target_format)
-            alloc = cuda.mem_alloc(self.target_pitch * ts.height_in_rows)
-            ts.alloc = alloc
-            ts.pitch = self.target_pitch
-            log.debug(f'{type(surface.alloc)}, {type(ts.alloc)}')
-            self.convert(np.ulonglong(surface.alloc), np.ulonglong(ts.alloc), block=block, grid = grid, **kwargs)
-        else:
-            raise Exception(f"Unsupported target {target}")
-        return ts
+        grid = ((self.height - 1) // block[0] + 1, (self.width - 1) // block[1] + 1)
+        self.convert(np.ulonglong(source.__cuda_array_interface__['data'][0]), np.ulonglong(target.__cuda_array_interface__['data'][0]), block = block, grid = grid, **kwargs)
