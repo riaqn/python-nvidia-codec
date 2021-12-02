@@ -1,6 +1,6 @@
 from .cuda import call as CUDAcall
 from .nvcuvid import *
-from .surface import *
+from .common import *
 from queue import Queue
 import numpy as np
 from ctypes import *
@@ -11,32 +11,76 @@ log = logging.getLogger(__name__)
 
 nvcuvid = cdll.LoadLibrary('libnvcuvid.so')
 
-class DecoderSurfaceAllocation(cuda.PointerHolderBase):
+class Surface:
     '''
     don't call this yourself; call Picture.map
     '''
-    def __init__(self, decoder, c_devptr):
+    def __init__(self, decoder, c_devptr, c_pitch, stream):
         super().__init__()
         self.decoder = decoder
         # ctypes is pain to handle, so we convert it to python int        
+        self.c_pitch = c_pitch
         self.c_devptr = c_devptr
+        self.stream = stream
 
-    def get_pointer(self):
-        return self.c_devptr.value
+    @property
+    def format(self):
+        format = self.decoder.surface_format
+        if format in [cudaVideoSurfaceFormat.NV12, cudaVideoSurfaceFormat.P016]:
+            return SurfaceFormat.YUV420P
+        elif format in [cudaVideoSurfaceFormat.YUV444, cudaVideoSurfaceFormat.YUV444_16Bit]:
+            return SurfaceFormat.YUV444P
+        else:
+            raise ValueError(f'unsupported format {format}')
+
+    @property
+    def height(self):
+        return self.decoder.target_height
+
+    @property
+    def width(self):
+        return self.decoder.target_width
+
+    @property
+    def size(self):
+        return {'width':self.width, 'height':self.height}
 
     def __del__(self):
         log.debug(f'trying to unmap {self.c_devptr}')
         if self.c_devptr:
             with self.decoder.surfaces_cond:
-                self.decoder.surfaces_to_unmap.add(int(self))
+                self.decoder.surfaces_to_unmap.add(self.c_devptr.value)
                 self.decoder.surfaces_cond.notify_all()
 
-format2format = {
-    cudaVideoSurfaceFormat.NV12 : SurfaceFormat.YUV420P,
-    cudaVideoSurfaceFormat.P016 : SurfaceFormat.YUV420P16,
-    cudaVideoSurfaceFormat.YUV444 : SurfaceFormat.YUV444P,
-    cudaVideoSurfaceFormat.YUV444_16Bit : SurfaceFormat.YUV444P16,
-}                
+    @property
+    def __cuda_array_interface__(self):
+        format = self.decoder.surface_format
+        if format is cudaVideoSurfaceFormat.NV12:
+            shape = (self.height //2 * 3, self.width)
+            typestr = '|u1'
+            strides = (self.c_pitch.value, 1)
+        elif format is cudaVideoSurfaceFormat.P016:
+            shape = (self.height //2 * 3, self.width)
+            typestr = '<u2'
+            strides = (self.c_pitch.value, 2)
+        elif format is cudaVideoSurfaceFormat.YUV444:
+            shape = (3, self.height, self.width)
+            typestr = '|u1'
+            strides = (self.c_pitch.value * self.height, self.c_pitch.value, 1)
+        elif format is cudaVideoSurfaceFormat.YUV444_16Bit:
+            shape = (3, self.height, self.width)
+            typestr = '<u2'
+            strides = (self.c_pitch.value * self.height, self.c_pitch.value, 2)
+        else:
+            raise ValueError(f'unsupported format {format}')
+        return {
+            'shape': shape,
+            'typestr': typestr,
+            'strides': strides,
+            'version': 3,
+            'data': (self.c_devptr.value, False),
+            'stream': get_stream_ptr(self.stream)
+        }        
         
 class Picture:
     def __init__(self, decoder, params):
@@ -63,8 +107,8 @@ class Picture:
     should call within approapriate cuda context
     '''
     def map(self, stream = None):
-        log.debug(f'using stream {stream.handle}')
-        self.params.stream = stream.handle if stream else None
+        self.params.stream = get_stream_ptr(stream)
+        assert self.params.stream != 0, 'must speicfy legacy default stream or per-thread default stream'
 
         with self.decoder.surfaces_cond:
             if self.decoder.surfaces_avail == 0:
@@ -85,12 +129,7 @@ class Picture:
             CUDAcall(nvcuvid.cuvidMapVideoFrame64, self.decoder.decoder, self.index, byref(c_devptr), byref(c_pitch), byref(self.params))
             self.decoder.surfaces_avail -= 1
 
-            alloc = DecoderSurfaceAllocation(self.decoder, c_devptr)
-
-            format = format2format[self.decoder.surface_format]
-            surface = Surface(**self.decoder.target_size, format = format)
-            surface.alloc = alloc
-            surface.pitch = c_pitch.value
+            surface = Surface(self.decoder, c_devptr, c_pitch, stream)
             return surface
 
 '''
@@ -282,10 +321,18 @@ class BaseDecoder:
         }
 
     @property
+    def target_width(self):
+        return self.decode_create_info.ulTargetWidth
+    
+    @property
+    def target_height(self):
+        return self.decode_create_info.ulTargetHeight
+
+    @property
     def target_size(self):
         return {
-            'width' : self.decode_create_info.ulTargetWidth, 
-            'height' : self.decode_create_info.ulTargetHeight
+            'width' : self.target_width,
+            'height' : self.target_height
         }
 
     @property
