@@ -1,16 +1,35 @@
 from ctypes import c_ulonglong, c_void_p
+import itertools
 from pycuda.compiler import SourceModule
 import pycuda.driver as cuda
 import numpy as np
 from .common import *
 
-import cppyy
+# copied from http://www.ffmpeg.org/doxygen/trunk/pixfmt_8h_source.html#l00523
+class Space(Enum):
+    RGB         = 0
+    BT709       = 1 
+    UNSPECIFIED = 2
+    RESERVED    = 3 
+    FCC         = 4 
+    BT470BG     = 5 
+    SMPTE170M   = 6 
+    SMPTE240M   = 7 
+    YCGCO       = 8 
+    YCOCG       = YCGCO
+    BT2020_NCL  = 9  
+    BT2020_CL   = 10 
+    SMPTE2085   = 11
+    CHROMA_DERIVED_NCL = 12
+    CHROMA_DERIVED_CL = 13
+    ICTCP       = 14
+    NB = auto()
 
-
-cppyy.c_include('libavutil/avutil.h')
-
-c = cppyy.gbl
-
+class Range(Enum):
+    UNSPECIFIED = 0
+    MPEG = 1
+    JPEG = 2
+    NB = auto()
 
 '''
 We are doing some metaprogramming; according to pycuda, 
@@ -19,71 +38,90 @@ it's therefore worthwhile to compile the specialized code
 this should be faster than the official color cvt in NPP
 '''
 class Converter:
-
     @staticmethod
-    def idx(base, dtype, stride, *indices):
+    def idx(base, ctype, strides, indices):
         code = f'((uint8_t *)({base}))'
         # index is string 
         # stide is integer
-        assert len(indices) <= len(stride)
-        for index, strid in zip(indices, stride):
-            code += f'+ ({index}) * {strid}'
-        return f'(*({dtype} *)({code}))'
+        assert len(indices) <= len(strides)
+        for index, stride in zip(indices, strides):
+            code += f'+ ({index}) * {stride}'
+        return f'(*({ctype} *)({code}))'
+
+    @staticmethod
+    def shape2strides(shape, typestr):
+        if len(shape) == 0:
+            return (int(typestr[2:]),)
+        else:
+            strides = Converter.shape2strides(shape[1:], typestr)
+            return (strides[0] * shape[0], *strides)
+            
+    @staticmethod
+    def typestr2ctype(typestr):
+        if typestr == '<f4':
+            return 'float'
+        elif typestr == '|u1':
+            return 'uint8_t'
+        elif typestr == '<u2':
+            return 'uint16_t'
+        else:
+            raise ValueError(f'unsupported typestr {typestr}')
         
     def __init__(self, source_template, source_format, source_space, source_range, 
-    target_template = None, target_format = SurfaceFormat.RGB444P, target_space = c.AVCOL_SPC_RGB, target_range = c.AVCOL_RANGE_JPEG):
+    target_template = None, target_format = SurfaceFormat.RGB444P, target_space = Space.RGB, target_range = Range.JPEG):
         source = source_template.__cuda_array_interface__
         self.source_shape = source['shape']
         self.source_strides = source['strides']
         self.source_typestr = source['typestr']
+        if self.source_strides is None:
+            self.source_strides = self.shape2strides(self.source_shape, source['typestr'])[1:]        
 
         self.size = shape2size(source_format, self.source_shape)
         self.target_shape = size2shape(target_format, self.size)
 
         target = target_template.__cuda_array_interface__
-        assert self.target_shape == target['shape']
+        assert self.target_shape == target['shape'], f'{self.target_shape} != {target["shape"]}'
         self.target_strides = target['strides']
-        self.target_typestr = target['typestr']        
-        
-        if self.source_typestr[1:] in ['f4', 'u2'] and self.target_typestr[1:] in ['f4', 'u2']:
-            mtype = 'float'
-        else:
-            # todo: use low precision 
-            mtype = 'float'
+        self.target_typestr = target['typestr']
+        if self.target_strides is None:
+            self.target_strides = self.shape2strides(self.target_shape, target['typestr'])[1:]
 
-        if source['typestr'] == '|u1':
-            stype = 'uint8_t'
-            if source_range == c.AVCOL_RANGE_MPEG:
+        stype = Converter.typestr2ctype(self.source_typestr)
+        ttype = Converter.typestr2ctype(self.target_typestr)
+        
+        mtype = 'float'
+
+        if stype == 'uint8_t':
+            if source_range == Range.MPEG:
                 # partial range
                 normalize_yuv = f'''
-                    {mtype} Y_ = ({mtype})(Y - 16) / ({mtype})220;
-                    {mtype} U_ = ({mtype})(U - 128) / ({mtype})225;
-                    {mtype} V_ = ({mtype})(V - 128) / ({mtype})225;
+                    {mtype} Y_ = ({mtype})(Y - 16) / 220;
+                    {mtype} U_ = ({mtype})(U - 128) / 225;
+                    {mtype} V_ = ({mtype})(V - 128) / 225;
                 '''
-            elif source_range == c.AVCOL_RANGE_JPEG:
+            elif source_range == Range.JPEG:
                 # full range
                 normalize_yuv = f'''
-                    {mtype} Y_ = ({mtype})(Y) / ({mtype})256.0;
-                    {mtype} U_ = ({mtype})(U - 128) / ({mtype})256.0;
-                    {mtype} V_ = ({mtype})(V - 128) / ({mtype})256.0;
+                    {mtype} Y_ = ({mtype})(Y) / 256;
+                    {mtype} U_ = ({mtype})(U - 128) / 256;
+                    {mtype} V_ = ({mtype})(V - 128) / 256;
                 '''
             else:
                 raise Exception(f"Unsupported source range {source_range}")
-        elif source['typestr'] == '<u2':
-            stype = 'uint16_t'
-            if source_range == c.AVCOL_RANGE_MPEG:
+        elif stype == 'uint16_t':
+            if source_range == Range.MPEG:
                 # partial range
                 normalize_yuv = f'''
-                    {mtype} Y_ = ({mtype})(Y - (16<<8)) / ({mtype})(220 << 8);
-                    {mtype} U_ = ({mtype})(U - (128<<8)) / ({mtype})(225 << 8);
-                    {mtype} V_ = ({mtype})(V - (128<<8)) / ({mtype})(225 << 8);
+                    {mtype} Y_ = ({mtype})(Y - (16<<8)) / (220 << 8);
+                    {mtype} U_ = ({mtype})(U - (128<<8)) / (225 << 8);
+                    {mtype} V_ = ({mtype})(V - (128<<8)) / (225 << 8);
                 '''
-            elif source_range == c.AVCOL_RANGE_JPEG:
+            elif source_range == Range.JPEG:
                 # full range
                 normalize_yuv = f'''
-                    {mtype} Y_ = ({mtype})(Y) / ({mtype})(256<<8);
-                    {mtype} U_ = ({mtype})(U - (128<<8)) / ({mtype})(256<<8);
-                    {mtype} V_ = ({mtype})(V - (128<<8)) / ({mtype})(256<<8);
+                    {mtype} Y_ = ({mtype})(Y) / (256<<8);
+                    {mtype} U_ = ({mtype})(U - (128<<8)) / (256<<8);
+                    {mtype} V_ = ({mtype})(V - (128<<8)) / (256<<8);
                 '''
             else:
                 raise Exception(f"Unsupported source range {source_range}")
@@ -91,7 +129,7 @@ class Converter:
             raise Exception(f"Unsupported source type {source['typestr']}")
 
         def src(*indices):
-            return Converter.idx('src', stype, source['strides'], *indices)
+            return Converter.idx('src', stype, self.source_strides, indices)
 
         if source_format is SurfaceFormat.YUV420P:
             self.height, self.width = source['shape'] 
@@ -112,25 +150,22 @@ class Converter:
         else:
             raise Exception(f"Unsupported source format {source_format}")    
 
-        assert target_space == c.AVCOL_SPC_RGB, 'only support RGB space as target'
-        assert target_range == c.AVCOL_RANGE_JPEG, 'only support JPEG range as target'
+        assert target_space == Space.RGB, 'only support RGB space as target'
+        assert target_range == Range.JPEG, 'only support JPEG range as target'
 
-        if target['typestr'] == '<u2':
-            ttype = 'uint16_t'
+        if ttype == 'uint16_t':
             normalize_rgb = f'''
-            {ttype} R = min(max(R_ * ({mtype})65536, .5), 65536 - .5);
-            {ttype} G = min(max(G_ * ({mtype})65536, .5), 65536 - .5);
-            {ttype} B = min(max(B_ * ({mtype})65536, .5), 65536 - .5);
+            {ttype} R = min(max(R_ * 65536, .5), 65536 - .5);
+            {ttype} G = min(max(G_ * 65536, .5), 65536 - .5);
+            {ttype} B = min(max(B_ * 65536, .5), 65536 - .5);
             '''
-        elif target['typestr'] == '|u1':
-            ttype = 'uint8_t'
+        elif ttype == 'uint8_t':
             normalize_rgb = f'''
-            {ttype} R = min(max(R_ * ({mtype})256, .5), 256 - .5);
-            {ttype} G = min(max(G_ * ({mtype})256, .5), 256 - .5);
-            {ttype} B = min(max(B_ * ({mtype})256, .5), 256 - .5);
+            {ttype} R = min(max(R_ * 256, .5), 256 - .5);
+            {ttype} G = min(max(G_ * 256, .5), 256 - .5);
+            {ttype} B = min(max(B_ * 256, .5), 256 - .5);
             '''
-        elif target['typestr'] == '<f4':
-            ttype = 'float'
+        elif ttype == 'float':
             normalize_rgb = f'''
             {ttype} R = min(max(R_, 0.0), 1.0);
             {ttype} G = min(max(G_, 0.0), 1.0);
@@ -140,13 +175,13 @@ class Converter:
             raise Exception(f"Unsupported target type {target['typestr']}")
 
         def dst(*indices):
-            return Converter.idx('dst', ttype, target['strides'], *indices)
+            return Converter.idx('dst', ttype, self.target_strides, indices)
 
-        if source_space in [c.AVCOL_SPC_BT470BG, c.AVCOL_SPC_SMPTE170M]:
+        if source_space in [Space.BT470BG, Space.SMPTE170M]:
             m = [[1, 0, 1.402], [1, -0.34414, -0.71414], [1, 1.772, 0]]
-        elif source_space == c.AVCOL_SPC_BT709:
+        elif source_space == Space.AVCOL_SPC_BT709:
             m = [[1, 0, 1.5748], [1, -0.1873, -0.4681], [1, 1.8556, 0]]
-        elif source_space == c.AVCOL_SPC_BT2020_NCL:
+        elif source_space == Space.AVCOL_SPC_BT2020_NCL:
             # https://gist.github.com/yohhoy/dafa5a47dade85d8b40625261af3776a
             m = [[1, 0, 1.4746], [1, -0.1646, -0.5714], [1, 1.8814, 0]]
         else:
@@ -189,8 +224,8 @@ class Converter:
             assert target.__cuda_array_interface__['shape'] == self.target_shape
             assert source.__cuda_array_interface__['typestr'] == self.source_typestr
             assert target.__cuda_array_interface__['typestr'] == self.target_typestr
-            assert source.__cuda_array_interface__['strides'] == self.source_strides
-            assert target.__cuda_array_interface__['strides'] == self.target_strides
+            # assert source.__cuda_array_interface__['strides'] == self.source_strides
+            # assert target.__cuda_array_interface__['strides'] == self.target_strides
 
         grid = ((self.height - 1) // block[0] + 1, (self.width - 1) // block[1] + 1)
         self.convert(np.ulonglong(source.__cuda_array_interface__['data'][0]), np.ulonglong(target.__cuda_array_interface__['data'][0]), block = block, grid = grid, **kwargs)

@@ -65,6 +65,15 @@ class PyAVStreamAdaptor:
         for packet in packets:
             yield from self.translate_packet(packet, copy = copy)
 
+    def __del__(self):
+        try:
+            self.out_container.close()
+        except TypeError:
+            # to omit the weird error message
+            pass
+
+        self.b.close()
+
 def test():
     pass
 
