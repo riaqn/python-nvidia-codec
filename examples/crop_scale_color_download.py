@@ -11,10 +11,7 @@ import faulthandler
 from tqdm import tqdm
 import numpy as np
 
-import cppyy
 from PIL import Image
-cppyy.include('libavutil/avutil.h')
-c = cppyy.gbl
 
 faulthandler.enable()
 
@@ -64,12 +61,12 @@ def test(deviceID, path):
                 # the following two lines rely on some patch
                 # to query the color space/range of video stream
                 # https://github.com/riaqn/PyAV
-                space = stream.colorspace
-                range = stream.color_range                
-                if space == c.AVCOL_SPC_UNSPECIFIED:
-                    space = c.AVCOL_SPC_BT470BG
-                if range == c.AVCOL_RANGE_UNSPECIFIED:
-                    range = c.AVCOL_RANGE_MPEG                
+                space = color.Space(stream.colorspace)
+                range = color.Range(stream.color_range)
+                if space is color.Space.UNSPECIFIED:
+                    space = color.Space.BT470BG
+                if range == color.Range.UNSPECIFIED:
+                    range = color.Range.MPEG          
                 log.info(f'color space = {space} color range = {range}')
                 target_format = SurfaceFormat.RGB444P
                 target_shape = size2shape(target_format, surface.size)
