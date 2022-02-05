@@ -5,6 +5,15 @@ class SurfaceFormat(Enum):
     YUV444P = auto()
 
 def shape2size(format, shape):
+    """convert array shape to picture size
+
+    Args:
+        format (SurfaceFormat): surface format of the array
+        shape (tuple): shape of the array
+
+    Returns:
+        dict : size of the picture, with keys 'width' and 'height'
+    """    
     if format in [SurfaceFormat.RGB444P, SurfaceFormat.YUV444P]:
         c, h, w = shape
         assert c == 3
@@ -17,6 +26,15 @@ def shape2size(format, shape):
         raise ValueError(f'Unknown format {format}')
 
 def size2shape(format, size):
+    """convert picture size to array shape
+
+    Args:
+        format (SurfaceFormat): surface format of the array
+        size (dict): size of the picture, with keys 'width' and 'height'
+
+    Returns:
+        tuple: shape of the array
+    """    
     if format in [SurfaceFormat.RGB444P, SurfaceFormat.YUV444P]:
         return (3, size['height'], size['width'])
     elif format is SurfaceFormat.YUV420P:
@@ -26,9 +44,30 @@ def size2shape(format, size):
         raise ValueError(f'Unknown format {format}')
 
 def convert_shape(source_format, target_format, source_shape):
+    """convert source shape to target shape
+
+    Args:
+        source_format (SurfaceFormat): source surface format
+        target_format (SurfaceFormat):  target surface format
+        source_shape (tuple): shape of the source array
+
+    Returns:
+        [type]: [description]
+    """    
     return size2shape(target_format, shape2size(source_format, source_shape))
 
 def get_stream_ptr(stream):
+    """extract cuda stream raw handler from several known wrappers
+
+    Args:
+        stream : cuda stream wrapper
+
+    Raises:
+        Exception: the cuda stream wrapper is not supported
+
+    Returns:
+        [int]: the raw cuda stream handler
+    """    
     if stream is None:
         return 2 # default to per-thread default stream
     elif type(stream) is int:

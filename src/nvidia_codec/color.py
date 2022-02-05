@@ -28,13 +28,13 @@ class Range(Enum):
     JPEG = 2
     NB = auto()
 
-'''
-We are doing some metaprogramming; according to pycuda, 
-constant is much faster than variable in e.g. multipllication
-it's therefore worthwhile to compile the specialized code
-this should be faster than the official color cvt in NPP
-'''
+
 class Converter:
+    """
+    Color converter from YUV to RGB running on CUDA
+    each converter instance is parameterized by source and target surface format (shape, strides, atom type) for best performance
+    CUDA kernel is compiled once on converter initialization and used repeatedly for each invocation
+    """    
     @staticmethod
     def idx(base, ctype, strides, indices):
         code = f'((uint8_t *)({base}))'
@@ -65,7 +65,18 @@ class Converter:
             raise ValueError(f'unsupported typestr {typestr}')
         
     def __init__(self, source_template, source_format, source_space, source_range, 
-    target_template = None, target_format = SurfaceFormat.RGB444P, target_space = Space.RGB, target_range = Range.JPEG):
+    target_template, target_format = SurfaceFormat.RGB444P, target_space = Space.RGB, target_range = Range.JPEG):
+        """
+        Args:
+            source_template : a surface whose CUDA array interface will be used as template for sources
+            source_format (SurfaceFormat): the source format
+            source_space (Color.Space): color space of source surface
+            source_range (Color.Range): color range of source surface
+            target_template : a surface whose CUDA array interface will be used as template for targets
+            target_format (SurfaceFormat, optional): the target format. Defaults to SurfaceFormat.RGB444P.
+            target_space (Color.Space, optional): color space of target surface. Defaults to Space.RGB.
+            target_range (Color.Range, optional): color range of target surface. Defaults to Range.JPEG.
+        """    
         source = source_template.__cuda_array_interface__
         self.source_shape = source['shape']
         self.source_strides = source['strides']
@@ -216,6 +227,14 @@ class Converter:
         self.convert = self.mod.get_function("convert")
 
     def __call__(self, source, target, check = True, block = (32, 32, 1), **kwargs):
+        """perform color convertion on a surface
+
+        Args:
+            source: source surface with CUDA Array Interface
+            target: target surface with CUDA Array Interface
+            check (bool, optional): Check if the surfaces formats are compatible with converter. Defaults to True.
+            block (tuple, optional): The block size of this CUDA computation. Defaults to (32, 32, 1).
+        """        
         if check:
             assert source.__cuda_array_interface__['shape'] == self.source_shape
             assert target.__cuda_array_interface__['shape'] == self.target_shape

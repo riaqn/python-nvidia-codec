@@ -3,12 +3,17 @@ import av
 
 from .cuviddec import cudaVideoCodec
 
-
-'''
-Adapts PyAV stream for CUVID decoding
-'''
 class PyAVStreamAdaptor:
+    """Adapter class for PyAV video stream to work with CUVID decoder
+    """
     def __init__(self, stream):
+        """
+        Args:
+            stream (av.VideoStream): PyAV video stream to be wrapped
+
+        Raises:
+            Exception: if codec is not supported for bitstream
+        """        
         self.stream = stream
         self.b = io.BytesIO()            
         if stream.codec.name == 'h264':
@@ -28,6 +33,15 @@ class PyAVStreamAdaptor:
         self.out_container.start_encoding()
 
     def translate_codec(self):
+        """return the cuvid codec enum of the wrapped video stream
+
+        Raises:
+            Exception: if codec is not supported
+
+        Returns:
+            cudaVideoCodec: the codec enum
+        """        
+
         if self.stream.codec.name == 'h264':
             return cudaVideoCodec.H264
         elif self.stream.codec.name == 'hevc':
@@ -35,14 +49,21 @@ class PyAVStreamAdaptor:
         else:
             raise Exception('codec not supported')
 
-    '''
-    convert a pyav packet to an iterator of (pts, bytes) where bytes is annex B packet that can be passed to decoder
-
-    if copy is True, return a copy that the caller can use as long as it wants
-    if copy is False, the underlying buffer is returned directly; 
-    the caller must drop the returned reference before the next iteration
-    '''
     def translate_packet(self, packet, copy = True):
+        """Convert a pyav packet to an iterator of (pts, packet) 
+        where the latter is annex.B packet that can be passed to decoder
+
+        Args:
+            packet (bytes): [description]
+            copy (bool, optional): If True, copy of the underlying buffer is returned; 
+            the copy is owned by the user. If False, the underlying buffer is returned directly, 
+            and the caller must drop the returned reference (by `del`) before the next iteration. 
+            Defaults to True.
+
+
+        Yields:
+            (int, bytes-like object): PTS and annex.B packet
+        """
         if packet.dts is None:
             # pyav generate NULL packet to flush we don't need
             return # empty iterator
@@ -56,12 +77,10 @@ class PyAVStreamAdaptor:
             buf = self.b.getbuffer()
             yield (self.b.getvalue() if copy else self.b.getbuffer(), bs.pts)
 
-    '''
-    convert an iterator of pyav packets to an iterator of (pts, bytes) 
-    where bytes is annex B packet that can be passed to decoder
-    See translate_packet for copy parameter
-    '''
     def translate_packets(self, packets, copy = True):
+        """ Plural version of translate_packet,
+            converts an iterator of pyav packets to iterator of (pts, packet)
+        """        
         for packet in packets:
             yield from self.translate_packet(packet, copy = copy)
 
@@ -73,9 +92,3 @@ class PyAVStreamAdaptor:
             pass
 
         self.b.close()
-
-def test():
-    pass
-
-if __name__ == '__main__':
-    test()
