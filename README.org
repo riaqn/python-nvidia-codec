@@ -38,7 +38,7 @@ Please open issues if you have ideas for improvement.
 - [X] support for built-in cropping and scaling provided by NV decoder
 - [X] make the library thread-safe and thread-friendly
 - [ ] Encoder
-- [ ] interpolation with deep learning frameworks
+- [X] interpolation with deep learning frameworks
 
 * Acknowledgements
 - Many thanks to @rarzumanyan for all the helps and explanations!
