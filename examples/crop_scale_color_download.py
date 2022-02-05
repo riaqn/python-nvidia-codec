@@ -1,3 +1,5 @@
+from datetime import timedelta
+from hypothesis import target
 import pycuda.driver as cuda
 from pycuda.gpuarray  import GPUArray
 from types import SimpleNamespace
@@ -20,6 +22,13 @@ log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 def test(deviceID, path):
+    '''
+    take a screenshot for every 10 secs
+    - only take the left half of the picture as source
+    - the output will be 256x224
+    - the source is scaled to 80x204, and put to the target rectangle (20,20,100,224) of the output
+    - the margin in the output will be left black
+    '''
     cuda.init()    
     ctx = cuda.Device(deviceID).retain_primary_context()
     ctx.push()
@@ -31,21 +40,30 @@ def test(deviceID, path):
     def decide(p):
         log.info(p)
         # cropping: we only want the left half of the picture
-        cropping = {
-            'left' : 0,
-            'top' : 0,
-            'right' : p['size']['width'] // 2,
-            'bottom' : p['size']['height']
-        }
         # resize to 1/2 in both dimensions
+        cropping = {
+            'top': 0,
+            'left': 0,
+            'right': p['size']['width'] // 2, # we only want the left half
+            'bottom': p['size']['height']
+        }
+
         target_size = {
-            'width' : (cropping['right'] - cropping['left'])//2,
-            'height' : (cropping['bottom'] - cropping['top'])//2
+            'width' : 256,
+            'height' : 224
+        }
+
+        target_rect = {
+            'top': 20,
+            'left': 20,
+            'right': 100,
+            'bottom': 224
         }
 
         return {
-            'cropping' : cropping,
+            'cropping': cropping,
             'target_size' : target_size,
+            'target_rect' : target_rect,
         }
         
     decoder = Decoder(trans.translate_codec(), decide)
@@ -53,9 +71,11 @@ def test(deviceID, path):
     # container.seek(int(600/stream.time_base), stream=stream)
     bar = tqdm(decoder.decode(trans.translate_packets(container.demux(stream), False)))
     cvt = None
-    for i, (picture, pts) in enumerate(bar):
-        bar.set_description(f'{pts}')
-        if i % 600 == 0:
+    position = timedelta()
+    for picture, pts in bar:
+        if pts > position.total_seconds() * stream.time_base + stream.start_time:
+            bar.set_description(f'{position}')
+            position += timedelta(seconds=10) # take a screenshot for every 10 sec
             surface = picture.map(stream=s)
             if cvt is None:
                 # the following two lines rely on some patch
@@ -85,8 +105,8 @@ def test(deviceID, path):
             log.debug(arr.shape)
             img = Image.fromarray(arr, mode='RGB')
             img.save('dump.jpg')
-            del surface # drop the reference to the surface to free up the slot
-        del picture # drop reference to picture to free up slot
+            surface.free() # drop the reference to the surface to free up the slot
+        picture.free() # drop reference to picture to free up slot
 
     ctx.pop()
 

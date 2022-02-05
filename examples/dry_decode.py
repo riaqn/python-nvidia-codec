@@ -1,3 +1,4 @@
+from datetime import timedelta
 import pycuda.driver as cuda
 from nvidia_codec.decode import Decoder
 import logging
@@ -6,20 +7,16 @@ from nvidia_codec.pyav import PyAVStreamAdaptor
 import faulthandler
 from tqdm import tqdm
 
-import cppyy
-cppyy.include('libavutil/avutil.h')
-c = cppyy.gbl
-
 faulthandler.enable()
 
 log = logging.getLogger(__name__)
 
 logging.basicConfig(level=logging.INFO)
 
-'''
-Simply decode a video file without any further action
-'''
 def test(deviceID, path):
+    '''
+    Simply decode a video file without any further action
+    '''
     cuda.init()    
     ctx = cuda.Device(deviceID).retain_primary_context()
     ctx.push()
@@ -29,11 +26,13 @@ def test(deviceID, path):
     trans = PyAVStreamAdaptor(stream)
     decoder = Decoder(trans.translate_codec())
 
-    # container.seek(int(600/stream.time_base), stream=stream)
     bar = tqdm(decoder.decode(trans.translate_packets(container.demux(stream), False)))
-    for i, (picture, pts) in enumerate(bar):
-        bar.set_description(f'{pts}')
-        del picture # drop reference to picture to free up slot
+    for picture, pts in bar:
+        seconds = (pts - stream.start_time) * float(stream.time_base)
+        delta = timedelta(seconds=seconds)
+        bar.set_description(f'{delta}')
+        # must drop the reference explicitly to free up the decoder pictures slot
+        picture.free() 
 
     ctx.pop()
 

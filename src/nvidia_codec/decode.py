@@ -13,9 +13,12 @@ nvcuvid = cdll.LoadLibrary('libnvcuvid.so')
 
 class Surface:
     '''
-    don't call this yourself; call Picture.map
+    represents a cuda memory region owned by the decoder
     '''
     def __init__(self, decoder, c_devptr, c_pitch, stream):
+        '''
+        don't call this yourself; call Picture.map
+        '''        
         super().__init__()
         self.decoder = decoder
         # ctypes is pain to handle, so we convert it to python int        
@@ -45,12 +48,18 @@ class Surface:
     def size(self):
         return {'width':self.width, 'height':self.height}
 
+    def free(self):
+        if self.c_devptr is None:
+            return
+        
+        with self.decoder.surfaces_cond:
+            self.decoder.surfaces_to_unmap.add(self.c_devptr.value)
+            self.c_devptr = None
+            self.decoder.surfaces_cond.notify_all()
+
     def __del__(self):
         log.debug(f'trying to unmap {self.c_devptr}')
-        if self.c_devptr:
-            with self.decoder.surfaces_cond:
-                self.decoder.surfaces_to_unmap.add(self.c_devptr.value)
-                self.decoder.surfaces_cond.notify_all()
+        self.free()
 
     @property
     def __cuda_array_interface__(self):
@@ -83,6 +92,9 @@ class Surface:
         }        
         
 class Picture:
+    '''
+    represent a picture inside the decoder sillicon
+    '''
     def __init__(self, decoder, params):
         self.decoder = decoder        
         self.index = params.CurrPicIdx
@@ -92,16 +104,23 @@ class Picture:
             self.decoder.pictures_cond.wait_for(lambda:self.index not in self.decoder.pictures_used)
             log.debug('wait_for_pictures finished')
             self.decoder.pictures_used.add(self.index)
+            log.debug(f'picture {self.index} added to used')
 
         CUDAcall(nvcuvid.cuvidDecodePicture, self.decoder.decoder, byref(params))
 
     def on_display(self, params):
         self.params = params
-    
-    def __del__(self):
+
+    def free(self):
+        if self.index is None:
+            return
         with self.decoder.pictures_cond:
             self.decoder.pictures_used.remove(self.index)
-            self.decoder.pictures_cond.notify_all()
+            self.index = None # the index is released and therefore invalid
+            self.decoder.pictures_cond.notify_all()    
+    
+    def __del__(self):
+        self.free()
 
     '''
     should call within approapriate cuda context
@@ -248,7 +267,13 @@ class BaseDecoder:
             'target_size': {
                 'width' : p['size']['width'],
                 'height' : p['size']['height']
-            }
+            },
+            'target_rect': {
+                'left': 0,
+                'right' : 0,
+                'top': 0,
+                'bottom' : 0
+            },
         }
 
         decision |= self.decide(p)
@@ -265,6 +290,13 @@ class BaseDecoder:
             top = da.top + c['top'],
             right = da.left + c['right'],
             bottom = da.top + c['bottom']
+        )
+        tr = decision['target_rect']
+        target_rect = SRECT(
+            left = tr['left'],
+            top = tr['top'],
+            right = tr['right'],
+            bottom = tr['bottom']
         )
 
         p = CUVIDDECODECREATEINFO(
@@ -285,6 +317,7 @@ class BaseDecoder:
             ulTargetHeight = decision['target_size']['height'],
             ulNumOutputSurfaces = decision['num_surfaces'],
             vidLock = None,
+            target_rect = target_rect,
             enableHistogram = 0
         )
 

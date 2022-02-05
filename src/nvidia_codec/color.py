@@ -1,7 +1,4 @@
-from ctypes import c_ulonglong, c_void_p
-import itertools
 from pycuda.compiler import SourceModule
-import pycuda.driver as cuda
 import numpy as np
 from .common import *
 
@@ -179,9 +176,9 @@ class Converter:
 
         if source_space in [Space.BT470BG, Space.SMPTE170M]:
             m = [[1, 0, 1.402], [1, -0.34414, -0.71414], [1, 1.772, 0]]
-        elif source_space == Space.AVCOL_SPC_BT709:
+        elif source_space == Space.BT709:
             m = [[1, 0, 1.5748], [1, -0.1873, -0.4681], [1, 1.8556, 0]]
-        elif source_space == Space.AVCOL_SPC_BT2020_NCL:
+        elif source_space == Space.BT2020_NCL:
             # https://gist.github.com/yohhoy/dafa5a47dade85d8b40625261af3776a
             m = [[1, 0, 1.4746], [1, -0.1646, -0.5714], [1, 1.8814, 0]]
         else:
