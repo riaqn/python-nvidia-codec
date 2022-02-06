@@ -503,6 +503,20 @@ class BaseDecoder:
             codec (cudaVideoCodec): the codec enum of the video
             on_recv (callback): a callback that will be called when a picture is ready to be displayed
             decide (callback, optional): a callback used to decide decoder parameters. Defaults to lambda p:{}.
+                The callback will be called with a dict containing:
+                    'chroma_format' (cudaVideoChromaFormat) : the chroma format of the video
+                    'bit_depth' (int) : the bit depth of the video, usually 8
+                    'size' (dict) : the size of the video, with keys 'width' and 'height'
+                    'supported_surface_formats' (set) : a set of cudaVideoSurfaceFormat that are supported as output surface for this video
+                    'min_num_pictures' (int) : the minimum number of pictures needed for decoding
+                it should return a dict containing (all optional): 
+                    'num_pictures' (int) : the number of pictures used for decoding, by default it is the same as 'min_num_pictures'. 
+                    'num_surfaces' (int) : the number of surfaces used for mapping, by default 1
+                    'surface_format' (cudaVideoSurfaceFormat) : the output surface format to use, by default selected by decide_surface_format
+                    'cropping' (dict) : the cropping parameters, with keys 'left', 'top', 'right', 'bottom', by default no cropping
+                    'target_size' (dict) : the target size of the output picture, with keys 'width' and 'height, by default the same as 'size'
+                    'target_rect' (dict) : the target rectangle of the output picture, with keys 'left', 'top', 'right', 'bottom', by default no black margin
+                only include keys that you want to change from the default
         """        
         self.dirty = False
         self.on_recv = on_recv
