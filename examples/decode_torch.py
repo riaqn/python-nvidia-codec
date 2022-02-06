@@ -1,6 +1,9 @@
 from datetime import timedelta
-from hypothesis import target
-import pycuda.driver as cuda
+import torch
+import torchvision
+
+
+import pycuda.driver as cuda_dri
 from pycuda.gpuarray  import GPUArray
 from types import SimpleNamespace
 from nvidia_codec.common import SurfaceFormat, convert_shape, size2shape
@@ -21,62 +24,74 @@ log = logging.getLogger(__name__)
 
 logging.basicConfig(level=logging.INFO)
 
+import requests
+import json
+
 def test(deviceID, path):
     '''
-    take a screenshot for every 10 secs
-    - only take the left half of the picture as source
-    - the output will be 256x224
-    - the source is scaled to 80x204, and put to the target rectangle (20,20,100,224) of the output
-    - the margin in the output will be left black
+    take a screenshot for every 10 secs, and run image classification on it
+    pictures never leaves GPU
     '''
-    cuda.init()    
-    ctx = cuda.Device(deviceID).retain_primary_context()
+
+    cuda_dri.init()    
+    cuda = torch.device(f'cuda:{deviceID}')
+
+
+    resp = requests.get('https://s3.amazonaws.com/deep-learning-models/image-models/imagenet_class_index.json')
+    id2label = json.loads(resp.text)
+
+    net = torchvision.models.efficientnet_b3(pretrained=True).to(cuda)
+    # must be 256x224    
+
+    ctx = cuda_dri.Device(deviceID).retain_primary_context()
     ctx.push()
-    s = cuda.Stream()
+    s = cuda_dri.Stream()
 
     container = av.open(path)
     stream = container.streams.video[0]
     trans = PyAVStreamAdaptor(stream)
     def decide(p):
         log.info(p)
-        # cropping: we only want the left half of the picture
-        # resize to 1/2 in both dimensions
-        cropping = {
-            'top': 0,
-            'left': 0,
-            'right': p['size']['width'] // 2, # we only want the left half
-            'bottom': p['size']['height']
-        }
-
+        width = 320
+        height = 300
         target_size = {
-            'width' : 256,
-            'height' : 224
-        }
+            'width' : width,
+            'height' : height
+        } # size required by efficientnet-b0
 
-        target_rect = {
-            'top': 20,
-            'left': 20,
-            'right': 100,
-            'bottom': 224
-        }
+        ratio = p['size']['width'] / p['size']['height']
+        if ratio > width/height:
+            # too wide
+            target_rect = {
+                'top': 0,
+                'left': 0,
+                'right': width,
+                'bottom': int(width/ratio)
+            }
+        else:
+            target_rect = {
+                'top': 0,
+                'left': 0,
+                'right': int(ratio*height),
+                'bottom': height
+            }
 
         return {
-            'cropping': cropping,
             'target_size' : target_size,
-            'target_rect' : target_rect,
+            'target_rect' : target_rect
         }
         
     decoder = Decoder(trans.translate_codec(), decide)
 
     # container.seek(int(600/stream.time_base), stream=stream)
     bar = tqdm(decoder.decode(trans.translate_packets(container.demux(stream), False)))
+    timestamp = timedelta()
     cvt = None
-    position = timedelta()
     for picture, pts in bar:
         time = timedelta(seconds = float((pts - stream.start_time) * stream.time_base))
         bar.set_description(f'{time}')        
-        if time > position:
-            position += timedelta(seconds=10) # take a screenshot for every 10 sec
+        if time > timestamp:
+            timestamp += timedelta(seconds=1) # take a screenshot for every 10 sec
             surface = picture.map(stream=s)
             if cvt is None:
                 # the following two lines rely on some patch
@@ -92,20 +107,37 @@ def test(deviceID, path):
                 target_format = SurfaceFormat.RGB444P
                 target_shape = size2shape(target_format, surface.size)
                 # for best performance, we have a fixed gpu array for output
-                surface_rgb = GPUArray(shape = target_shape, dtype=np.uint8)
-                # for best performance, we have a fixed cpu array for downloading
-                array_rgb = np.ndarray(shape = target_shape, dtype=np.uint8)
+                surface_rgb = torch.empty(target_shape, dtype=torch.uint8, device=cuda)
                 cvt = color.Converter(surface, surface.format, space, range, target_template=surface_rgb, target_format=target_format)
             cvt(surface, surface_rgb, stream=s)
-            surface_rgb.get_async(s, array_rgb)
-            s.synchronize()
+            s.synchronize()        
+            array_rgb = surface_rgb.cpu().numpy()            
+
+            arr =  np.moveaxis(array_rgb, 0, -1)
+            img = Image.fromarray(arr, mode='RGB')
+            img.save(f'{time}.jpg')
+
+            surface_float = surface_rgb.type(torch.float) / 256.0
+            # print('surface_float mean', torch.mean(surface_float))
+
+            # print(torch.mean(surface_float), torch.std(surface_float))
+
+            norm = torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225]).to(cuda)
+
+            surface_norm = norm(surface_float)
+            # print('surface_norm',torch.mean(surface_norm))
+
+            features = net(torch.unsqueeze(surface_norm, dim=0))
+            idx = torch.argmax(features).item()
+            # print(idx)
+            # print(f'{features.shape}, {len(id2label)}')
+            print(f'{id2label[str(idx)][1]} {features[0][idx].item()}')
+
             # the downloaded array is 3*h*w
             # reorganize to h*w*3 for image loading
             # zero cost
-            arr = np.moveaxis(array_rgb, 0, -1)
-            log.debug(arr.shape)
-            img = Image.fromarray(arr, mode='RGB')
-            img.save(f'{time}.jpg')
+
             surface.free() # drop the reference to the surface to free up the slot
         picture.free() # drop reference to picture to free up slot
 
