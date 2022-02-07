@@ -1,10 +1,8 @@
 from datetime import timedelta
-from hypothesis import target
 import pycuda.driver as cuda
 from pycuda.gpuarray  import GPUArray
-from types import SimpleNamespace
-from nvidia_codec.common import SurfaceFormat, convert_shape, size2shape
-from nvidia_codec.decode import Decoder, Surface, decide_surface_format
+from nvidia_codec.common import SurfaceFormat, size2shape
+from nvidia_codec.decode import Decoder
 import logging
 import av
 from nvidia_codec.pyav import PyAVStreamAdaptor
@@ -106,8 +104,6 @@ def test(deviceID, path):
             log.debug(arr.shape)
             img = Image.fromarray(arr, mode='RGB')
             img.save(f'{time}.jpg')
-            surface.free() # drop the reference to the surface to free up the slot
-        picture.free() # drop reference to picture to free up slot
 
     ctx.pop()
 

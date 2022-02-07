@@ -4,10 +4,8 @@ import torchvision
 
 
 import pycuda.driver as cuda_dri
-from pycuda.gpuarray  import GPUArray
-from types import SimpleNamespace
-from nvidia_codec.common import SurfaceFormat, convert_shape, size2shape
-from nvidia_codec.decode import Decoder, Surface, decide_surface_format
+from nvidia_codec.common import SurfaceFormat, size2shape
+from nvidia_codec.decode import Decoder
 import logging
 import av
 from nvidia_codec.pyav import PyAVStreamAdaptor
@@ -36,6 +34,8 @@ def test(deviceID, path):
     cuda_dri.init()    
     cuda = torch.device(f'cuda:{deviceID}')
 
+    norm = torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                            std=[0.229, 0.224, 0.225]).to(cuda)
 
     resp = requests.get('https://s3.amazonaws.com/deep-learning-models/image-models/imagenet_class_index.json')
     id2label = json.loads(resp.text)
@@ -46,6 +46,9 @@ def test(deviceID, path):
     ctx = cuda_dri.Device(deviceID).retain_primary_context()
     ctx.push()
     s = cuda_dri.Stream()
+    with torch.cuda.device(cuda):
+        s_net = torch.cuda.Stream() # for prediction
+        s_cpy = torch.cuda.Stream() # for copying to CPU
 
     container = av.open(path)
     stream = container.streams.video[0]
@@ -110,36 +113,24 @@ def test(deviceID, path):
                 surface_rgb = torch.empty(target_shape, dtype=torch.uint8, device=cuda)
                 cvt = color.Converter(surface, surface.format, space, range, target_template=surface_rgb, target_format=target_format)
             cvt(surface, surface_rgb, stream=s)
-            s.synchronize()        
-            array_rgb = surface_rgb.cpu().numpy()            
+            s.synchronize()
+            
+            with torch.cuda.stream(s_net):
+                surface_float = surface_rgb.type(torch.float) / 256.0
+                surface_norm = norm(surface_float)
+                features = net(torch.unsqueeze(surface_norm, dim=0))
+                idx = torch.argmax(features).cpu().numpy()
+            with torch.cuda.stream(s_cpy):
+                array_rgb = surface_rgb.cpu().numpy()
+                arr =  np.moveaxis(array_rgb, 0, -1)
 
-            arr =  np.moveaxis(array_rgb, 0, -1)
+            s_cpy.synchronize()
             img = Image.fromarray(arr, mode='RGB')
             img.save(f'{time}.jpg')
 
-            surface_float = surface_rgb.type(torch.float) / 256.0
-            # print('surface_float mean', torch.mean(surface_float))
-
-            # print(torch.mean(surface_float), torch.std(surface_float))
-
-            norm = torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]).to(cuda)
-
-            surface_norm = norm(surface_float)
-            # print('surface_norm',torch.mean(surface_norm))
-
-            features = net(torch.unsqueeze(surface_norm, dim=0))
-            idx = torch.argmax(features).item()
-            # print(idx)
-            # print(f'{features.shape}, {len(id2label)}')
+            s_net.synchronize()
             print(f'{id2label[str(idx)][1]} {features[0][idx].item()}')
 
-            # the downloaded array is 3*h*w
-            # reorganize to h*w*3 for image loading
-            # zero cost
-
-            surface.free() # drop the reference to the surface to free up the slot
-        picture.free() # drop reference to picture to free up slot
 
     ctx.pop()
 

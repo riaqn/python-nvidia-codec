@@ -1,17 +1,12 @@
 from datetime import timedelta
 import pycuda.driver as cuda
 from nvidia_codec.decode import Decoder
-import logging
 import av
 from nvidia_codec.pyav import PyAVStreamAdaptor
-import faulthandler
+# import faulthandler
 from tqdm import tqdm
 
-faulthandler.enable()
-
-log = logging.getLogger(__name__)
-
-logging.basicConfig(level=logging.INFO)
+# faulthandler.enable()
 
 def test(deviceID, path):
     '''
@@ -31,8 +26,6 @@ def test(deviceID, path):
         seconds = (pts - stream.start_time) * float(stream.time_base)
         delta = timedelta(seconds=seconds)
         bar.set_description(f'{delta}')
-        # must drop the reference explicitly to free up the decoder pictures slot
-        picture.free() 
 
     ctx.pop()
 
