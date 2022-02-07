@@ -315,8 +315,8 @@ class BaseDecoder:
 
         # the default values 
         decision = {
-            'num_pictures' : p['min_num_pictures'],
-            'num_surfaces' : 1,
+            'num_pictures' : p['min_num_pictures'] + 1, # for simplicity
+            'num_surfaces' : 1 + 1, # for simplicity
             'surface_format' : decide_surface_format(p['chroma_format'], p['bit_depth'], p['supported_surface_formats']),
             'cropping' : {
                 'left': 0,
