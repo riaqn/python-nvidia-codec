@@ -7,7 +7,7 @@ Increase the number of pictures might speed up the decoding. User can also incre
 
 Similarly one might increase the `num_surfaces` if their applications can make use of it. `num_surfaces` does not have upper limit as long as there is sufficient graphics memory. Note that again they are allocated on creation of decoder. Freeing `Surface` and `Picture` only marked the slots as reusable by the decoder for future frames, while the corresponding memory are still owned by the decoder and not usable by other CUDA operations. 
 '''
-from .cuda import call as CUDAcall
+from . import cuda
 from .nvcuvid import *
 from .common import *
 from queue import Queue
@@ -29,7 +29,6 @@ class Surface:
         DO NOT call this by yourself; use Picture.map() instead
         """
         self.decoder = decoder
-        # ctypes is pain to handle, so we convert it to python int        
         self.c_pitch = c_pitch
         self.c_devptr = c_devptr
         self.stream = stream
@@ -42,15 +41,9 @@ class Surface:
             ValueError: surface format not supported
 
         Returns:
-            SurfaceFormat: format of the surface
+            cudaVideoSurfaceFormat : format of the surface
         """        
-        format = self.decoder.surface_format
-        if format in [cudaVideoSurfaceFormat.NV12, cudaVideoSurfaceFormat.P016]:
-            return SurfaceFormat.YUV420P
-        elif format in [cudaVideoSurfaceFormat.YUV444, cudaVideoSurfaceFormat.YUV444_16Bit]:
-            return SurfaceFormat.YUV444P
-        else:
-            raise ValueError(f'unsupported format {format}')
+        return self.decoder.surface_format
 
     @property
     def height(self):
@@ -98,20 +91,22 @@ class Surface:
 
     @property
     def __cuda_array_interface__(self):
-        format = self.decoder.surface_format
-        if format is cudaVideoSurfaceFormat.NV12:
+        format = self.format
+        if format == cudaVideoSurfaceFormat.NV12:
+            assert self.height % 2 == 0
             shape = (self.height //2 * 3, self.width)
             typestr = '|u1'
             strides = (self.c_pitch.value, 1)
-        elif format is cudaVideoSurfaceFormat.P016:
+        elif format == cudaVideoSurfaceFormat.P016:
+            assert self.height % 2 == 0
             shape = (self.height //2 * 3, self.width)
             typestr = '<u2'
             strides = (self.c_pitch.value, 2)
-        elif format is cudaVideoSurfaceFormat.YUV444:
+        elif format == cudaVideoSurfaceFormat.YUV444:
             shape = (3, self.height, self.width)
             typestr = '|u1'
             strides = (self.c_pitch.value * self.height, self.c_pitch.value, 1)
-        elif format is cudaVideoSurfaceFormat.YUV444_16Bit:
+        elif format == cudaVideoSurfaceFormat.YUV444_16Bit:
             shape = (3, self.height, self.width)
             typestr = '<u2'
             strides = (self.c_pitch.value * self.height, self.c_pitch.value, 2)
@@ -122,8 +117,8 @@ class Surface:
             'typestr': typestr,
             'strides': strides,
             'version': 3,
-            'data': (self.c_devptr.value, False),
-            'stream': get_stream_ptr(self.stream)
+            'data': (self.c_devptr.value, False), # false = not read-only
+            'stream': self.stream,
         }        
         
 class Picture:
@@ -146,7 +141,7 @@ class Picture:
             self.decoder.pictures_used.add(self.index)
             log.debug(f'picture {self.index} added to used')
 
-        CUDAcall(nvcuvid.cuvidDecodePicture, self.decoder.decoder, byref(params))
+        cuda.call(nvcuvid.cuvidDecodePicture, self.decoder.decoder, byref(params))
 
     def on_display(self, params):
         self.params = params
@@ -169,18 +164,17 @@ class Picture:
     def __del__(self):
         self.free()
 
-    def map(self, stream = None):
+    def map(self, stream : int = 2):
         """post-process and output this picture to a surface which can be accessed by user as a CUDA array
 
         Args:
-            stream (optional): CUDA stream to queue this map operation. 
-            Can be raw handle, CuPy wrapper or pycuda wrapper.
-            Defaults to None which means per-thread default stream
+            stream (optional, int): CUDA stream to queue this map operation. 
+            Defaults to 2 which means per-thread default stream
 
         Returns:
             Surface : Surface mapped by this picture
         """
-        self.params.stream = get_stream_ptr(stream)
+        self.params.stream = stream
         assert self.params.stream != 0, 'must speicfy legacy default stream or per-thread default stream'
 
         with self.decoder.surfaces_cond:
@@ -192,14 +186,14 @@ class Picture:
                 try:
                     while True:
                         devptr = self.decoder.surfaces_to_unmap.pop()
-                        CUDAcall(nvcuvid.cuvidUnmapVideoFrame64, self.decoder.decoder, c_ulonglong(devptr))
+                        cuda.call(nvcuvid.cuvidUnmapVideoFrame64, self.decoder.decoder, c_ulonglong(devptr))
                         self.decoder.surfaces_avail += 1
                 except KeyError:
                     pass
 
             c_devptr = c_ulonglong() # according to cuviddec, the argument type of cuvidmapvideoframe64
             c_pitch = c_uint()
-            CUDAcall(nvcuvid.cuvidMapVideoFrame64, self.decoder.decoder, self.index, byref(c_devptr), byref(c_pitch), byref(self.params))
+            cuda.call(nvcuvid.cuvidMapVideoFrame64, self.decoder.decoder, self.index, byref(c_devptr), byref(c_pitch), byref(self.params))
             self.decoder.surfaces_avail -= 1
 
             surface = Surface(self.decoder, c_devptr, c_pitch, stream)
@@ -223,9 +217,9 @@ def decide_surface_format(chroma_format, bit_depth, supported_surface_formats, a
     """    
     if chroma_format in [cudaVideoChromaFormat.YUV420, cudaVideoChromaFormat.MONOCHROME]:
         f = cudaVideoSurfaceFormat.P016 if bit_depth > 8 and allow_high else cudaVideoSurfaceFormat.NV12
-    elif chroma_format is cudaVideoChromaFormat.YUV444:
+    elif chroma_format == cudaVideoChromaFormat.YUV444:
         f = cudaVideoSurfaceFormat.YUV444_16Bit if bit_depth > 8 and allow_high else cudaVideoSurfaceFormat.YUV444
-    elif chroma_format is cudaVideoChromaFormat.YUV422:
+    elif chroma_format == cudaVideoChromaFormat.YUV422:
         f = cudaVideoSurfaceFormat.NV12
     else:
         raise Exception(f'unexpected chroma format {chroma_format}')
@@ -298,7 +292,7 @@ class BaseDecoder:
             nBitDepthMinus8=vf.bit_depth_luma_minus8
         )
 
-        CUDAcall(nvcuvid.cuvidGetDecoderCaps, byref(caps))
+        cuda.call(nvcuvid.cuvidGetDecoderCaps, byref(caps))
         assert caps.bIsSupported == 1, "Codec not supported"
         assert vf.coded_width <= caps.nMaxWidth, "width too large"
         assert vf.coded_height <= caps.nMaxHeight, "height too large"
@@ -306,10 +300,10 @@ class BaseDecoder:
         assert vf.coded_height >= caps.nMinHeight, "height too small"
         assert (vf.coded_width >> 4) * (vf.coded_height >> 4) <= caps.nMaxMBCount, "too many macroblocks"
         
-        supported_surface_formats = set()
-        for surface_format in cudaVideoSurfaceFormat:
-            if caps.nOutputFormatMask & (1 << surface_format.value):
-                supported_surface_formats.add(surface_format)
+        supported_surface_formats = []
+        for surface_format in range(4): # cudaVideoSurfaceFormat:
+            if caps.nOutputFormatMask & (1 << surface_format):
+                supported_surface_formats.append(cudaVideoSurfaceFormat(surface_format))
 
         p = {
             'chroma_format': cudaVideoChromaFormat(vf.chroma_format),
@@ -374,14 +368,14 @@ class BaseDecoder:
             ulNumDecodeSurfaces = decision['num_pictures'],
             CodecType = vf.codec,
             ChromaFormat = vf.chroma_format,
-            ulCreationFlags = cudaVideoCreateFlags.PreferCUVID.value,
+            ulCreationFlags = cudaVideoCreateFlags.PreferCUVID,
             bitDepthMinus8 = vf.bit_depth_luma_minus8,
             ulIntraDecodeOnly = 0,
             ulMaxWidth = vf.coded_width,
             ulMaxHeight = vf.coded_height,
             display_area = display_area,
-            OutputFormat = decision['surface_format'].value,
-            DeinterlaceMode = (cudaVideoDeinterlaceMode.Weave if vf.progressive_sequence else cudaVideoDeinterlaceMode.Adaptive).value,
+            OutputFormat = decision['surface_format'],
+            DeinterlaceMode = (cudaVideoDeinterlaceMode.Weave if vf.progressive_sequence else cudaVideoDeinterlaceMode.Adaptive),
             ulTargetWidth = decision['target_size']['width'],
             ulTargetHeight = decision['target_size']['height'],
             ulNumOutputSurfaces = decision['num_surfaces'],
@@ -393,7 +387,7 @@ class BaseDecoder:
         # for field_name, filed_type in p._fields_:
         #     print(field_name, getattr(p, field_name))
 
-        CUDAcall(nvcuvid.cuvidCreateDecoder, byref(self.decoder), byref(p))
+        cuda.call(nvcuvid.cuvidCreateDecoder, byref(self.decoder), byref(p))
         log.debug(f'created decoder: {p}')
 
         # this mirrors parser's reorder buffer
@@ -467,7 +461,7 @@ class BaseDecoder:
         Returns:
             cudaVideoSurfaceFormat: the output surface format of the video
         """
-        return cudaVideoSurfaceFormat(self.decode_create_info.OutputFormat)
+        return self.decode_create_info.OutputFormat
 
     def handlePictureDecode(self, pUserData, pPicParams):
         log.debug('decode')
@@ -543,7 +537,7 @@ class BaseDecoder:
         self.handlePictureDisplayCallback = PFNVIDDISPLAYCALLBACK(self.catch_exception(self.handlePictureDisplay))
         self.handleOperatingPointCallback = PFNVIDOPPOINTCALLBACK(self.catch_exception(self.handleOperatingPoint, -1))
         p = CUVIDPARSERPARAMS(
-            CodecType=codec.value,
+            CodecType=codec,
             ulMaxNumDecodeSurfaces=0,
             ulErrorThreshold=0,
             ulMaxDisplayDelay=0,
@@ -554,7 +548,7 @@ class BaseDecoder:
             pfnGetOperatingPoint=self.handleOperatingPointCallback
             )
 
-        CUDAcall(nvcuvid.cuvidCreateVideoParser, byref(self.parser), byref(p))
+        cuda.call(nvcuvid.cuvidCreateVideoParser, byref(self.parser), byref(p))
 
     def send(self, packet, pts = 0):
         """
@@ -569,22 +563,20 @@ class BaseDecoder:
         will never be called. In this case flush() should be called
     
         Args:
-            packet (bytes): packet is expected to be of buffer protocol; None means end of stream; packet can be reused after the call
+            packet (numpy.ndarray): packet is expected to be a numpy 1d-array; None means end of stream; user can reuse the packet after the call
             pts (int, optional): PTS of this packet. Defaults to 0.
         """        
         self.dirty = True
         flags = CUvideopacketflags(0)
         flags |= CUvideopacketflags.TIMESTAMP
 
-        arr = np.frombuffer(packet, dtype=np.uint8)
-
         p = CUVIDSOURCEDATAPACKET(
             flags = flags.value,
-            payload_size = arr.shape[0],
-            payload = arr.ctypes.data_as(POINTER(c_uint8)),
+            payload_size = packet.shape[0],
+            payload = packet.ctypes.data_as(POINTER(c_uint8)),
             timestamp = pts
             )
-        CUDAcall(nvcuvid.cuvidParseVideoData, self.parser, byref(p))
+        cuda.call(nvcuvid.cuvidParseVideoData, self.parser, byref(p))
         # catch: cuvidParseVideoData will not propagate error return code 0 of HandleVideoSequenceCallback
         # it still returns CUDA_SUCCESS and simply ignore all future incoming packets
         # therefore we must check the exception here, even if the last call succeeded
@@ -605,7 +597,7 @@ class BaseDecoder:
             timestamp = 0
         )
         # this reset the parser internal state
-        CUDAcall(nvcuvid.cuvidParseVideoData, self.parser, byref(p))
+        cuda.call(nvcuvid.cuvidParseVideoData, self.parser, byref(p))
 
         # frees reorder buffer
         self.reorder_buffer = {}
@@ -615,9 +607,9 @@ class BaseDecoder:
 
     def __del__(self):
         if self.parser:
-            CUDAcall(nvcuvid.cuvidDestroyVideoParser, self.parser)
+            cuda.call(nvcuvid.cuvidDestroyVideoParser, self.parser)
         if self.decoder:
-            CUDAcall(nvcuvid.cuvidDestroyDecoder, self.decoder)
+            cuda.call(nvcuvid.cuvidDestroyDecoder, self.decoder)
 
 class Decoder(BaseDecoder):
     """A decoder with send/recv paradigm. That is, user send packets to decoder, and receive pictures from decoder. 
@@ -641,11 +633,11 @@ class Decoder(BaseDecoder):
         """Decode packets; will flush() beforehand
     
         Args:
-            packets ([int, bytes]): iterator of (timestamp, annex.B packet). 
+            packets ([(numpy.array, pts)]): iterator of (annex.B packet, timestamp). 
                 Each packet will be 'del'-ed before the next packet is fetched
 
         Yields:
-            [[int, Picture]]: iterator of (timestamp, Picture)
+            [(Picture, int)]: iterator of (Picture, timestamp)
         """        
         self.flush()
 
