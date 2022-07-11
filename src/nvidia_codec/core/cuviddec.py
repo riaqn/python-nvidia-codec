@@ -2,45 +2,44 @@
 
 from ctypes import *
 from .cuda import *
-from enum import Enum, auto
+from ..common import TypedCEnumeration
 
-class cudaVideoSurfaceFormat(Enum):
+class cudaVideoSurfaceFormat(TypedCEnumeration(c_int)):
     NV12 = 0
-    P016 = auto()
-    YUV444 = auto()
-    YUV444_16Bit = auto()
+    P016 = 1
+    YUV444 = 2
+    YUV444_16Bit = 3
 
-class cudaVideoCodec(Enum):
+class cudaVideoCodec(TypedCEnumeration(c_int)):
     MPEG1 = 0
-    MPEG2 = auto()
-    MPEG4 = auto()
-    VC1  = auto()
-    H264 = auto()
-    JPEG = auto()
-    H264_SVC = auto()
-    H264_MVC = auto()
-    HEVC = auto()
-    VP8 = auto()
-    VP9 = auto()
-    AV1 = auto()
+    MPEG2 = 1
+    MPEG4 = 2
+    VC1  = 3
+    H264 = 4
+    JPEG = 5
+    H264_SVC = 6
+    H264_MVC = 7
+    HEVC = 8
+    VP8 = 9
+    VP9 = 10
+    AV1 = 11
 
-class cudaVideoChromaFormat(Enum):
+class cudaVideoChromaFormat(TypedCEnumeration(c_int)):
     MONOCHROME = 0
-    YUV420 = auto()
-    YUV422 = auto()
-    YUV444 = auto()
+    YUV420 = 1
+    YUV422 = 2
+    YUV444 = 3
 
-class cudaVideoCreateFlags(Enum):
+class cudaVideoCreateFlags(TypedCEnumeration(c_int)):
     Default = 0
-    PreferCUDA = auto()
-    PreferDXVA = auto()
-    PreferCUVID = auto()
+    PreferCUDA = 1
+    PreferDXVA = 2
+    PreferCUVID = 3
 
-class cudaVideoDeinterlaceMode(Enum):
+class cudaVideoDeinterlaceMode(TypedCEnumeration(c_int)):
     Weave = 0
-    Bob = auto()
-    Adaptive = auto()
-
+    Bob = 1
+    Adaptive = 2
 
 class CUVIDPROCPARAMS(Structure):
     _fields_ = [('progressive_frame', c_int),
@@ -73,8 +72,8 @@ class CUVIDDECODECREATEINFO(Structure):
         ('ulWidth', c_ulong),
         ('ulHeight', c_ulong),
         ('ulNumDecodeSurfaces', c_ulong),
-        ('CodecType', c_int), # should be cudaVideoCodec
-        ('ChromaFormat', c_int), # should be cudaVideoChromaFormat
+        ('CodecType', cudaVideoCodec), 
+        ('ChromaFormat', cudaVideoChromaFormat), 
         ('ulCreationFlags', c_ulong),
         ('bitDepthMinus8', c_ulong),
         ('ulIntraDecodeOnly', c_ulong),
@@ -82,8 +81,8 @@ class CUVIDDECODECREATEINFO(Structure):
         ('ulMaxHeight', c_ulong),
         ('Reserved1', c_ulong),
         ('display_area', SRECT),
-        ('OutputFormat', c_int), # should be cudaVideoSurfaceFormat        
-        ('DeinterlaceMode', c_int), # should be cudaVideoDeinterlaceMode
+        ('OutputFormat', cudaVideoSurfaceFormat), 
+        ('DeinterlaceMode', cudaVideoDeinterlaceMode), 
         ('ulTargetWidth', c_ulong),
         ('ulTargetHeight', c_ulong),
         ('ulNumOutputSurfaces', c_ulong),
@@ -94,8 +93,8 @@ class CUVIDDECODECREATEINFO(Structure):
     ]
 
 class CUVIDDECODECAPS(Structure):
-    _fields_ = [('eCodecType', c_int), # should be cudaVideoCodec
-                ('eChromaFormat', c_int), # should be cudaVideoChromaFormat
+    _fields_ = [('eCodecType', cudaVideoCodec), 
+                ('eChromaFormat', cudaVideoChromaFormat), 
                 ('nBitDepthMinus8', c_uint),
                 ('reserved1', c_uint*3),
                 ('bIsSupported', c_ubyte),
