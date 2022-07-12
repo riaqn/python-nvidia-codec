@@ -1,6 +1,7 @@
 from datetime import timedelta
 from fractions import Fraction
 import numpy as np
+from ctypes import byref
 
 from ..ffmpeg.libavcodec import BitStreamFilter, BSFContext, Packet
 from ..ffmpeg.libavformat import FormatContext, AVMediaType, AVCodecID
@@ -28,11 +29,8 @@ class Screenshot:
         if self.start_time == AV_NOPTS_VALUE:
             self.start_time = self.fc.av.start_time
             if self.start_time == AV_NOPTS_VALUE:
-                log.warning('infering start time from first packet')
-                # in this case, we get the first packet
-                pkt = Packet()
-                self.fc.read_frame(pkt)
-                self.start_time = pkt.av.pts
+                start_time, time_base = self.fc.infer_start_time()
+                self.start_time = int(start_time * time_base / self.time_base)
             else:
                 self.start_time = int(self.start_time / AV_TIME_BASE / self.time_base)                
 
@@ -101,15 +99,15 @@ class Screenshot:
         def demux():
             for pkt in self.bsf.filter(self.fc.read_frames(self.stream)):
                 pts = pkt.av.pts
+                log.warning(f'filtered: dts={pkt.av.dts} pts = {pkt.av.pts}')
                 # log.warning(pts)
                 arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
-                
-                yield arr, pts        
+                yield arr, pts     
 
         for pic, pts in self.decoder.decode(demux()):
+            log.warning(f'decoded: {pts}')
             # log.warning(f'{pts}')
             if pts > target_pts:
-                log.warning(f'found pts: {pts}')
                 break
             last = pic
         surface = last.map(cuda_stream)
