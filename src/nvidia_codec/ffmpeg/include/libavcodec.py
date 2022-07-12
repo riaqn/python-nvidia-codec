@@ -1,6 +1,7 @@
 from ...common import TypedCEnumeration
 from ctypes import *
 from .libavutil import *
+
 class AVBitStreamFilter(Structure):
     pass
 
@@ -45,7 +46,7 @@ class AVCodecParameters(Structure):
 class AVBSFContext(Structure):
     _fields_ = [
         ('av_class', c_void_p),
-        ('filter', c_void_p),
+        ('filter', POINTER(AVBitStreamFilter)),
         ('priv_data', c_void_p),
         ('par_in', POINTER(AVCodecParameters)),
         ('par_out', POINTER(AVCodecParameters)),

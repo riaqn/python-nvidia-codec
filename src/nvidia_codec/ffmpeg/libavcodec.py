@@ -10,11 +10,20 @@ log = logging.getLogger(__name__)
 
 lib = cdll.LoadLibrary('libavcodec.so')
 
-class Packet:
-    def __init__(self):
-        av_packet_alloc = lib.av_packet_alloc
-        av_packet_alloc.restype = POINTER(AVPacket)            
-        self.av = av_packet_alloc().contents
+
+av_packet_alloc = lib.av_packet_alloc
+av_packet_alloc.restype = POINTER(AVPacket)
+
+# def packet_alloc():
+#     p = av_packet_alloc()    
+#     return cast(p, POINTER(AVPacket)).contents
+
+# def packet_free(pkt):
+#     p = pointer(pkt)
+#     lib.av_packet_free(byref(p))
+
+# def packet_unref(pkt):
+#     lib.av_packet_unref(byref(pkt))
 
 class BitStreamFilter:
     def __init__(self, name):
@@ -24,6 +33,27 @@ class BitStreamFilter:
         ptr = func(name)
         self.av = ptr.contents
 
+class Packet:
+    def __init__(self):
+        ptr = av_packet_alloc()
+        self._av = ptr.contents
+        self.own = True
+
+    @property
+    def av(self):
+        assert self.own, 'packet is not owned by us'
+        return self._av
+
+    def disown(self):
+        assert self.own, 'packet is not owned by us'
+        self.own = False
+
+    def unref(self):
+        lib.av_packet_unref(byref(self.av))
+
+    def __del__(self):
+        if self.own:
+            lib.av_packet_free(byref(pointer(self._av)))
 
 class BSFContext:
     def __init__(self, filter : BitStreamFilter, codecpar : AVCodecParameters, time_base : AVRational):
@@ -35,19 +65,21 @@ class BSFContext:
         self.av.time_base_in = time_base
         call(lib.av_bsf_init, byref(self.av))
 
+    def __del__(self):
+        lib.av_bsf_free(byref(pointer(self.av)))
+
     def filter(self, packets):
         # always flush for the first time
         call(lib.av_bsf_flush, byref(self.av))
 
         # packets = peekable(packets)
-
         pkt_out = Packet()
-        while True:
+        for pkt in packets:
+            self.send_packet(pkt) 
+
             while True:
                 try:
-                    self.receive_packet(pkt_out)
-                    yield pkt_out
-                    # log.warning('bsf received')
+                    self.receive_packet(pkt_out)# we still own it
                 except AVException as e:
                     if e.errnum == AVERROR_EOF:
                         # no more to see here
@@ -58,18 +90,18 @@ class BSFContext:
                         break
                     else:
                         raise
-            # only reason we are here is because we need input
-            # therefore the following cannot return eagain
-            try:
-                self.send_packet(next(packets))
-                # log.warning('bsf sent')
-            except StopIteration:               
-                log.warning('bsf input EOF')
-                self.send_packet(None)
+                yield pkt_out 
+                pkt_out.unref()
 
+                # after the yield, the other side should be done with the packet
+                
     # None means EOF
     def send_packet(self, pkt : Packet = None):
         call(lib.av_bsf_send_packet, byref(self.av), byref(pkt.av) if pkt is not None else None)
+        # in case of exception, the following is not called
+        pkt.disown()
+            
+        
 
     def receive_packet(self, pkt : Packet):
         call(lib.av_bsf_receive_packet, byref(self.av), byref(pkt.av))

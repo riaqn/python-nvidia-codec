@@ -17,7 +17,7 @@ class Converter:
         # index is string 
         # stide is integer
         assert len(indices) <= len(strides)
-        for index, stride in zip(indices, strides):
+        for index, stride in zip(indices, strides, strict=True):
             code += f'+ ({index}) * ({stride})'
         return f'(*({ctype} *)({code}))'
 
@@ -35,7 +35,7 @@ class Converter:
         s = i['strides']
         if s is None:
             # in thise case, that implicitly assumed contiguous memory
-            return Converter.shape2strides(i['shape'], int(i['typestr'][2:]))
+            return Converter.shape2strides(i['shape'], int(i['typestr'][2:]))[1:]
         else:
             return s
             
@@ -76,7 +76,6 @@ class Converter:
         self.source_shape = source['shape']
         self.source_strides = Converter.strides(source)
         self.source_typestr = source['typestr']  
-        print(source_format)
         assert self.source_typestr == typestr(source_format)
         self.size = shape2size(source_format, self.source_shape)
         h,w = self.size
@@ -187,7 +186,8 @@ class Converter:
 
         self.convert =  cupy.RawKernel(f"""
             extern "C" __global__        
-            __global__ void convert(unsigned char *src, unsigned char *dst) {{
+            void convert(unsigned char *src, unsigned char *dst) {{
+                //printf("%p %p\\n", src, dst);
             int x = blockIdx.x * blockDim.x + threadIdx.x; // row
             if (x >= {h}) return;
             int y = blockIdx.y * blockDim.y + threadIdx.y; // column
@@ -209,7 +209,8 @@ class Converter:
         """      
         
         s = source.__cuda_array_interface__
-        t = target.__cuda_array_interface__          
+        t = target.__cuda_array_interface__
+        print(s, t)          
         if check:
             assert s['shape'] == self.source_shape
             assert t['shape'] == self.target_shape
@@ -221,4 +222,4 @@ class Converter:
         grid = ((self.size[0] - 1) // block[0] + 1, (self.size[1] - 1) // block[1] + 1)
 
 
-        self.convert(grid, block, (np.ulonglong(s['data'][0]), np.ulonglong(t['data'][0])))
+        self.convert(grid, block, (s['data'][0], t['data'][0]))

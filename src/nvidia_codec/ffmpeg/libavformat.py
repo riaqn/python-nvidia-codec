@@ -3,13 +3,15 @@
 # not pyav
 
 from ctypes import *
+from fractions import Fraction
 
 from .include.libavutil import *
 from .include.libavcodec import *
 from .include.libavformat import *
 from .libavcodec import Packet
 
-from .common import call
+from .common import call, AVException
+
 
 import logging
 log = logging.getLogger(__name__)
@@ -28,15 +30,24 @@ class FormatContext:
         call(lib.av_read_frame, byref(self.av), byref(pkt.av))
 
     def read_frames(self, stream : AVStream):
-        pkt = Packet()
         while True:
-            self.read_frame(pkt)
-            # log.warning(f'{pkt.av.pts}')
+            pkt = Packet()
+            self.read_frame(pkt) # we own the packet
             if pkt.av.stream_index == stream.index:
-                yield pkt
+                log.warning(f'demuxed dts={pkt.av.dts} pts={pkt.av.pts}')
+                yield pkt # ownership transferred outside
 
     def seek_file(self, stream : AVStream, ts : int, min_ts = -(2**63), max_ts = (2**63) - 1):
         call(lib.avformat_seek_file, byref(self.av), c_int(stream.index), c_int64(min_ts), c_int64(ts), c_int64(max_ts), c_int(0))
+
+    def infer_start_time(self):
+        # log.warning('infering start time from first packet')
+                # in this case, we get the first packet
+        pkt = Packet()
+        self.read_frame(pkt)
+        start_time = pkt.av.pts
+        time_base = pkt.av.time_base
+        return start_time, Fraction(time_base.num, time_base.den)
 
     @property
     def streams(self):
