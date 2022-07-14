@@ -1,8 +1,11 @@
 import numpy as np
+
+from nvidia_codec.utils.compat import extract_stream_ptr
 from ..core.common import *
 from ..ffmpeg.include.libavutil import AVColorRange,AVColorSpace, AVPixelFormat
 from ..ffmpeg.libavutil import *
 import cupy
+from ..core import cuda
 
 class Converter:
     """
@@ -59,7 +62,8 @@ class Converter:
         target_template, 
         target_format : AVPixelFormat = AVPixelFormat.RGB24, 
         target_space: AVColorSpace = AVColorSpace.RGB, 
-        target_range: AVColorRange = AVColorRange.JPEG
+        target_range: AVColorRange = AVColorRange.JPEG,
+        device = None
         ):
         """
         Args:
@@ -184,21 +188,23 @@ class Converter:
                 raise Exception(f"Unsupported target format {target_format}")
             return normalize_rgb + store_rgb
 
-        self.convert =  cupy.RawKernel(f"""
-            extern "C" __global__        
-            void convert(unsigned char *src, unsigned char *dst) {{
-                //printf("%p %p\\n", src, dst);
-            int x = blockIdx.x * blockDim.x + threadIdx.x; // row
-            if (x >= {h}) return;
-            int y = blockIdx.y * blockDim.y + threadIdx.y; // column
-            if (y >= {w}) return;
-            {yuv()}
-            {yuv2rgb()}
-            {rgb()}
-            }}
-        """, 'convert')
+        self.device = cuda.get_current_device(device)
+        with cuda.Device(self.device):
+            self.convert =  cupy.RawKernel(f"""
+                extern "C" __global__        
+                void convert(unsigned char *src, unsigned char *dst) {{
+                    //printf("%p %p\\n", src, dst);
+                int x = blockIdx.x * blockDim.x + threadIdx.x; // row
+                if (x >= {h}) return;
+                int y = blockIdx.y * blockDim.y + threadIdx.y; // column
+                if (y >= {w}) return;
+                {yuv()}
+                {yuv2rgb()}
+                {rgb()}
+                }}
+            """, 'convert')
 
-    def __call__(self, source, target, check = True, block = (32, 32, 1)):
+    def __call__(self, source, target, check = True, block = (32, 32, 1), stream : int = 2):
         """perform color convertion on a surface
 
         Args:
@@ -221,5 +227,6 @@ class Converter:
 
         grid = ((self.size[0] - 1) // block[0] + 1, (self.size[1] - 1) // block[1] + 1)
 
-
-        self.convert(grid, block, (s['data'][0], t['data'][0]))
+        with cuda.Device(self.device):
+            with cupy.cuda.ExternalStream(stream):
+                self.convert(grid, block, (s['data'][0], t['data'][0]))

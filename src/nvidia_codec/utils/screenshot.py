@@ -3,19 +3,22 @@ from fractions import Fraction
 import numpy as np
 from ctypes import byref
 
-from ..ffmpeg.libavcodec import BitStreamFilter, BSFContext, Packet
+from ..ffmpeg.libavcodec import BitStreamFilter, BSFContext
 from ..ffmpeg.libavformat import FormatContext, AVMediaType, AVCodecID
 from ..ffmpeg.include.libavutil  import AV_NOPTS_VALUE, AV_TIME_BASE, AVColorRange, AVColorSpace
 from .compat import av2cuda, cuda2av
 from ..core.decode import Decoder
 from ..utils.color import Converter
 
+
+from ..core import cuda
+
 import logging
 
 log = logging.getLogger(__name__)
 
 class Screenshot:
-    def __init__(self, url):
+    def __init__(self, url, device = None):
         self.fc = FormatContext(url)
         l = list(filter(lambda s: s.codecpar.contents.codec_type == AVMediaType.VIDEO, self.fc.streams))
 
@@ -54,7 +57,9 @@ class Screenshot:
 
         self.bsf = BSFContext(f, self.stream.codecpar.contents, self.stream.time_base)
 
-        self.decoder = Decoder(av2cuda(self.stream.codecpar.contents.codec_id))
+        self.device = cuda.get_current_device(device)
+        with cuda.Device(self.device):
+            self.decoder = Decoder(av2cuda(self.stream.codecpar.contents.codec_id))
         self.cvt = None
 
     @property
@@ -112,12 +117,13 @@ class Screenshot:
             last = pic
         surface = last.map(cuda_stream)
         if self.cvt is None:
-            self.cvt = Converter(
-                surface, 
-                cuda2av(surface.format),
-                self.color_space(AVColorSpace.BT470BG),
-                self.color_range(AVColorRange.MPEG),
-                array
-                )
-                
-        self.cvt(surface, array)
+            with cuda.Device(self.device):                
+                self.cvt = Converter(
+                    surface, 
+                    cuda2av(surface.format),
+                    self.color_space(AVColorSpace.BT470BG),
+                    self.color_range(AVColorRange.MPEG),
+                    array
+                    )
+                    
+        self.cvt(surface, array, stream = cuda_stream)
