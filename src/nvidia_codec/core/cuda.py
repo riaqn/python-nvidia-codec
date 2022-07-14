@@ -1,6 +1,12 @@
 from ctypes import * 
+import logging
+
+log = logging.getLogger(__name__)
+
 CUstream = c_void_p
+CUcontext = c_void_p
 CUresult = c_int
+cudaError = c_int
 
 lib = cdll.LoadLibrary('libcuda.so')
 librt = cdll.LoadLibrary('libcudart.so')
@@ -25,13 +31,17 @@ def get_current_device(device = None):
     else:
         return device
 
+cudaGetErrorString = librt.cudaGetErrorString
+cudaGetErrorString.restype = c_char_p
+
 class CUDAError(Exception):
     def __init__(self, cudaError):
         self.cudaError = cudaError
 
     def __str__(self):
-        p = librt.cudaGetErrorString(self.cudaError)
-        return p.value.decode('utf-8')
+        p = cudaGetErrorString(c_int(self.cudaError))
+        return p.decode('utf-8')
+
 
 def check(cuResult):
     if cuResult > 0:
@@ -51,9 +61,29 @@ class Device:
 
     def __enter__(self):
         check_rt(librt.cudaGetDevice(byref(self.prev)))
-        if self.idx != self.prev:
-            check_rt(librt.cudaSetDevice(self.idx))
+        log.debug(f'entering {self.prev.value} -> {self.idx} ')
+        check_rt(librt.cudaSetDevice(self.idx))
+        check_rt(librt.cudaFree(0)) # ensure init
     
     def __exit__(self,  type, value, traceback):
-        if self.idx != self.prev:
-            check_rt(librt.cudaSetDevice(self.prev))
+        log.debug(f'exiting {self.idx} -> {self.prev.value} ')
+        check_rt(librt.cudaSetDevice(self.prev))
+
+# def get_current_context():
+#     k = CUcontext()
+#     check(lib.cuCtxGetCurrent(byref(k)))
+#     return k
+    
+# class Context:
+#     def __init__(self, ctx):
+#         self.ctx = ctx
+
+#     def __int__(self):
+#         return self.ctx.value()
+
+#     def __enter__(self):
+#         check(lib.cuCtxPushCurrent(self.ctx))
+    
+#     def __exit__(self,  type, value, traceback):
+#         check(lib.cuCtxPopCurrent(byref(self.prev)))
+

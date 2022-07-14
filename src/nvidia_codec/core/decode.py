@@ -582,7 +582,8 @@ class BaseDecoder:
             payload = packet.ctypes.data_as(POINTER(c_uint8)),
             timestamp = pts
             )
-        cuda.check(nvcuvid.cuvidParseVideoData(self.cuvid_parser, byref(p)))
+        with cuda.Device(self.device):
+            cuda.check(nvcuvid.cuvidParseVideoData(self.cuvid_parser, byref(p)))
         # catch: cuvidParseVideoData will not propagate error return code 0 of HandleVideoSequenceCallback
         # it still returns CUDA_SUCCESS and simply ignore all future incoming packets
         # therefore we must check the exception here, even if the last call succeeded
