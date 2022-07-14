@@ -141,7 +141,8 @@ class Picture:
             self.decoder.pictures_used.add(self.index)
             log.debug(f'picture {self.index} added to used')
 
-        cuda.call(nvcuvid.cuvidDecodePicture, self.decoder.decoder, byref(params))
+        with cuda.Device(decoder.device):
+            cuda.check(nvcuvid.cuvidDecodePicture(self.decoder.cuvid_decoder, byref(params)))
 
     def on_display(self, params):
         self.params = params
@@ -186,14 +187,16 @@ class Picture:
                 try:
                     while True:
                         devptr = self.decoder.surfaces_to_unmap.pop()
-                        cuda.call(nvcuvid.cuvidUnmapVideoFrame64, self.decoder.decoder, c_ulonglong(devptr))
+                        with cuda.Device(self.decoder.device):
+                            cuda.check(nvcuvid.cuvidUnmapVideoFrame64(self.decoder.cuvid_decoder, c_ulonglong(devptr)))
                         self.decoder.surfaces_avail += 1
                 except KeyError:
                     pass
 
             c_devptr = c_ulonglong() # according to cuviddec, the argument type of cuvidmapvideoframe64
             c_pitch = c_uint()
-            cuda.call(nvcuvid.cuvidMapVideoFrame64, self.decoder.decoder, self.index, byref(c_devptr), byref(c_pitch), byref(self.params))
+            with cuda.Device(self.decoder.device):
+                cuda.check(nvcuvid.cuvidMapVideoFrame64(self.decoder.cuvid_decoder, self.index, byref(c_devptr), byref(c_pitch), byref(self.params)))
             self.decoder.surfaces_avail -= 1
 
             surface = Surface(self.decoder, c_devptr, c_pitch, stream)
@@ -261,7 +264,7 @@ class BaseDecoder:
     def handleVideoSequence(self, pUserData, pVideoFormat):
         log.debug('sequence')
         vf = cast(pVideoFormat, POINTER(CUVIDEOFORMAT)).contents
-        if self.decoder:
+        if self.cuvid_decoder:
             def cmp(a,b):
                 if type(a) is not type(b):
                     log.debug(f'{type(a)} {type(b)}')
@@ -292,7 +295,8 @@ class BaseDecoder:
             nBitDepthMinus8=vf.bit_depth_luma_minus8
         )
 
-        cuda.call(nvcuvid.cuvidGetDecoderCaps, byref(caps))
+        with cuda.Device(self.device):
+            cuda.check(nvcuvid.cuvidGetDecoderCaps(byref(caps)))
         assert caps.bIsSupported == 1, "Codec not supported"
         assert vf.coded_width <= caps.nMaxWidth, "width too large"
         assert vf.coded_height <= caps.nMaxHeight, "height too large"
@@ -387,7 +391,8 @@ class BaseDecoder:
         # for field_name, filed_type in p._fields_:
         #     print(field_name, getattr(p, field_name))
 
-        cuda.call(nvcuvid.cuvidCreateDecoder, byref(self.decoder), byref(p))
+        with cuda.Device(self.device):
+            cuda.check(nvcuvid.cuvidCreateDecoder(byref(self.cuvid_decoder), byref(p)))
         log.debug(f'created decoder: {p}')
 
         # this mirrors parser's reorder buffer
@@ -466,7 +471,7 @@ class BaseDecoder:
     def handlePictureDecode(self, pUserData, pPicParams):
         log.debug('decode')
         pp = cast(pPicParams, POINTER(CUVIDPICPARAMS)).contents
-        assert self.decoder, "decoder not initialized"
+        assert self.cuvid_decoder, "decoder not initialized"
         log.debug(f'decode picture index: {pp.CurrPicIdx}')
 
         p = Picture(self, pp)
@@ -500,7 +505,7 @@ class BaseDecoder:
                 return self.operating_point | (1 << 10 if self.disp_all_layers else 0)
         return -1
 
-    def __init__(self, codec: cudaVideoCodec, on_recv, decide = lambda p: {}):
+    def __init__(self, codec: cudaVideoCodec, on_recv, decide = lambda p: {}, device = None):
         """
         Args:
             codec (cudaVideoCodec): the codec enum of the video
@@ -528,8 +533,8 @@ class BaseDecoder:
 
         self.operating_point = 0
         self.disp_all_layers = False
-        self.parser = CUvideoparser() # NULL, to be filled in next 
-        self.decoder = CUvideodecoder() # NULL, to be filled in later        
+        self.cuvid_parser = CUvideoparser() # NULL, to be filled in next 
+        self.cuvid_decoder = CUvideodecoder() # NULL, to be filled in later        
         self.video_format = CUVIDEOFORMAT() # NULL, to be filled in later
 
         self.handleVideoSequenceCallback = PFNVIDSEQUENCECALLBACK(self.catch_exception(self.handleVideoSequence))
@@ -547,8 +552,9 @@ class BaseDecoder:
             pfnDisplayPicture=self.handlePictureDisplayCallback,
             pfnGetOperatingPoint=self.handleOperatingPointCallback
             )
-
-        cuda.call(nvcuvid.cuvidCreateVideoParser, byref(self.parser), byref(p))
+        
+        self.device = cuda.get_current_device(device)
+        cuda.check(nvcuvid.cuvidCreateVideoParser(byref(self.cuvid_parser), byref(p)))
 
     def send(self, packet, pts = 0):
         """
@@ -576,7 +582,7 @@ class BaseDecoder:
             payload = packet.ctypes.data_as(POINTER(c_uint8)),
             timestamp = pts
             )
-        cuda.call(nvcuvid.cuvidParseVideoData, self.parser, byref(p))
+        cuda.check(nvcuvid.cuvidParseVideoData(self.cuvid_parser, byref(p)))
         # catch: cuvidParseVideoData will not propagate error return code 0 of HandleVideoSequenceCallback
         # it still returns CUDA_SUCCESS and simply ignore all future incoming packets
         # therefore we must check the exception here, even if the last call succeeded
@@ -597,7 +603,7 @@ class BaseDecoder:
             timestamp = 0
         )
         # this reset the parser internal state
-        cuda.call(nvcuvid.cuvidParseVideoData, self.parser, byref(p))
+        cuda.check(nvcuvid.cuvidParseVideoData(self.cuvid_parser, byref(p)))
 
         # frees reorder buffer
         self.reorder_buffer = {}
@@ -606,10 +612,11 @@ class BaseDecoder:
                             
 
     def __del__(self):
-        if self.parser:
-            cuda.call(nvcuvid.cuvidDestroyVideoParser, self.parser)
-        if self.decoder:
-            cuda.call(nvcuvid.cuvidDestroyDecoder, self.decoder)
+        if self.cuvid_parser:
+            cuda.check(nvcuvid.cuvidDestroyVideoParser(self.cuvid_parser))
+        if self.cuvid_decoder:
+            with cuda.Device(self.device):
+                cuda.check(nvcuvid.cuvidDestroyDecoder(self.cuvid_decoder))
 
 class Decoder(BaseDecoder):
     """A decoder with send/recv paradigm. That is, user send packets to decoder, and receive pictures from decoder. 
@@ -658,11 +665,11 @@ class Decoder(BaseDecoder):
             self.send(packet, pts)
             while not self.pictures.empty():
                 self.pictures.get()
-            if self.decoder:
+            if self.cuvid_decoder:
                 break
             del packet
 
-    def __init__(self, codec: cudaVideoCodec, decide=lambda p: {}):
+    def __init__(self, codec: cudaVideoCodec, decide=lambda p: {}, device=None):
         """
         Args:
             codec (cudaVideoCodec): codec enum of video
@@ -670,4 +677,4 @@ class Decoder(BaseDecoder):
         """        
         self.pictures = Queue()
         on_recv = lambda pic,pts : self.pictures.put((pic, pts))
-        super().__init__(codec, on_recv, decide)
+        super().__init__(codec, on_recv, decide, device)
