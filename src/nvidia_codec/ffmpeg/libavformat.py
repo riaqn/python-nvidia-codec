@@ -34,7 +34,7 @@ class FormatContext:
             pkt = Packet()
             self.read_frame(pkt) # we own the packet
             if pkt.av.stream_index == stream.index:
-                log.warning(f'demuxed dts={pkt.av.dts} pts={pkt.av.pts}')
+                log.debug(f'demuxed dts={pkt.av.dts} pts={pkt.av.pts}')
                 yield pkt # ownership transferred outside
 
     def seek_file(self, stream : AVStream, ts : int, min_ts = -(2**63), max_ts = (2**63) - 1):

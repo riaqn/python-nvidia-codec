@@ -68,7 +68,7 @@ class BSFContext:
     def __del__(self):
         lib.av_bsf_free(byref(pointer(self.av)))
 
-    def filter(self, packets):
+    def filter(self, packets, reuse = False):
         # always flush for the first time
         call(lib.av_bsf_flush, byref(self.av))
 
@@ -91,7 +91,10 @@ class BSFContext:
                     else:
                         raise
                 yield pkt_out 
-                pkt_out.unref()
+                if reuse:
+                    pkt_out.unref()
+                else:
+                    pkt_out = Packet()
 
                 # after the yield, the other side should be done with the packet
                 
