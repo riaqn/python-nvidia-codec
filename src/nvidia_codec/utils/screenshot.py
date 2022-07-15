@@ -16,7 +16,7 @@ import logging
 log = logging.getLogger(__name__)
 
 class Screenshot:
-    def __init__(self, url, target_size = lambda h,w: (h,w), device = None):
+    def __init__(self, url, target_size = lambda h,w: (h,w), target_typestr = '|u1', device = None):
         self.fc = FormatContext(url)
         l = list(filter(lambda s: s.codecpar.contents.codec_type == AVMediaType.VIDEO, self.fc.streams))
 
@@ -69,6 +69,7 @@ class Screenshot:
             }
         self.decoder = Decoder(av2cuda(self.stream.codecpar.contents.codec_id), decide = decide, device = self.device)
         self.cvt = None
+        self.target_typestr = target_typestr
 
     @property
     def time_base(self):
@@ -142,14 +143,19 @@ class Screenshot:
         surface = last.map(stream)
 
         if isinstance(target, str):
-            shape, typestr = Converter.infer_target(surface.shape, cuda2av(surface.format), AVPixelFormat.RGB24)
+            shape = Converter.infer_target(surface.shape, cuda2av(surface.format))
             with cuda.Device(self.device):   
                 if target == 'cupy':
                     import cupy            
-                    target = cupy.empty(shape, dtype = typestr)        
+                    target = cupy.empty(shape, dtype = self.target_typestr)        
                 elif target == 'torch':
                     import torch
-                    target = torch.empty(shape, dtype = typestr) 
+                    m = {
+                        '|u1': torch.uint8,
+                        '<f2': torch.float16,
+                        '<f4': torch.float32,
+                    }
+                    target = torch.empty(shape, dtype = m[self.target_typestr], device = 'cuda') 
                 else:
                     raise Exception(f'unsupported target {target}')
 
@@ -160,7 +166,8 @@ class Screenshot:
                     cuda2av(surface.format),
                     self.color_space(AVColorSpace.BT470BG),
                     self.color_range(AVColorRange.MPEG),
-                    target
+                    target,
+                    self.target_typestr
                     )
                     
         self.cvt(surface, target, stream = stream)
