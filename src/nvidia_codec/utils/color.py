@@ -55,9 +55,9 @@ class Converter:
             raise ValueError(f'unsupported typestr {typestr}')
 
     @staticmethod
-    def infer_target(source_shape, source_format, target_format):
+    def infer_target(source_shape, source_format):
         size = shape2size(source_format, source_shape)
-        return (size2shape(target_format, size), typestr(target_format))
+        return size2shape(AVPixelFormat.RGB24, size)
         
     def __init__(self, 
         source_template, 
@@ -65,9 +65,7 @@ class Converter:
         source_space : AVColorSpace, 
         source_range : AVColorRange, 
         target_template, 
-        target_format : AVPixelFormat = AVPixelFormat.RGB24, 
-        target_space: AVColorSpace = AVColorSpace.RGB, 
-        target_range: AVColorRange = AVColorRange.JPEG,
+        target_typestr : str,
         device = None
         ):
         """
@@ -93,9 +91,8 @@ class Converter:
         self.target_shape = target['shape']
         self.target_strides = Converter.strides(target)
         self.target_typestr = target['typestr']
-        assert self.target_typestr == typestr(target_format)
-        assert self.size == shape2size(target_format, self.target_shape), 'source and target size must be the same'
-
+        assert self.target_typestr == target_typestr, f'{self.target_typestr} != {target_typestr}'
+        assert self.size == shape2size(AVPixelFormat.RGB24, self.target_shape), f'{self.size} != {shape2size(AVPixelFormat.RGB24, self.target_shape)}'
 
         # intermedia type
         mtype = 'float'
@@ -149,8 +146,6 @@ class Converter:
 
 
         def yuv2rgb():
-            assert target_space == AVColorSpace.RGB, 'only support RGB space as target'
-    
             if source_space in [AVColorSpace.BT470BG, AVColorSpace.SMPTE170M]:
                 m = [[1, 0, 1.402], [1, -0.34414, -0.71414], [1, 1.772, 0]]
             elif source_space == AVColorSpace.BT709:
@@ -169,7 +164,6 @@ class Converter:
             return yuv_to_rgb
 
         def rgb():
-            assert target_range == AVColorRange.JPEG, 'only support JPEG range as target'            
             ttype = Converter.typestr2ctype(self.target_typestr)
             def dst(*indices):
                 return Converter.idx('dst', ttype, self.target_strides, indices)            
@@ -180,17 +174,22 @@ class Converter:
                 {ttype} G = min(max(G_ * 256, .5), 256 - .5);
                 {ttype} B = min(max(B_ * 256, .5), 256 - .5);
                 '''
+            elif ttype == 'float':
+                normalize_rgb = f'''
+                {ttype} R = min(max(R_, 0.0), 1.0);
+                {ttype} G = min(max(G_, 0.0), 1.0);
+                {ttype} B = min(max(B_, 0.0), 1.0);
+                '''
             else:
                 raise Exception(f"Unsupported target type {target['typestr']}")
 
-            if target_format == AVPixelFormat.RGB24:
-                store_rgb = f'''
-                {dst('x', 'y', '0')} = R;
-                {dst('x', 'y', '1')} = G;
-                {dst('x', 'y', '2')} = B;
-                '''
-            else:
-                raise Exception(f"Unsupported target format {target_format}")
+
+            store_rgb = f'''
+            {dst('x', 'y', '0')} = R;
+            {dst('x', 'y', '1')} = G;
+            {dst('x', 'y', '2')} = B;
+            '''
+
             return normalize_rgb + store_rgb
 
         self.device = cuda.get_current_device(device)
