@@ -6,9 +6,9 @@ from PIL import Image
 
 import sys
 
-_, device, path, seconds = sys.argv
-screenshot = Screenshot(path, lambda h,w: (h//2,w//2), int(device))
+_, device, path, seconds, out = sys.argv
+screenshot = Screenshot(path, lambda h,w: (h//4*2,w//4*2), int(device))
 
 arr = screenshot.shoot(timedelta(seconds=int(seconds)))
 k = arr.get()
-Image.fromarray(k).save('test.png')
+Image.fromarray(k).save(out)

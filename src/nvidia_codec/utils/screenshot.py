@@ -6,10 +6,8 @@ from ..ffmpeg.libavcodec import BitStreamFilter, BSFContext
 from ..ffmpeg.libavformat import FormatContext, AVMediaType, AVCodecID
 from ..ffmpeg.include.libavutil  import AV_NOPTS_VALUE, AV_TIME_BASE, AVColorRange, AVColorSpace, AVPixelFormat
 from .compat import av2cuda, cuda2av
-from ..core.decode import Decoder, decide_surface_format
+from ..core.decode import Decoder
 from ..utils.color import Converter
-import cupy
-
 
 from ..core import cuda
 
@@ -114,14 +112,14 @@ class Screenshot:
             log.info(f'color range is {r}')
             return r
 
-    def shoot(self, target : int | timedelta, array = None, stream : int = 2):
+    def shoot(self, time : int | timedelta, target = 'cupy', stream : int = 2):
 
-        if isinstance(target, timedelta):
-            target_pts = int(target.total_seconds() / self.time_base) + self.start_time
-        elif isinstance(target, int):
-            target_pts = target
+        if isinstance(time, timedelta):
+            target_pts = int(time.total_seconds() / self.time_base) + self.start_time
+        elif isinstance(time, int):
+            target_pts = time
         else:
-            raise Exception(f'unsupported target type {type(target)}')
+            raise Exception(f'unsupported target type {type(time)}')
         log.debug(f'target_pts: {target_pts}')
         self.fc.seek_file(self.stream, target_pts)
 
@@ -143,10 +141,17 @@ class Screenshot:
             last = pic
         surface = last.map(stream)
 
-        if array is None:
+        if isinstance(target, str):
             shape, typestr = Converter.infer_target(surface.shape, cuda2av(surface.format), AVPixelFormat.RGB24)
-            with cuda.Device(self.device):
-                array = cupy.empty(shape, dtype = typestr)        
+            with cuda.Device(self.device):   
+                if target == 'cupy':
+                    import cupy            
+                    target = cupy.empty(shape, dtype = typestr)        
+                elif target == 'torch':
+                    import torch
+                    target = torch.empty(shape, dtype = typestr) 
+                else:
+                    raise Exception(f'unsupported target {target}')
 
         if self.cvt is None:
             with cuda.Device(self.device):                
@@ -155,8 +160,8 @@ class Screenshot:
                     cuda2av(surface.format),
                     self.color_space(AVColorSpace.BT470BG),
                     self.color_range(AVColorRange.MPEG),
-                    array
+                    target
                     )
                     
-        self.cvt(surface, array, stream = stream)
-        return array
+        self.cvt(surface, target, stream = stream)
+        return target
