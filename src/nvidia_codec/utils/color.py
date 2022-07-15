@@ -53,6 +53,11 @@ class Converter:
             return 'unsigned short'
         else:
             raise ValueError(f'unsupported typestr {typestr}')
+
+    @staticmethod
+    def infer_target(source_shape, source_format, target_format):
+        size = shape2size(source_format, source_shape)
+        return (size2shape(target_format, size), typestr(target_format))
         
     def __init__(self, 
         source_template, 
@@ -216,7 +221,6 @@ class Converter:
         
         s = source.__cuda_array_interface__
         t = target.__cuda_array_interface__
-        print(s, t)          
         if check:
             assert s['shape'] == self.source_shape
             assert t['shape'] == self.target_shape

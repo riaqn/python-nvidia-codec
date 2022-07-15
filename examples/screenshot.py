@@ -4,31 +4,11 @@ import torch
 from datetime import timedelta
 from PIL import Image
 
-import cupy
+import sys
 
+_, device, path, seconds = sys.argv
+screenshot = Screenshot(path, lambda h,w: (h//2,w//2), int(device))
 
-# url = '/mnt/Downloads/movies/Everything.Everywhere.All.At.Once.2022.2160p.WEB-DL.DDP5.1.x265.10bit-EVO.60fps.mkv'
-url = '/mnt/Downloads/movies/L.A.Confidential.1997.BluRay.1080p.TrueHD.5.1.x265.10bit-BeiTai/L.A.Confidential.1997.BluRay.1080p.TrueHD.5.1.x265.10bit-BeiTai.mkv'
-# url = '/mnt/Downloads/movies/现代启示录.Apocalypse.Now.1979.BluRay.2160p.x265.10bit.HDR.3Audio.mUHD-FRDS/Apocalypse.Now.1979.BluRay.2160p.x265.10bit.HDR.3Audio.mUHD-FRDS.mkv'
-screenshot = Screenshot(url)
-print(screenshot.start_time, screenshot.duration)
-cuda = torch.device('cuda')
-# cuda = torch.device('cuda:1')
-# stream = torch.cuda.Stream()
-
-
-
-
-# with torch.cuda.device(cuda):
-    # with cupy.cuda.Device(cuda.index):
-arr = torch.empty((screenshot.height, screenshot.width, 3), dtype=torch.uint8, device=cuda)
-print(arr.stride())
-        # with torch.cuda.stream(stream):
-            # with cupy.cuda.ExternalStream(extract_stream_ptr(stream)):
-screenshot.shoot(timedelta(seconds=3601), arr)
-
-print(arr.shape)
-k = arr.cpu().numpy()
-
-# stream.synchronize()
-Image.fromarray(k).save('text1.png')
+arr = screenshot.shoot(timedelta(seconds=int(seconds)))
+k = arr.get()
+Image.fromarray(k).save('test.png')

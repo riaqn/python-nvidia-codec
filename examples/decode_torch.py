@@ -2,14 +2,7 @@ from datetime import timedelta
 import torch
 import torchvision
 
-
-import pycuda.driver as cuda_dri
-from nvidia_codec.common import SurfaceFormat, size2shape
-from nvidia_codec.decode import Decoder
 import logging
-import av
-from nvidia_codec.pyav import PyAVStreamAdaptor
-from nvidia_codec import color
 import faulthandler
 from tqdm import tqdm
 import numpy as np
@@ -25,14 +18,13 @@ logging.basicConfig(level=logging.INFO)
 import requests
 import json
 
-def test(deviceID, path):
+def test(device_idx, path):
     '''
     take a screenshot for every 10 secs, and run image classification on it
     pictures never leaves GPU
     '''
 
-    cuda_dri.init()    
-    cuda = torch.device(f'cuda:{deviceID}')
+    cuda = torch.device(device_idx)
 
     norm = torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                             std=[0.229, 0.224, 0.225]).to(cuda)
@@ -132,10 +124,9 @@ def test(deviceID, path):
             print(f'{id2label[str(idx)][1]} {features[0][idx].item()}')
 
 
-    ctx.pop()
 
 if __name__ == '__main__':
     import sys
-    deviceID = int(sys.argv[1])
+    device_idx = int(sys.argv[1])
     path = sys.argv[2]
-    test(deviceID, path)
+    test(device_idx, path)
