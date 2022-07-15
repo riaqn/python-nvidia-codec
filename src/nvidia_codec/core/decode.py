@@ -90,6 +90,10 @@ class Surface:
         self.free()
 
     @property
+    def shape(self):
+        return self.__cuda_array_interface__['shape']
+
+    @property
     def __cuda_array_interface__(self):
         format = self.format
         if format == cudaVideoSurfaceFormat.NV12:
@@ -264,6 +268,7 @@ class BaseDecoder:
     def handleVideoSequence(self, pUserData, pVideoFormat):
         log.debug('sequence')
         vf = cast(pVideoFormat, POINTER(CUVIDEOFORMAT)).contents
+
         if self.cuvid_decoder:
             def cmp(a,b):
                 if type(a) is not type(b):
@@ -287,7 +292,8 @@ class BaseDecoder:
                 return self.decode_create_info.ulNumDecodeSurfaces
             else:
                 raise Exception("decoder already initialized, please create a new decoder for new video sequence")
-
+        memmove(byref(self.video_format), byref(vf), sizeof(CUVIDEOFORMAT))
+        # save for user use
 
         caps = CUVIDDECODECAPS(
             eCodecType=vf.codec,
@@ -310,47 +316,44 @@ class BaseDecoder:
                 supported_surface_formats.append(cudaVideoSurfaceFormat(surface_format))
 
         p = {
-            'chroma_format': cudaVideoChromaFormat(vf.chroma_format),
+            'chroma_format': vf.chroma_format,
             'bit_depth' : vf.bit_depth_luma_minus8 + 8,
-            'size' : {
-                'width' : vf.display_area.right - vf.display_area.left,
-                'height' : vf.display_area.bottom - vf.display_area.top
-            },
             'supported_surface_formats' : supported_surface_formats,
             'min_num_pictures' : vf.min_num_decode_surfaces,
         }
+
+        self.decode_create_info = p # save for user use        
+
 
         # the default values 
         decision = {
             'num_pictures' : p['min_num_pictures'] + 1, # for simplicity
             'num_surfaces' : 1 + 1, # for simplicity
             'surface_format' : decide_surface_format(p['chroma_format'], p['bit_depth'], p['supported_surface_formats']),
-            'cropping' : {
+            'cropping' : lambda height,width : { # by default no cropping 
                 'left': 0,
-                'right' : p['size']['width'],
+                'right' : width,
                 'top': 0,
-                'bottom' : p['size']['height']
+                'bottom' : height
             },
-            'target_size': {
-                'width' : p['size']['width'],
-                'height' : p['size']['height']
-            },
-            'target_rect': {
+            'target_size': lambda cropped_height, cropped_width: (cropped_height,cropped_width),# by default no scaling
+            'target_rect': lambda target_height, target_width : { # by default no margin
                 'left': 0,
-                'right' : 0,
+                'right' : target_width,
                 'top': 0,
-                'bottom' : 0
+                'bottom' : target_height
             },
         }
 
         decision |= self.decide(p)
+        c = decision['cropping'](self.height, self.width)
+        target_height, target_width = decision['target_size'](c['bottom'] - c['top'], c['right'] - c['left'])
+        tr = decision['target_rect'](target_height, target_width)
 
         assert decision['num_pictures'] <= 32, f"number of pictures {decision['num_pictures']} > 32 max"
-
         assert decision['surface_format'] in supported_surface_formats, f"surface format {decision['surface_format']} not supported for codec {caps.eCodecType} chroma {caps.eChromaFormat} depth {caps.nBitDepthMinus8 + 8}"
         assert decision['num_surfaces'] >= 0, "number of surfaces must be non-negative"
         da = vf.display_area
-        c = decision['cropping']        
         # the provided cropping is offsetted 
         display_area = SRECT(
             left = da.left + c['left'],
@@ -358,7 +361,6 @@ class BaseDecoder:
             right = da.left + c['right'],
             bottom = da.top + c['bottom']
         )
-        tr = decision['target_rect']
         target_rect = SRECT(
             left = tr['left'],
             top = tr['top'],
@@ -366,7 +368,7 @@ class BaseDecoder:
             bottom = tr['bottom']
         )
 
-        p = CUVIDDECODECREATEINFO(
+        self.decode_create_info = CUVIDDECODECREATEINFO(
             ulWidth = vf.coded_width,
             ulHeight = vf.coded_height,
             ulNumDecodeSurfaces = decision['num_pictures'],
@@ -380,8 +382,8 @@ class BaseDecoder:
             display_area = display_area,
             OutputFormat = decision['surface_format'],
             DeinterlaceMode = (cudaVideoDeinterlaceMode.Weave if vf.progressive_sequence else cudaVideoDeinterlaceMode.Adaptive),
-            ulTargetWidth = decision['target_size']['width'],
-            ulTargetHeight = decision['target_size']['height'],
+            ulTargetWidth = target_width,
+            ulTargetHeight = target_height,
             ulNumOutputSurfaces = decision['num_surfaces'],
             vidLock = None,
             target_rect = target_rect,
@@ -392,8 +394,8 @@ class BaseDecoder:
         #     print(field_name, getattr(p, field_name))
 
         with cuda.Device(self.device):
-            cuda.check(nvcuvid.cuvidCreateDecoder(byref(self.cuvid_decoder), byref(p)))
-        log.debug(f'created decoder: {p}')
+            cuda.check(nvcuvid.cuvidCreateDecoder(byref(self.cuvid_decoder), byref(self.decode_create_info)))
+
 
         # this mirrors parser's reorder buffer
         # maps picture index to pictures
@@ -405,8 +407,7 @@ class BaseDecoder:
         self.surfaces_to_unmap = set() # surfaces waiting to be unmap (their devptr)
         self.surfaces_avail = decision['num_surfaces'] # number of surfaces available
         self.surfaces_cond = Condition()
-        self.decode_create_info = p # save for user use
-        memmove(byref(self.video_format), byref(vf), sizeof(CUVIDEOFORMAT))
+
         log.debug('sequence successful')
         return decision['num_pictures']
 
@@ -416,19 +417,15 @@ class BaseDecoder:
         Returns:
             cudaVideoCodec: the codec enum of the video
         """        
-        return cudaVideoCodec(self.decode_create_info.CodecType)
+        return self.decode_create_info.CodecType
 
     @property
-    def coded_size(self):
-        '''
-        Returns:
-            dict: the coded size of the video, with keys 'width' and 'height'
-            note this is not the actual size of the video
-        '''
-        return {
-            'width' : self.decode_create_info.ulWidth,
-            'height' : self.decode_create_info.ulHeight
-        }
+    def height(self):
+        return  self.video_format.display_area.bottom - self.video_format.display_area.top
+
+    @property
+    def width(self):
+        return self.video_format.display_area.right - self.video_format.display_area.left
 
     @property
     def target_width(self):
@@ -446,18 +443,6 @@ class BaseDecoder:
             int: the height of the target picture
         """        
         return self.decode_create_info.ulTargetHeight
-
-    @property
-    def target_size(self):
-        """
-
-        Returns:
-            dict: the size of the target picture, with keys 'width' and 'height'
-        """        
-        return {
-            'width' : self.target_width,
-            'height' : self.target_height
-        }
 
     @property
     def surface_format(self):

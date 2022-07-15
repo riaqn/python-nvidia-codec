@@ -52,7 +52,7 @@ def check_rt(cudaError):
         raise CUDAError(cudaError)
 
 class Device:
-    def __init__(self, idx):
+    def __init__(self, idx : int):
         self.idx = idx
         self.prev = c_int(-1)
 
