@@ -25,14 +25,6 @@ av_packet_alloc.restype = POINTER(AVPacket)
 # def packet_unref(pkt):
 #     lib.av_packet_unref(byref(pkt))
 
-class BitStreamFilter:
-    def __init__(self, name):
-        name = c_char_p(name.encode('utf-8'))
-        func = lib.av_bsf_get_by_name
-        func.restype = POINTER(AVBitStreamFilter)
-        ptr = func(name)
-        self.av = ptr.contents
-
 class Packet:
     def __init__(self):
         ptr = av_packet_alloc()

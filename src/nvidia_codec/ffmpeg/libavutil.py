@@ -11,7 +11,7 @@ def strerror(errnum):
 
 def shape2size(self, shape):
     if self == AVPixelFormat.RGB24:
-        h, w, c = shape
+        c, h, w = shape
         assert c == 3
     elif self in [AVPixelFormat.YUV420P, AVPixelFormat.YUV420P16LE]:
         h, w = shape
@@ -27,7 +27,7 @@ def shape2size(self, shape):
 def size2shape(self, size):
     h,w = size
     if self == AVPixelFormat.RGB24:
-        return (h, w, 3)
+        return (3, h, w)
     elif self in [AVPixelFormat.YUV420P, AVPixelFormat.YUV420P16LE]:
         assert h % 2 == 0
         return (h//2 * 3, w)

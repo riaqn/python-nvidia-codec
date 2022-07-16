@@ -13,7 +13,7 @@ from .common import *
 from queue import Queue
 import numpy as np
 from ctypes import *
-from threading import Condition
+from threading import Condition, Lock, Semaphore
 
 import logging
 log = logging.getLogger(__name__)
@@ -28,11 +28,12 @@ class Surface:
         """
         DO NOT call this by yourself; use Picture.map() instead
         """
-        log.warning(f'creating surface {c_devptr}')
+        log.debug(f'creating surface {c_devptr}')
         self.decoder = decoder
         self.c_pitch = c_pitch
         self.c_devptr = c_devptr
         self.stream = stream
+        self.lock = Lock()
 
     @property
     def format(self):
@@ -77,14 +78,15 @@ class Surface:
 
         free() is called automatically when the surface is garbage collected
         """        
-        log.warning(f'freeing surface {self.c_devptr}')
-        if self.c_devptr is None:
-            return
-        
-        with self.decoder.surfaces_cond:
-            self.decoder.surfaces_to_unmap.add(self.c_devptr.value)
+        log.debug(f'freeing surface {self.c_devptr}')
+        with self.lock:
+            if self.c_devptr is None:
+                return
+
+            with cuda.Device(self.decoder.device):
+                cuda.check(nvcuvid.cuvidUnmapVideoFrame64(self.decoder.cuvid_decoder, self.c_devptr))
             self.c_devptr = None
-            self.decoder.surfaces_cond.notify_all()
+        self.decoder.surfaces_sem.release()
 
     def __del__(self):
         log.debug(f'trying to unmap {self.c_devptr}')
@@ -132,26 +134,16 @@ class Picture:
     Its data is not accessible at all, but still takes up GPU memory
     User must call Picture.map() to get a Surface for the data
     '''
-    def __init__(self, decoder, params):
+    def __init__(self, decoder, index, proc_params):
         '''
         DO NOT call this by yourself; use Decoder.decode() instead
         '''
-        log.warning(f'creating picture {params.CurrPicIdx}')
-        self.decoder = decoder        
-        self.index = params.CurrPicIdx
+        self.decoder = decoder
+        self.index = index
+        self.params = proc_params
         with self.decoder.pictures_cond:
-            # wait until picture slot is available again
-            log.debug('wait_for_pictures started')
-            self.decoder.pictures_cond.wait_for(lambda:self.index not in self.decoder.pictures_used)
-            log.debug('wait_for_pictures finished')
             self.decoder.pictures_used.add(self.index)
-            log.debug(f'picture {self.index} added to used')
-
-        with cuda.Device(decoder.device):
-            cuda.check(nvcuvid.cuvidDecodePicture(self.decoder.cuvid_decoder, byref(params)))
-
-    def on_display(self, params):
-        self.params = params
+        self.lock = Lock()
 
     def free(self):
         '''
@@ -161,13 +153,14 @@ class Picture:
 
         free() is called automatically when the picture is garbage collected        
         '''
-        log.warning(f'freeing picture {self.index}')
-        if self.index is None:
-            return
-        with self.decoder.pictures_cond:
-            self.decoder.pictures_used.remove(self.index)
-            self.index = None # the index is released and therefore invalid
-            self.decoder.pictures_cond.notify_all()    
+        log.debug(f'freeing picture {self.index}')
+        with self.lock:
+            if self.index is None:
+                return
+            with self.decoder.pictures_cond:
+                self.decoder.pictures_used.remove(self.index)
+                self.index = None # the index is released and therefore invalid
+                self.decoder.pictures_cond.notify_all()    
     
     def __del__(self):
         self.free()
@@ -185,29 +178,15 @@ class Picture:
         self.params.stream = stream
         assert self.params.stream != 0, 'must speicfy legacy default stream or per-thread default stream'
 
-        with self.decoder.surfaces_cond:
-            if self.decoder.surfaces_avail == 0:
-                log.debug('wait_for surface started')
-                self.decoder.surfaces_cond.wait_for(lambda: len(self.decoder.surfaces_to_unmap) > 0)
-                log.debug('wait_for surface finished')
-                # we now make sure we at least have one surface to unmap
-                try:
-                    while True:
-                        devptr = self.decoder.surfaces_to_unmap.pop()
-                        with cuda.Device(self.decoder.device):
-                            cuda.check(nvcuvid.cuvidUnmapVideoFrame64(self.decoder.cuvid_decoder, c_ulonglong(devptr)))
-                        self.decoder.surfaces_avail += 1
-                except KeyError:
-                    pass
+        self.decoder.surfaces_sem.acquire()
 
-            c_devptr = c_ulonglong() # according to cuviddec, the argument type of cuvidmapvideoframe64
-            c_pitch = c_uint()
-            with cuda.Device(self.decoder.device):
-                cuda.check(nvcuvid.cuvidMapVideoFrame64(self.decoder.cuvid_decoder, self.index, byref(c_devptr), byref(c_pitch), byref(self.params)))
-            self.decoder.surfaces_avail -= 1
+        c_devptr = c_ulonglong() # according to cuviddec, the argument type of cuvidmapvideoframe64
+        c_pitch = c_uint()
+        with cuda.Device(self.decoder.device):
+            cuda.check(nvcuvid.cuvidMapVideoFrame64(self.decoder.cuvid_decoder, self.index, byref(c_devptr), byref(c_pitch), byref(self.params)))
 
-            surface = Surface(self.decoder, c_devptr, c_pitch, stream)
-            return surface
+        surface = Surface(self.decoder, c_devptr, c_pitch, stream)
+        return surface
 
 def decide_surface_format(chroma_format, bit_depth, supported_surface_formats, allow_high = False):
     """decide the appropriate surface format for a given chroma format and bit depth
@@ -397,17 +376,11 @@ class BaseDecoder:
         with cuda.Device(self.device):
             cuda.check(nvcuvid.cuvidCreateDecoder(byref(self.cuvid_decoder), byref(self.decode_create_info)))
 
-
-        # this mirrors parser's reorder buffer
-        # maps picture index to pictures
-        self.reorder_buffer = {}
         # this contains all picture indices that are still being used
         # including the ones in above, and the ones passed to user via on_recv
         self.pictures_used = set() 
         self.pictures_cond = Condition()
-        self.surfaces_to_unmap = set() # surfaces waiting to be unmap (their devptr)
-        self.surfaces_avail = decision['num_surfaces'] # number of surfaces available
-        self.surfaces_cond = Condition()
+        self.surfaces_sem = Semaphore(decision['num_surfaces']) # number of surfaces available
 
         log.debug('sequence successful')
         return decision['num_pictures']
@@ -457,17 +430,25 @@ class BaseDecoder:
     def handlePictureDecode(self, pUserData, pPicParams):
         log.debug('decode')
         pp = cast(pPicParams, POINTER(CUVIDPICPARAMS)).contents
-        assert self.cuvid_decoder, "decoder not initialized"
+        # assert self.cuvid_decoder, "decoder not initialized"
         log.debug(f'decode picture index: {pp.CurrPicIdx}')
 
-        p = Picture(self, pp)
-        self.reorder_buffer[p.index] = p
+        with self.pictures_cond:
+            # wait until picture slot is available again
+            log.debug('wait_for_pictures started')
+            self.pictures_cond.wait_for(lambda:pp.CurrPicIdx not in self.pictures_used)
+            log.debug('wait_for_pictures finished')
+
+            # now we know that the user no longer need this picture
+            # we can overwrite it
+            with cuda.Device(self.device):
+                cuda.check(nvcuvid.cuvidDecodePicture(self.cuvid_decoder, byref(pp)))
+
         return 1  
 
     def handlePictureDisplay(self, pUserData, pDispInfo):
         log.debug('display')
         di = cast(pDispInfo, POINTER(CUVIDPARSERDISPINFO)).contents
-        picture = self.reorder_buffer.pop(di.picture_index) # remove this reference        
 
         params = CUVIDPROCPARAMS(
             progressive_frame=di.progressive_frame,
@@ -475,7 +456,7 @@ class BaseDecoder:
             top_field_first=di.top_field_first,
             unpaired_field=di.repeat_first_field < 0
         )
-        picture.on_display(params)
+        picture = Picture(self, di.picture_index, params)
         self.on_recv(picture, di.timestamp)
         return 1
 
@@ -591,12 +572,7 @@ class BaseDecoder:
         )
         # this reset the parser internal state
         cuda.check(nvcuvid.cuvidParseVideoData(self.cuvid_parser, byref(p)))
-
-        # frees reorder buffer
-        self.reorder_buffer = {}
-        # no need to set self.pictures - should be set by the previous line
-        # some will remain because user still holds them.
-                            
+          
 
     def __del__(self):
         if self.cuvid_parser:

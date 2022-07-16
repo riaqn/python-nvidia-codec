@@ -185,9 +185,9 @@ class Converter:
 
 
             store_rgb = f'''
-            {dst('x', 'y', '0')} = R;
-            {dst('x', 'y', '1')} = G;
-            {dst('x', 'y', '2')} = B;
+            {dst('0', 'x', 'y')} = R;
+            {dst('1', 'x', 'y')} = G;
+            {dst('2', 'x', 'y')} = B;
             '''
 
             return normalize_rgb + store_rgb
