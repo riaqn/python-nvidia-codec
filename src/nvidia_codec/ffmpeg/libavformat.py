@@ -10,7 +10,7 @@ from .include.libavcodec import *
 from .include.libavformat import *
 from .libavcodec import Packet
 
-from .common import check
+from .common import AVException, check
 
 
 import logging
@@ -32,7 +32,13 @@ class FormatContext:
     def read_frames(self, stream : AVStream):
         while True:
             pkt = Packet()
-            self.read_frame(pkt) # we own the packet
+            try:
+                self.read_frame(pkt) # we own the packet
+            except AVException as e:
+                if e.errnum == AVERROR_EOF:
+                    break
+                raise
+
             if pkt.av.stream_index == stream.index:
                 log.debug(f'demuxed dts={pkt.av.dts} pts={pkt.av.pts}')
                 yield pkt # ownership transferred outside

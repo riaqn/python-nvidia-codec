@@ -102,8 +102,6 @@ class BSFContext:
         check(lib.av_bsf_send_packet(byref(self.av), byref(pkt.av) if pkt is not None else None))
         # in case of exception, the following is not called
         pkt.disown()
-            
-        
 
     def receive_packet(self, pkt : Packet):
         check(lib.av_bsf_receive_packet(byref(self.av), byref(pkt.av)))
