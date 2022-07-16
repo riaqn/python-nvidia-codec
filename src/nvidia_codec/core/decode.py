@@ -28,6 +28,7 @@ class Surface:
         """
         DO NOT call this by yourself; use Picture.map() instead
         """
+        log.warning(f'creating surface {c_devptr}')
         self.decoder = decoder
         self.c_pitch = c_pitch
         self.c_devptr = c_devptr
@@ -76,7 +77,7 @@ class Surface:
 
         free() is called automatically when the surface is garbage collected
         """        
-
+        log.warning(f'freeing surface {self.c_devptr}')
         if self.c_devptr is None:
             return
         
@@ -135,6 +136,7 @@ class Picture:
         '''
         DO NOT call this by yourself; use Decoder.decode() instead
         '''
+        log.warning(f'creating picture {params.CurrPicIdx}')
         self.decoder = decoder        
         self.index = params.CurrPicIdx
         with self.decoder.pictures_cond:
@@ -159,6 +161,7 @@ class Picture:
 
         free() is called automatically when the picture is garbage collected        
         '''
+        log.warning(f'freeing picture {self.index}')
         if self.index is None:
             return
         with self.decoder.pictures_cond:
@@ -321,8 +324,6 @@ class BaseDecoder:
             'supported_surface_formats' : supported_surface_formats,
             'min_num_pictures' : vf.min_num_decode_surfaces,
         }
-
-        self.decode_create_info = p # save for user use        
 
 
         # the default values 
