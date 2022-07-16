@@ -13,7 +13,7 @@ from .common import *
 from queue import Queue
 import numpy as np
 from ctypes import *
-from threading import Condition, Lock, Semaphore
+from threading import Condition, Semaphore
 
 import logging
 log = logging.getLogger(__name__)
@@ -24,16 +24,26 @@ class Surface:
     '''
     A CUDA array owned by the decoder to store post-processed frames
     '''
-    def __init__(self, decoder, c_devptr, c_pitch, stream):
+    def __init__(self, decoder, index, params, stream):
         """
         DO NOT call this by yourself; use Picture.map() instead
         """
-        log.debug(f'creating surface {c_devptr}')
+
         self.decoder = decoder
-        self.c_pitch = c_pitch
-        self.c_devptr = c_devptr
-        self.stream = stream
-        self.lock = Lock()
+
+
+        self.params = CUVIDPROCPARAMS()
+        memmove(byref(self.params), byref(params), sizeof(CUVIDEOFORMAT))
+
+        assert stream != 0, 'must speicfy legacy default stream or per-thread default stream'                
+        self.params.output_stream = stream        
+
+        self.c_devptr = c_ulonglong() # according to cuviddec, the argument type of cuvidmapvideoframe64
+        self.c_pitch = c_uint()
+
+        self.decoder.surfaces_sem.acquire()        
+        with cuda.Device(self.decoder.device):
+            cuda.check(nvcuvid.cuvidMapVideoFrame64(self.decoder.cuvid_decoder, index, byref(self.c_devptr), byref(self.c_pitch), byref(self.params)))
 
     @property
     def format(self):
@@ -71,7 +81,7 @@ class Surface:
         """        
         return {'width':self.width, 'height':self.height}
 
-    def free(self):
+    def __del__(self):
         """free up the surface. 
         Note that the GPU memory involved is managed by decoder and will not be available to other CUDA operations
         free() only notifies the decoder that the surface can be reused for future frames
@@ -79,18 +89,14 @@ class Surface:
         free() is called automatically when the surface is garbage collected
         """        
         log.debug(f'freeing surface {self.c_devptr}')
-        with self.lock:
-            if self.c_devptr is None:
-                return
 
-            with cuda.Device(self.decoder.device):
+        with cuda.Device(self.decoder.device):
+            try:
                 cuda.check(nvcuvid.cuvidUnmapVideoFrame64(self.decoder.cuvid_decoder, self.c_devptr))
-            self.c_devptr = None
-        self.decoder.surfaces_sem.release()
+            except AttributeError:
+                pass
 
-    def __del__(self):
-        log.debug(f'trying to unmap {self.c_devptr}')
-        self.free()
+        self.decoder.surfaces_sem.release()        
 
     @property
     def shape(self):
@@ -125,7 +131,7 @@ class Surface:
             'strides': strides,
             'version': 3,
             'data': (self.c_devptr.value, False), # false = not read-only
-            'stream': self.stream,
+            'stream': self.params.output_stream
         }        
         
 class Picture:
@@ -143,9 +149,8 @@ class Picture:
         self.params = proc_params
         with self.decoder.pictures_cond:
             self.decoder.pictures_used.add(self.index)
-        self.lock = Lock()
 
-    def free(self):
+    def __del__(self):
         '''
         free up the picture.
         Note that the GPU memory involved is managed by decoder and will not be available to other CUDA operations
@@ -154,16 +159,16 @@ class Picture:
         free() is called automatically when the picture is garbage collected        
         '''
         log.debug(f'freeing picture {self.index}')
-        with self.lock:
-            if self.index is None:
-                return
-            with self.decoder.pictures_cond:
-                self.decoder.pictures_used.remove(self.index)
-                self.index = None # the index is released and therefore invalid
-                self.decoder.pictures_cond.notify_all()    
-    
-    def __del__(self):
-        self.free()
+
+        with self.decoder.pictures_cond:
+            try:
+                # discard instead of remove
+                # so this won't trigger exception
+                # which is possible
+                self.decoder.pictures_used.discard(self.index)
+            except AttributeError:
+                pass
+            self.decoder.pictures_cond.notify_all()    
 
     def map(self, stream : int = 2):
         """post-process and output this picture to a surface which can be accessed by user as a CUDA array
@@ -175,18 +180,7 @@ class Picture:
         Returns:
             Surface : Surface mapped by this picture
         """
-        self.params.stream = stream
-        assert self.params.stream != 0, 'must speicfy legacy default stream or per-thread default stream'
-
-        self.decoder.surfaces_sem.acquire()
-
-        c_devptr = c_ulonglong() # according to cuviddec, the argument type of cuvidmapvideoframe64
-        c_pitch = c_uint()
-        with cuda.Device(self.decoder.device):
-            cuda.check(nvcuvid.cuvidMapVideoFrame64(self.decoder.cuvid_decoder, self.index, byref(c_devptr), byref(c_pitch), byref(self.params)))
-
-        surface = Surface(self.decoder, c_devptr, c_pitch, stream)
-        return surface
+        return Surface(self.decoder, self.index, self.params, stream)
 
 def decide_surface_format(chroma_format, bit_depth, supported_surface_formats, allow_high = False):
     """decide the appropriate surface format for a given chroma format and bit depth
@@ -575,11 +569,13 @@ class BaseDecoder:
           
 
     def __del__(self):
-        if self.cuvid_parser:
+        try:
+            # NULL is fine, will be no-op
             cuda.check(nvcuvid.cuvidDestroyVideoParser(self.cuvid_parser))
-        if self.cuvid_decoder:
             with cuda.Device(self.device):
                 cuda.check(nvcuvid.cuvidDestroyDecoder(self.cuvid_decoder))
+        except AttributeError:
+            pass
 
 class Decoder(BaseDecoder):
     """A decoder with send/recv paradigm. That is, user send packets to decoder, and receive pictures from decoder. 
