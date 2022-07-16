@@ -1,7 +1,7 @@
 from datetime import timedelta
 from nvidia_codec.core.decode import Decoder
 from nvidia_codec.ffmpeg.libavformat import FormatContext
-from nvidia_codec.ffmpeg.libavcodec import AVMediaType, AVCodecID, BitStreamFilter, BSFContext
+from nvidia_codec.ffmpeg.libavcodec import AVMediaType, AVCodecID, BSFContext
 
 from nvidia_codec.utils.compat import av2cuda
 import nvidia_codec.core.cuda  as cuda
@@ -22,11 +22,11 @@ def test(deviceID, path):
     codec_id = stream.codecpar.contents.codec_id
 
     if codec_id == AVCodecID.HEVC:
-            f = BitStreamFilter('hevc_mp4toannexb')
+            f = 'hevc_mp4toannexb'
     elif codec_id == AVCodecID.H264:
-            f = BitStreamFilter('h264_mp4toannexb') 
+            f = 'h264_mp4toannexb'
     else:
-            raise Exception(f'unsupported codec {codec_id}')                
+            f = None
 
     bsf = BSFContext(f, stream.codecpar.contents, stream.time_base)
 

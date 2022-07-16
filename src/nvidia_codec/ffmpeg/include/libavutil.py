@@ -2,7 +2,7 @@ from ctypes import *
 
 from ...common import TypedCEnumeration
 
-MKTAG = lambda a, b, c, d: (ord(a) << 24) | (ord(b) << 16) | (ord(c) << 8) | ord(d)
+MKTAG = lambda a, b, c, d: (ord(a)) | (ord(b) << 8) | (ord(c) << 16) | (c_int(ord(d) << 24).value)
 FFERRTAG = lambda a, b, c, d: -MKTAG(a, b, c, d)
 AVERROR_EOF = FFERRTAG('E', 'O', 'F', ' ')
 AVERROR = lambda errnum: -errnum
