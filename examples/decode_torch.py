@@ -49,9 +49,8 @@ def test(device_idx, path):
         while time < s.length:
             with torch.cuda.stream(stream):
                 screen = s.shoot(time, target='torch', stream=extract_stream_ptr(stream))
-                inp = screen.moveaxis(-1, 0)
 
-                inp = inp[None, :]
+                inp = screen[None, :]
                 mean = inp.mean((0,2,3))    
                 std = inp.std((0,2,3))
                 norm = torchvision.transforms.Normalize(mean=mean,
@@ -59,7 +58,8 @@ def test(device_idx, path):
                 inp = norm(inp)
                 out = net(inp)
                 idx = torch.argmax(out).cpu().numpy()
-                # Image.fromarray((inp[0].cpu().numpy() * 255).astype(np.uint8)).save('test.png')            
+
+                Image.fromarray((screen.moveaxis(0, -1).cpu().numpy() * 255).astype(np.uint8)).save(f'test-{time}.png')            
             print(f'{time} {id2label[str(idx)][1]} {out[0][idx].item()}')
             time += timedelta(seconds = 10)
 

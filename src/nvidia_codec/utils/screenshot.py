@@ -2,9 +2,9 @@ from datetime import timedelta
 from fractions import Fraction
 import numpy as np
 
-from ..ffmpeg.libavcodec import BitStreamFilter, BSFContext
+from ..ffmpeg.libavcodec import BSFContext
 from ..ffmpeg.libavformat import FormatContext, AVMediaType, AVCodecID
-from ..ffmpeg.include.libavutil  import AV_NOPTS_VALUE, AV_TIME_BASE, AVColorRange, AVColorSpace, AVPixelFormat
+from ..ffmpeg.include.libavutil  import AV_NOPTS_VALUE, AV_TIME_BASE, AVColorRange, AVColorSpace
 from .compat import av2cuda, cuda2av
 from ..core.decode import Decoder
 from ..utils.color import Converter
@@ -61,7 +61,7 @@ class Screenshot:
         self.device = cuda.get_current_device(device)
         def decide(p):
             return {
-                'num_pictures': p['min_num_pictures'],
+                'num_pictures': p['min_num_pictures'] + 1, # to be safe
                 'num_surfaces': 1, # only need one 
                 # will use default surface_format
                 # will use default cropping (no cropping)
@@ -133,17 +133,18 @@ class Screenshot:
                 arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
                 yield arr, pts     
 
-        surface = None
+        # surface = None
+        # for pic, pts in self.decoder.decode(demux()):
+        #     if pts > target_pts:
+        #         break
+        #     del surface
+        #     surface = pic.map(stream)
+        #     del pic
+        #     log.debug(f'decoded: {pts}')
         for pic, pts in self.decoder.decode(demux()):
-            print(pic.index)
             if pts > target_pts:
                 break
-            del surface
-            surface = pic.map(stream)
-            del pic
-            log.debug(f'decoded: {pts}')
-            # log.warning(f'{pts}')
-
+        surface = pic.map(stream)
 
         if isinstance(target, str):
             shape = Converter.infer_target(surface.shape, cuda2av(surface.format))
