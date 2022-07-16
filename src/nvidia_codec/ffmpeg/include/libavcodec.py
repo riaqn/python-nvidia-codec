@@ -15,8 +15,16 @@ class AVMediaType(TypedCEnumeration(c_int)):
     NB = 5
 
 class AVCodecID(TypedCEnumeration(c_int)):
-    HEVC = 173
+    MPEG1 = 1
+    MPEG2 = 2
+    MPEG4 = 12
+    VC1 = 70
     H264 = 27
+    JPEG = 88    
+    HEVC = 173
+    VP8 = 139
+    VP9 = 167
+    AV1 = 226
 
 class AVCodecParameters(Structure):
     _fields_ = [

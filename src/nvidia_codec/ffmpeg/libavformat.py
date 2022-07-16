@@ -10,7 +10,7 @@ from .include.libavcodec import *
 from .include.libavformat import *
 from .libavcodec import Packet
 
-from .common import call, AVException
+from .common import check
 
 
 import logging
@@ -23,11 +23,11 @@ class FormatContext:
     def __init__(self, url : str):
         ptr = POINTER(AVFormatContext)()
         url = c_char_p(url.encode('utf-8'))
-        call(lib.avformat_open_input, byref(ptr), url, None, None)
+        check(lib.avformat_open_input(byref(ptr), url, None, None))
         self.av = ptr.contents
     
     def read_frame(self, pkt : Packet):
-        call(lib.av_read_frame, byref(self.av), byref(pkt.av))
+        check(lib.av_read_frame(byref(self.av), byref(pkt.av)))
 
     def read_frames(self, stream : AVStream):
         while True:
@@ -38,7 +38,7 @@ class FormatContext:
                 yield pkt # ownership transferred outside
 
     def seek_file(self, stream : AVStream, ts : int, min_ts = -(2**63), max_ts = (2**63) - 1):
-        call(lib.avformat_seek_file, byref(self.av), c_int(stream.index), c_int64(min_ts), c_int64(ts), c_int64(max_ts), c_int(0))
+        check(lib.avformat_seek_file( byref(self.av), c_int(stream.index), c_int64(min_ts), c_int64(ts), c_int64(max_ts), c_int(0)))
 
     def infer_start_time(self):
         # log.warning('infering start time from first packet')

@@ -49,18 +49,19 @@ class Screenshot:
 
         codec_id = self.stream.codecpar.contents.codec_id
         if codec_id == AVCodecID.HEVC:
-            f = BitStreamFilter('hevc_mp4toannexb')
+            f = 'hevc_mp4toannexb'
         elif codec_id == AVCodecID.H264:
-            f = BitStreamFilter('h264_mp4toannexb') 
+            f = 'h264_mp4toannexb'
         else:
-            raise Exception(f'unsupported codec {codec_id}')                
+            f = None
+            # raise Exception(f'unsupported codec {codec_id}')                
 
         self.bsf = BSFContext(f, self.stream.codecpar.contents, self.stream.time_base)
 
         self.device = cuda.get_current_device(device)
         def decide(p):
             return {
-                'num_pictures': p['min_num_pictures'] + 1, # one look back
+                'num_pictures': p['min_num_pictures'],
                 'num_surfaces': 1, # only need one 
                 # will use default surface_format
                 # will use default cropping (no cropping)
@@ -124,8 +125,6 @@ class Screenshot:
         log.debug(f'target_pts: {target_pts}')
         self.fc.seek_file(self.stream, target_pts)
 
-        last = None
-
         def demux():
             for pkt in self.bsf.filter(self.fc.read_frames(self.stream)):
                 pts = pkt.av.pts
@@ -134,13 +133,17 @@ class Screenshot:
                 arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
                 yield arr, pts     
 
+        surface = None
         for pic, pts in self.decoder.decode(demux()):
-            log.debug(f'decoded: {pts}')
-            # log.warning(f'{pts}')
+            print(pic.index)
             if pts > target_pts:
                 break
-            last = pic
-        surface = last.map(stream)
+            del surface
+            surface = pic.map(stream)
+            del pic
+            log.debug(f'decoded: {pts}')
+            # log.warning(f'{pts}')
+
 
         if isinstance(target, str):
             shape = Converter.infer_target(surface.shape, cuda2av(surface.format))

@@ -56,21 +56,28 @@ class Packet:
             lib.av_packet_free(byref(pointer(self._av)))
 
 class BSFContext:
-    def __init__(self, filter : BitStreamFilter, codecpar : AVCodecParameters, time_base : AVRational):
+    def __init__(self, filters : str, codecpar : AVCodecParameters, time_base : AVRational):
+
         ptr = POINTER(AVBSFContext)()
-        call(lib.av_bsf_alloc, byref(filter.av), byref(ptr))
+        if filters is None:
+            check(lib.av_bsf_get_null_filter(byref(ptr)))
+        else:
+            check(lib.av_bsf_list_parse_str(c_char_p(filters.encode('utf-8')), byref(ptr)))
 
         self.av = ptr.contents
         self.av.par_in = pointer(codecpar)
         self.av.time_base_in = time_base
-        call(lib.av_bsf_init, byref(self.av))
+        check(lib.av_bsf_init(byref(self.av)))
 
     def __del__(self):
         lib.av_bsf_free(byref(pointer(self.av)))
 
+    def flush(self):
+        check(lib.av_bsf_flush(byref(self.av)))
+
     def filter(self, packets, reuse = False):
         # always flush for the first time
-        call(lib.av_bsf_flush, byref(self.av))
+        self.flush()
 
         # packets = peekable(packets)
         pkt_out = Packet()
@@ -100,12 +107,12 @@ class BSFContext:
                 
     # None means EOF
     def send_packet(self, pkt : Packet = None):
-        call(lib.av_bsf_send_packet, byref(self.av), byref(pkt.av) if pkt is not None else None)
+        check(lib.av_bsf_send_packet(byref(self.av), byref(pkt.av) if pkt is not None else None))
         # in case of exception, the following is not called
         pkt.disown()
             
         
 
     def receive_packet(self, pkt : Packet):
-        call(lib.av_bsf_receive_packet, byref(self.av), byref(pkt.av))
+        check(lib.av_bsf_receive_packet(byref(self.av), byref(pkt.av)))
 

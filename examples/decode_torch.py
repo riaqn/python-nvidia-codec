@@ -28,9 +28,7 @@ def test(device_idx, path):
 
     with torch.cuda.device(device_idx):
         stream = torch.cuda.Stream()
-        norm = torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                                std=[0.229, 0.224, 0.225]).cuda()
-
+  
         resp = requests.get('https://s3.amazonaws.com/deep-learning-models/image-models/imagenet_class_index.json')
         id2label = json.loads(resp.text)
 
@@ -47,12 +45,17 @@ def test(device_idx, path):
         net = torchvision.models.convnext_tiny(weights = torchvision.models.ConvNeXt_Tiny_Weights.DEFAULT).cuda()        
         net.eval()
 
-        time = timedelta(seconds = 0)
+        time = timedelta(seconds = 10)
         while time < s.length:
             with torch.cuda.stream(stream):
                 screen = s.shoot(time, target='torch', stream=extract_stream_ptr(stream))
                 inp = screen.moveaxis(-1, 0)
+
                 inp = inp[None, :]
+                mean = inp.mean((0,2,3))    
+                std = inp.std((0,2,3))
+                norm = torchvision.transforms.Normalize(mean=mean,
+                                                        std=std).cuda()
                 inp = norm(inp)
                 out = net(inp)
                 idx = torch.argmax(out).cpu().numpy()
