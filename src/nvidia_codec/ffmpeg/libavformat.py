@@ -53,7 +53,7 @@ class FormatContext:
         self.read_frame(pkt)
         start_time = pkt.av.pts
         time_base = pkt.av.time_base
-        return start_time, Fraction(time_base.num, time_base.den)
+        return start_time * Fraction(time_base.num, time_base.den)
 
     @property
     def streams(self):

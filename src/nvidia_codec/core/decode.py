@@ -570,10 +570,11 @@ class BaseDecoder:
 
     def __del__(self):
         try:
-            # NULL is fine, will be no-op
-            cuda.check(nvcuvid.cuvidDestroyVideoParser(self.cuvid_parser))
+            if self.cuvid_parser:
+                cuda.check(nvcuvid.cuvidDestroyVideoParser(self.cuvid_parser))
             with cuda.Device(self.device):
-                cuda.check(nvcuvid.cuvidDestroyDecoder(self.cuvid_decoder))
+                if self.cuvid_decoder:
+                    cuda.check(nvcuvid.cuvidDestroyDecoder(self.cuvid_decoder))
         except AttributeError:
             pass
 

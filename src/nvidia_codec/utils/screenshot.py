@@ -25,27 +25,26 @@ class Screenshot:
             log.warning('file has multiple video streams, picking the first one')
         self.stream = l[0] 
 
-        self.start_time = self.stream.start_time
-
-        if self.start_time == AV_NOPTS_VALUE:
-            self.start_time = self.fc.av.start_time
-            if self.start_time == AV_NOPTS_VALUE:
-                start_time, time_base = self.fc.infer_start_time()
-                self.start_time = int(start_time * time_base / self.time_base)
+        self._start_time = self.stream.start_time
+        if self._start_time == AV_NOPTS_VALUE:
+            self._start_time = self.fc.av.start_time
+            if self._start_time == AV_NOPTS_VALUE:
+                start_time = self.fc.infer_start_time()
+                self._start_time = int(start_time / self._time_base)
             else:
-                self.start_time = int(self.start_time / AV_TIME_BASE / self.time_base)                
+                self._start_time = int(self._start_time / AV_TIME_BASE / self._time_base)                
 
-        self.duration = self.stream.duration
-        if self.duration == AV_NOPTS_VALUE:
+        self._duration = self.stream.duration
+        if self._duration == AV_NOPTS_VALUE:
             # if stream duration is unknown,
             # get the whole file duration
-            self.duration = self.fc.av.duration
-            if self.duration == AV_NOPTS_VALUE:
+            self._duration = self.fc.av.duration
+            if self._duration == AV_NOPTS_VALUE:
                 log.warning('cannot infer duration')
-                self.duration = None
+                self._duration = None
             else:
                 # remember to convert to stream' time base
-                self.duration = int(self.duration / AV_TIME_BASE / self.time_base)
+                self._duration = int(self._duration / AV_TIME_BASE / self._time_base)
 
         codec_id = self.stream.codecpar.contents.codec_id
         if codec_id == AVCodecID.HEVC:
@@ -73,7 +72,7 @@ class Screenshot:
         self.target_typestr = target_typestr
 
     @property
-    def time_base(self):
+    def _time_base(self):
         return Fraction(self.stream.time_base.num, self.stream.time_base.den)
 
     @property
@@ -93,35 +92,29 @@ class Screenshot:
         return self.decoder.target_height
 
     @property
-    def length(self):
-        return timedelta(seconds = float(self.duration * self.time_base))
+    def duration(self):
+        return timedelta(seconds = float(self._duration * self._time_base))
 
     def color_space(self, default = AVColorSpace.UNSPECIFIED):
         r = self.stream.codecpar.contents.color_space
         if r == AVColorSpace.UNSPECIFIED:
-            log.warning(f'color space is unspecified, using {default}')
+            log.debug(f'color space is unspecified, using {default}')
             return default
         else:
-            log.info(f'color space is {r}')
+            log.debug(f'color space is {r}')
             return r
     
     def color_range(self, default = AVColorRange.UNSPECIFIED):
         r = self.stream.codecpar.contents.color_range
         if r == AVColorRange.UNSPECIFIED:
-            log.warning(f'color range is unspecified, using {default}')
+            log.debug(f'color range is unspecified, using {default}')
             return default
         else:
-            log.info(f'color range is {r}')
+            log.debug(f'color range is {r}')
             return r
 
-    def shoot(self, time : int | timedelta, target = 'cupy', stream : int = 2):
-
-        if isinstance(time, timedelta):
-            target_pts = int(time.total_seconds() / self.time_base) + self.start_time
-        elif isinstance(time, int):
-            target_pts = time
-        else:
-            raise Exception(f'unsupported target type {type(time)}')
+    def shoot(self, time : timedelta, target = 'cupy', stream : int = 2):
+        target_pts = int(time.total_seconds() / self._time_base) + self._start_time
         log.debug(f'target_pts: {target_pts}')
         self.fc.seek_file(self.stream, target_pts)
 
