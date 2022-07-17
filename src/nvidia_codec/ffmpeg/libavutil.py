@@ -6,7 +6,7 @@ lib = cdll.LoadLibrary('libavutil.so')
 
 def strerror(errnum):
     buf = (c_char * 256)()
-    lib.av_strerror(errnum, buf, 256)
+    lib.av_strerror(c_int(errnum), buf, 256)
     return buf.value.decode('utf-8')
 
 def shape2size(self, shape):

@@ -1,4 +1,5 @@
 from datetime import timedelta
+import math
 import torch
 import torchvision
 
@@ -36,8 +37,8 @@ def test(device_idx, path):
 
         def target_size(h, w):
             aspect = h /w 
-            h = int((pixels * aspect)** 0.5 / 2) * 2
-            w = int((pixels / aspect)** 0.5 / 2) * 2
+            h = int(math.sqrt(pixels * aspect) // 2) * 2
+            w = int(math.sqrt(pixels / aspect) // 2) * 2
             return h,w
 
         s = Screenshot(path, target_size, '<f4')
@@ -46,7 +47,7 @@ def test(device_idx, path):
         net.eval()
 
         time = timedelta(seconds = 10)
-        while time < s.length:
+        while time < s.duration:
             with torch.cuda.stream(stream):
                 screen = s.shoot(time, target='torch', stream=extract_stream_ptr(stream))
 
@@ -59,7 +60,7 @@ def test(device_idx, path):
                 out = net(inp)
                 idx = torch.argmax(out).cpu().numpy()
 
-                Image.fromarray((screen.moveaxis(0, -1).cpu().numpy() * 255).astype(np.uint8)).save(f'test-{time}.png')            
+                # Image.fromarray((screen.moveaxis(0, -1).cpu().numpy() * 255).astype(np.uint8)).save(f'test-{time}.png')            
             print(f'{time} {id2label[str(idx)][1]} {out[0][idx].item()}')
             time += timedelta(seconds = 10)
 
