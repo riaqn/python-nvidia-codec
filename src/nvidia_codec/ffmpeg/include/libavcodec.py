@@ -34,7 +34,7 @@ class AVCodecParameters(Structure):
         ('extradata', POINTER(c_uint8)),
         ('extradata_size', c_int),
         ('format', c_int),
-        ('bitrate', c_int64),
+        ('bit_rate', c_int64),
         ('bits_per_coded_sample', c_int),
         ('bits_per_raw_sample', c_int),
         ('profile', c_int),

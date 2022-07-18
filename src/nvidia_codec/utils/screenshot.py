@@ -18,12 +18,14 @@ log = logging.getLogger(__name__)
 class Screenshot:
     def __init__(self, url, target_size = lambda h,w: (h,w), target_typestr = '|u1', device = None):
         self.fc = FormatContext(url)
-        l = list(filter(lambda s: s.codecpar.contents.codec_type == AVMediaType.VIDEO, self.fc.streams))
+        l = filter(lambda s: s.codecpar.contents.codec_type == AVMediaType.VIDEO, self.fc.streams)
+
+        l = sorted(l, key = lambda s: s.codecpar.contents.bit_rate, reverse = True)
 
         assert len(l) > 0, 'file has no video stream'
+        self.stream = l[0]         
         if len(l) > 1:
-            log.warning('file has multiple video streams, picking the first one')
-        self.stream = l[0] 
+            log.warning(f'{url} has multiple video streams, picking the highest bitrate @ {self.stream.codecpar.contents.bit_rate}')
 
         self._start_time = self.stream.start_time
         if self._start_time == AV_NOPTS_VALUE:
@@ -155,7 +157,7 @@ class Screenshot:
     def shoot(self, target : timedelta, dst = 'cupy', stream : int = 0):
         target_pts = int(target.total_seconds() / self._time_base) + self._start_time
         log.debug(f'target_pts: {target_pts}')
-        self.fc.seek_file(self.stream, target_pts)
+        self.fc.seek_file(self.stream, target_pts, max_ts = target_pts)
 
         found = False
 
@@ -178,7 +180,7 @@ class Screenshot:
 
         self.decoder.on_recv = on_recv
 
-        for pkt in self.bsf.filter(self.fc.read_frames(self.stream)):
+        for pkt in self.bsf.filter(self.fc.read_frames(self.stream), flush = False, reuse = True):
             pts = pkt.av.pts
             log.debug(f'filtered: dts={pkt.av.dts} pts = {pkt.av.pts}')
                 # log.warning(pts)
@@ -187,9 +189,12 @@ class Screenshot:
             if found:
                 break
         if not found:
-            raise Exception(f'cannot find target {target} out of {self.duration}')
+            # the target_pts is too late
+            # that we are reaching the end
+            dst, act_pts = self.convert(dst, stream = stream)
+
 
         act = timedelta(seconds = float((act_pts - self._start_time) * self._time_base))
-        if abs(act - target) > timedelta(seconds = 1):
-            log.warning(f'actual time {act} is not close to target time {target}')
+        # if abs(act - target) > timedelta(seconds = 0.1):
+        #     log.warning(f'actual time {act} is not close to target time {target}')
         return act, dst

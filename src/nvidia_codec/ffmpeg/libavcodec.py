@@ -67,9 +67,9 @@ class BSFContext:
     def flush(self):
         lib.av_bsf_flush(byref(self.av))
 
-    def filter(self, packets, reuse = False):
-        # always flush for the first time
-        self.flush()
+    def filter(self, packets, flush = True, reuse = False):
+        if flush:
+            self.flush()
 
         # packets = peekable(packets)
         pkt_out = Packet()
