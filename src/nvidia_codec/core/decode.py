@@ -43,7 +43,8 @@ class Surface:
         self.decoder.surfaces_sem.acquire()        
         with cuda.Device(self.decoder.device):
             try:
-                cuda.check(nvcuvid.cuvidMapVideoFrame64(self.decoder.cuvid_decoder, index, byref(self.c_devptr), byref(self.c_pitch), byref(self.params)))
+                cuda.check(nvcuvid.cuvidMapVideoFrame64(self.decoder.cuvid_decoder, c_int(index), byref(self.c_devptr), byref(self.c_pitch), byref(self.params)))
+                # log.warning('mapped')
             except:
                 self.decoder.surfaces_sem.release()
                 raise
@@ -91,11 +92,10 @@ class Surface:
 
         free() is called automatically when the surface is garbage collected
         """        
-        log.debug(f'freeing surface {self.c_devptr}')
-
-        if self.c_devptr.value != 0:
-            with cuda.Device(self.decoder.device):    
+        if self.c_devptr and self.decoder.cuvid_decoder:
+            with cuda.Device(self.decoder.device):   
                 cuda.check(nvcuvid.cuvidUnmapVideoFrame64(self.decoder.cuvid_decoder, self.c_devptr))    
+                # log.warning('unampped')
 
             self.decoder.surfaces_sem.release()        
 
@@ -242,7 +242,7 @@ class BaseDecoder:
 
     def handleVideoSequence(self, pUserData, pVideoFormat):
         log.debug('sequence')
-        vf = cast(pVideoFormat, POINTER(CUVIDEOFORMAT)).contents
+        vf = pVideoFormat.contents
 
         if self.cuvid_decoder:
             def cmp(a,b):
@@ -422,12 +422,12 @@ class BaseDecoder:
 
     def handlePictureDecode(self, pUserData, pPicParams):
         log.debug('decode')
-        pp = cast(pPicParams, POINTER(CUVIDPICPARAMS)).contents
+        pp = pPicParams.contents
         # assert self.cuvid_decoder, "decoder not initialized"
         log.debug(f'decode picture index: {pp.CurrPicIdx}')
 
         if pp.CurrPicIdx in self.pictures_used:
-            log.info(f'picture index {pp.CurrPicIdx} already used')
+            log.info(f'{self.pictures_used}')
         with self.pictures_cond:
             # wait until picture slot is available again
             log.debug('wait_for_pictures started')
@@ -456,6 +456,7 @@ class BaseDecoder:
             top_field_first=di.top_field_first,
             unpaired_field=di.repeat_first_field < 0
         )
+
         picture = Picture(self, di.picture_index, params)
         self.on_recv(picture, di.timestamp)
         return 1
@@ -464,7 +465,7 @@ class BaseDecoder:
     I don't understand AV1 operating point, just copying reference implementation
     '''
     def handleOperatingPoint(self, pUserData, pOPInfo):
-        opi = cast(pOPInfo, POINTER(CUVIDOPERATINGPOINTINFO)).contents
+        opi = pOPInfo.contents
         if opi.codec == cudaVideoCodec.AV1:
             if opi.av1.operating_points_cnt > 1:
                 if self.operating_point >= opi.av1.operating_points_cnt:
@@ -571,10 +572,13 @@ class BaseDecoder:
         self.send(None)
 
     def __del__(self):
+
         cuda.check(nvcuvid.cuvidDestroyVideoParser(self.cuvid_parser))
+        self.cuvid_parser = CUvideoparser()
         # if the above call failed, the following is not needed at all
         with cuda.Device(self.device):
             cuda.check(nvcuvid.cuvidDestroyDecoder(self.cuvid_decoder))
+            self.cuvid_decoder = CUvideodecoder()
 
 class Decoder(BaseDecoder):
     """A decoder with send/recv paradigm. That is, user send packets to decoder, and receive pictures from decoder. 

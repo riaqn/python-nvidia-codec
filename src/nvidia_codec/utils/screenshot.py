@@ -6,7 +6,7 @@ from ..ffmpeg.libavcodec import BSFContext
 from ..ffmpeg.libavformat import FormatContext, AVMediaType, AVCodecID
 from ..ffmpeg.include.libavutil  import AV_NOPTS_VALUE, AV_TIME_BASE, AVColorRange, AVColorSpace
 from .compat import av2cuda, cuda2av
-from ..core.decode import Decoder
+from ..core.decode import BaseDecoder, Decoder
 from ..utils.color import Converter
 
 from ..core import cuda
@@ -60,16 +60,19 @@ class Screenshot:
         self.device = cuda.get_current_device(device)
         def decide(p):
             return {
-                'num_pictures': p['min_num_pictures'] + 1, # to be safe
+                'num_pictures': p['min_num_pictures'], # to be safe
                 'num_surfaces': 1, # only need one 
                 # will use default surface_format
                 # will use default cropping (no cropping)
                 'target_size': target_size,
                 # will use default target rect (no margin)
             }
-        self.decoder = Decoder(av2cuda(self.stream.codecpar.contents.codec_id), decide = decide, device = self.device)
+        self.decoder = BaseDecoder(av2cuda(self.stream.codecpar.contents.codec_id), None, decide = decide, device = self.device)
         self.cvt = None
         self.target_typestr = target_typestr
+
+        self.surface = None
+        self.pts = None
 
     @property
     def _time_base(self):
@@ -113,42 +116,12 @@ class Screenshot:
             log.debug(f'color range is {r}')
             return r
 
-    def shoot(self, time : timedelta, target = 'cupy', stream : int = 0):
-        target_pts = int(time.total_seconds() / self._time_base) + self._start_time
-        log.debug(f'target_pts: {target_pts}')
-        self.fc.seek_file(self.stream, target_pts)
-
-        def demux():
-            for pkt in self.bsf.filter(self.fc.read_frames(self.stream)):
-                pts = pkt.av.pts
-                log.debug(f'filtered: dts={pkt.av.dts} pts = {pkt.av.pts}')
-                # log.warning(pts)
-                arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
-                yield arr, pts  
-
-
-        # surface = None
-        # for pic, pts in self.decoder.decode(demux()):
-        #     if pts > target_pts:
-        #         break
-        #     del surface
-        #     surface = pic.map(stream)
-        #     del pic
-        #     log.debug(f'decoded: {pts}')
-        surface = None
-        pts = None
-        for pic, pts in self.decoder.decode(demux(), flush=False):
-            if pts > target_pts:
-                break
-            del surface
-            surface = pic.map(stream)
-            del pic
-        # surface = pic.map(stream)
-        # del pic
-        if surface is None:
-            raise Exception(f'requested {target_pts}, but first frame is already {pts}')
+    '''
+    convert the current surface 
+    '''
+    def convert(self, target = 'cupy', stream : int = 0):
         if isinstance(target, str):
-            shape = Converter.infer_target(surface.shape, cuda2av(surface.format))
+            shape = Converter.infer_target(self.surface.shape, cuda2av(self.surface.format))
             with cuda.Device(self.device):   
                 if target == 'cupy':
                     import cupy            
@@ -167,13 +140,56 @@ class Screenshot:
         if self.cvt is None:
             with cuda.Device(self.device):                
                 self.cvt = Converter(
-                    surface, 
-                    cuda2av(surface.format),
+                    self.surface, 
+                    cuda2av(self.surface.format),
                     self.color_space(AVColorSpace.BT470BG),
                     self.color_range(AVColorRange.MPEG),
                     target,
                     self.target_typestr
                     )
                     
-        self.cvt(surface, target, stream = stream)
-        return target
+        self.cvt(self.surface, target, stream = stream)
+        return (target, self.pts)
+
+
+    def shoot(self, target : timedelta, dst = 'cupy', stream : int = 0):
+        target_pts = int(target.total_seconds() / self._time_base) + self._start_time
+        log.debug(f'target_pts: {target_pts}')
+        self.fc.seek_file(self.stream, target_pts)
+
+        found = False
+
+        act_pts = None
+
+        def on_recv(pic, pts):
+            nonlocal dst
+            nonlocal act_pts
+            nonlocal found
+            if pts > target_pts:
+                dst, act_pts = self.convert(dst, stream = stream)
+                found = True
+                # should use the current surface
+                            
+            # always map it
+            # to release the picture slot
+            del self.surface
+            self.surface = pic.map(stream)
+            self.pts = pts
+
+        self.decoder.on_recv = on_recv
+
+        for pkt in self.bsf.filter(self.fc.read_frames(self.stream)):
+            pts = pkt.av.pts
+            log.debug(f'filtered: dts={pkt.av.dts} pts = {pkt.av.pts}')
+                # log.warning(pts)
+            arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
+            self.decoder.send(arr, pts)
+            if found:
+                break
+        if not found:
+            raise Exception(f'cannot find target {target} out of {self.duration}')
+
+        act = timedelta(seconds = float((act_pts - self._start_time) * self._time_base))
+        if abs(act - target) > timedelta(seconds = 1):
+            log.warning(f'actual time {act} is not close to target time {target}')
+        return act, dst

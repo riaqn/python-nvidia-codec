@@ -46,24 +46,31 @@ def test(device_idx, path):
         net = torchvision.models.convnext_tiny(weights = torchvision.models.ConvNeXt_Tiny_Weights.DEFAULT).cuda()        
         net.eval()
 
-        time = timedelta(seconds = 10)
-        while time < s.duration:
+        time = timedelta(seconds=0)
+        while True:
+            time += timedelta(seconds = 10)
+            if time > s.duration:
+                break
             with torch.cuda.stream(stream):
-                screen = s.shoot(time, target='torch', stream=extract_stream_ptr(stream))
+                _, screen = s.shoot(time, dst='torch', stream=extract_stream_ptr(stream))
 
                 inp = screen[None, :]
                 mean = inp.mean((0,2,3))    
                 std = inp.std((0,2,3))
+
                 norm = torchvision.transforms.Normalize(mean=mean,
                                                         std=std).cuda()
-                inp = norm(inp)
+                try:
+                    inp = norm(inp)
+                except ValueError:
+                    log.warning(f'skip {time}: black screen')
+                    continue
                 out = net(inp)
                 idx = torch.argmax(out).cpu().numpy()
 
                 # Image.fromarray((screen.moveaxis(0, -1).cpu().numpy() * 255).astype(np.uint8)).save(f'test-{time}.png')            
             print(f'{time} {id2label[str(idx)][1]} {out[0][idx].item()}')
-            time += timedelta(seconds = 10)
-
+   
 if __name__ == '__main__':
     import sys
     device_idx = int(sys.argv[1])
