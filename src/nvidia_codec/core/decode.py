@@ -10,7 +10,7 @@ Similarly one might increase the `num_surfaces` if their applications can make u
 from . import cuda
 from .nvcuvid import *
 from .common import *
-from queue import Queue
+from queue import Empty, Queue
 import numpy as np
 from ctypes import *
 from threading import Condition, Semaphore
@@ -35,7 +35,6 @@ class Surface:
         self.params = CUVIDPROCPARAMS()
         memmove(byref(self.params), byref(params), sizeof(CUVIDEOFORMAT))
 
-        assert stream != 0, 'must speicfy legacy default stream or per-thread default stream'                
         self.params.output_stream = stream        
 
         self.c_devptr = c_ulonglong() # according to cuviddec, the argument type of cuvidmapvideoframe64
@@ -43,7 +42,11 @@ class Surface:
 
         self.decoder.surfaces_sem.acquire()        
         with cuda.Device(self.decoder.device):
-            cuda.check(nvcuvid.cuvidMapVideoFrame64(self.decoder.cuvid_decoder, index, byref(self.c_devptr), byref(self.c_pitch), byref(self.params)))
+            try:
+                cuda.check(nvcuvid.cuvidMapVideoFrame64(self.decoder.cuvid_decoder, index, byref(self.c_devptr), byref(self.c_pitch), byref(self.params)))
+            except:
+                self.decoder.surfaces_sem.release()
+                raise
 
     @property
     def format(self):
@@ -90,13 +93,11 @@ class Surface:
         """        
         log.debug(f'freeing surface {self.c_devptr}')
 
-        with cuda.Device(self.decoder.device):
-            try:
-                cuda.check(nvcuvid.cuvidUnmapVideoFrame64(self.decoder.cuvid_decoder, self.c_devptr))
-            except AttributeError:
-                pass
+        if self.c_devptr.value != 0:
+            with cuda.Device(self.decoder.device):    
+                cuda.check(nvcuvid.cuvidUnmapVideoFrame64(self.decoder.cuvid_decoder, self.c_devptr))    
 
-        self.decoder.surfaces_sem.release()        
+            self.decoder.surfaces_sem.release()        
 
     @property
     def shape(self):
@@ -161,16 +162,14 @@ class Picture:
         log.debug(f'freeing picture {self.index}')
 
         with self.decoder.pictures_cond:
-            try:
-                # discard instead of remove
-                # so this won't trigger exception
-                # which is possible
-                self.decoder.pictures_used.discard(self.index)
-            except AttributeError:
-                pass
+            # discard instead of remove
+            # so this won't trigger exception
+            # which is possible
+            self.decoder.pictures_used.discard(self.index)
+
             self.decoder.pictures_cond.notify_all()    
 
-    def map(self, stream : int = 2):
+    def map(self, stream : int = 0):
         """post-process and output this picture to a surface which can be accessed by user as a CUDA array
 
         Args:
@@ -427,6 +426,8 @@ class BaseDecoder:
         # assert self.cuvid_decoder, "decoder not initialized"
         log.debug(f'decode picture index: {pp.CurrPicIdx}')
 
+        if pp.CurrPicIdx in self.pictures_used:
+            log.info(f'picture index {pp.CurrPicIdx} already used')
         with self.pictures_cond:
             # wait until picture slot is available again
             log.debug('wait_for_pictures started')
@@ -442,7 +443,12 @@ class BaseDecoder:
 
     def handlePictureDisplay(self, pUserData, pDispInfo):
         log.debug('display')
-        di = cast(pDispInfo, POINTER(CUVIDPARSERDISPINFO)).contents
+        if not bool(pDispInfo):
+            # EOS notification
+            self.on_recv(None, 0)
+            return 1
+        # di = cast(pDispInfo, POINTER(CUVIDPARSERDISPINFO)).contents
+        di = pDispInfo.contents
 
         params = CUVIDPROCPARAMS(
             progressive_frame=di.progressive_frame,
@@ -533,16 +539,23 @@ class BaseDecoder:
             packet (numpy.ndarray): packet is expected to be a numpy 1d-array; None means end of stream; user can reuse the packet after the call
             pts (int, optional): PTS of this packet. Defaults to 0.
         """        
-        self.dirty = True
-        flags = CUvideopacketflags(0)
-        flags |= CUvideopacketflags.TIMESTAMP
 
-        p = CUVIDSOURCEDATAPACKET(
-            flags = flags.value,
-            payload_size = packet.shape[0],
-            payload = packet.ctypes.data_as(POINTER(c_uint8)),
-            timestamp = pts
-            )
+        if packet is None:
+            # this will reset the parser internal state
+            # also triggers dummy display callback
+            p = CUVIDSOURCEDATAPACKET(
+                flags = (CUvideopacketflags.ENDOFSTREAM | CUvideopacketflags.NOTIFY_EOS).value,
+                payload_size = 0,
+                payload = None,
+                timestamp = 0
+            )            
+        else:
+            p = CUVIDSOURCEDATAPACKET(
+                flags = CUvideopacketflags.TIMESTAMP.value,
+                payload_size = packet.shape[0],
+                payload = packet.ctypes.data_as(POINTER(c_uint8)),
+                timestamp = pts
+                )
         with cuda.Device(self.device):
             cuda.check(nvcuvid.cuvidParseVideoData(self.cuvid_parser, byref(p)))
         # catch: cuvidParseVideoData will not propagate error return code 0 of HandleVideoSequenceCallback
@@ -555,28 +568,13 @@ class BaseDecoder:
             raise e
 
     def flush(self):
-        """
-        flush the pipeline. do this before sending new packets to avoid old pictures
-        """        
-        p = CUVIDSOURCEDATAPACKET(
-            flags = CUvideopacketflags.ENDOFSTREAM.value,
-            payload_size = 0,
-            payload = None,
-            timestamp = 0
-        )
-        # this reset the parser internal state
-        cuda.check(nvcuvid.cuvidParseVideoData(self.cuvid_parser, byref(p)))
-          
+        self.send(None)
 
     def __del__(self):
-        try:
-            if self.cuvid_parser:
-                cuda.check(nvcuvid.cuvidDestroyVideoParser(self.cuvid_parser))
-            with cuda.Device(self.device):
-                if self.cuvid_decoder:
-                    cuda.check(nvcuvid.cuvidDestroyDecoder(self.cuvid_decoder))
-        except AttributeError:
-            pass
+        cuda.check(nvcuvid.cuvidDestroyVideoParser(self.cuvid_parser))
+        # if the above call failed, the following is not needed at all
+        with cuda.Device(self.device):
+            cuda.check(nvcuvid.cuvidDestroyDecoder(self.cuvid_decoder))
 
 class Decoder(BaseDecoder):
     """A decoder with send/recv paradigm. That is, user send packets to decoder, and receive pictures from decoder. 
@@ -596,7 +594,7 @@ class Decoder(BaseDecoder):
         """        
         return self.pictures.get()
 
-    def decode(self, packets):
+    def decode(self, packets, flush = True):
         """Decode packets; will flush() beforehand
     
         Args:
@@ -606,13 +604,27 @@ class Decoder(BaseDecoder):
         Yields:
             [(Picture, int)]: iterator of (Picture, timestamp)
         """        
-        self.flush()
+        if flush:
+            self.flush()
 
         for packet, pts in packets:
             self.send(packet, pts)
+            # single threaded, pictures being filled only because the above line
             while not self.pictures.empty():
-                yield self.pictures.get()
+                yield self.pictures.get_nowait()
             del packet # to allow buffer reuse
+        
+        # first send EOS
+        self.send(None)
+
+        # then take all remaining pictures
+        while True:
+            pic, pts = self.pictures.get_nowait()
+            if pic is None:
+                break
+            yield pic, pts
+            del pic
+        assert self.pictures.empty() # should have nothing left
 
     def warmup(self, packets):
         '''

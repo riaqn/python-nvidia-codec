@@ -113,7 +113,7 @@ class Screenshot:
             log.debug(f'color range is {r}')
             return r
 
-    def shoot(self, time : timedelta, target = 'cupy', stream : int = 2):
+    def shoot(self, time : timedelta, target = 'cupy', stream : int = 0):
         target_pts = int(time.total_seconds() / self._time_base) + self._start_time
         log.debug(f'target_pts: {target_pts}')
         self.fc.seek_file(self.stream, target_pts)
@@ -124,7 +124,8 @@ class Screenshot:
                 log.debug(f'filtered: dts={pkt.av.dts} pts = {pkt.av.pts}')
                 # log.warning(pts)
                 arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
-                yield arr, pts     
+                yield arr, pts  
+
 
         # surface = None
         # for pic, pts in self.decoder.decode(demux()):
@@ -134,11 +135,18 @@ class Screenshot:
         #     surface = pic.map(stream)
         #     del pic
         #     log.debug(f'decoded: {pts}')
-        for pic, pts in self.decoder.decode(demux()):
+        surface = None
+        pts = None
+        for pic, pts in self.decoder.decode(demux(), flush=False):
             if pts > target_pts:
                 break
-        surface = pic.map(stream)
-
+            del surface
+            surface = pic.map(stream)
+            del pic
+        # surface = pic.map(stream)
+        # del pic
+        if surface is None:
+            raise Exception(f'requested {target_pts}, but first frame is already {pts}')
         if isinstance(target, str):
             shape = Converter.infer_target(surface.shape, cuda2av(surface.format))
             with cuda.Device(self.device):   

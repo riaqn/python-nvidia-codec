@@ -27,7 +27,7 @@ def extract_stream_ptr(stream):
         raise Exception(f'Unknown stream type {type(stream)}')
 
 
-from nvidia_codec.ffmpeg.include.libavutil import AVPixelFormat
+from ..ffmpeg.include.libavutil import AVPixelFormat
 from ..ffmpeg.libavcodec import AVCodecID
 from ..core.cuviddec import cudaVideoCodec, cudaVideoSurfaceFormat
 
