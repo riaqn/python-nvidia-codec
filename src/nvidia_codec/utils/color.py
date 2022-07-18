@@ -1,6 +1,5 @@
 import numpy as np
 
-from nvidia_codec.utils.compat import extract_stream_ptr
 from ..core.common import *
 from ..ffmpeg.include.libavutil import AVColorRange,AVColorSpace, AVPixelFormat
 from ..ffmpeg.libavutil import *
@@ -208,7 +207,7 @@ class Converter:
                 }}
             """, 'convert')
 
-    def __call__(self, source, target, check = True, block = (32, 32, 1), stream : int = 2):
+    def __call__(self, source, target, check = True, block = (32, 32, 1), stream : int = 0):
         """perform color convertion on a surface
 
         Args:
