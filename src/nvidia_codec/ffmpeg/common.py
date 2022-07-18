@@ -1,7 +1,7 @@
 from ctypes import *
 from .libavutil import *
 
-class AVException(BaseException):
+class AVException(Exception):
     def __init__(self, errnum):
         self.errnum = errnum
 
