@@ -8,6 +8,8 @@ CUcontext = c_void_p
 CUresult = c_int
 cudaError = c_int
 
+CUdeviceptr = c_uint
+
 lib = cdll.LoadLibrary('libcuda.so')
 librt = cdll.LoadLibrary('libcudart.so')
 
