@@ -6,7 +6,7 @@ from ..ffmpeg.libavcodec import BSFContext
 from ..ffmpeg.libavformat import FormatContext, AVMediaType, AVCodecID
 from ..ffmpeg.include.libavutil  import AV_NOPTS_VALUE, AV_TIME_BASE, AVColorRange, AVColorSpace
 from .compat import av2cuda, cuda2av
-from ..core.decode import BaseDecoder, Decoder
+from ..core.decode import BaseDecoder
 from ..utils.color import Converter
 
 from ..core import cuda
@@ -73,9 +73,6 @@ class Screenshot:
         self.cvt = None
         self.target_typestr = target_typestr
 
-        self.surface = None
-        self.pts = None
-
     @property
     def _time_base(self):
         return Fraction(self.stream.time_base.num, self.stream.time_base.den)
@@ -121,9 +118,9 @@ class Screenshot:
     '''
     convert the current surface 
     '''
-    def convert(self, target = 'cupy', stream : int = 0):
+    def convert(self, surface, target = 'cupy', stream : int = 0):
         if isinstance(target, str):
-            shape = Converter.infer_target(self.surface.shape, cuda2av(self.surface.format))
+            shape = Converter.infer_target(surface.shape, cuda2av(surface.format))
             with cuda.Device(self.device):   
                 if target == 'cupy':
                     import cupy            
@@ -142,16 +139,16 @@ class Screenshot:
         if self.cvt is None:
             with cuda.Device(self.device):                
                 self.cvt = Converter(
-                    self.surface, 
-                    cuda2av(self.surface.format),
+                    surface, 
+                    cuda2av(surface.format),
                     self.color_space(AVColorSpace.BT470BG),
                     self.color_range(AVColorRange.MPEG),
                     target,
                     self.target_typestr
                     )
                     
-        self.cvt(self.surface, target, stream = stream)
-        return (target, self.pts)
+        self.cvt(surface, target, stream = stream)
+        return target
 
 
     def shoot(self, target : timedelta, dst = 'cupy', stream : int = 0):
@@ -160,23 +157,19 @@ class Screenshot:
         self.fc.seek_file(self.stream, target_pts, max_ts = target_pts)
 
         found = False
-
         act_pts = None
 
         def on_recv(pic, pts):
             nonlocal dst
             nonlocal act_pts
             nonlocal found
-            if pts > target_pts:
-                dst, act_pts = self.convert(dst, stream = stream)
+            if pts >= target_pts:
+                surface = pic.map(stream)
+                pic.free()                                
+                act_pts = pts
+                dst = self.convert(surface, dst, stream = stream)
+                surface.free()
                 found = True
-                # should use the current surface
-                            
-            # always map it
-            # to release the picture slot
-            del self.surface
-            self.surface = pic.map(stream)
-            self.pts = pts
 
         self.decoder.on_recv = on_recv
 
@@ -189,12 +182,13 @@ class Screenshot:
             if found:
                 break
         if not found:
-            # the target_pts is too late
-            # that we are reaching the end
-            dst, act_pts = self.convert(dst, stream = stream)
+            raise Exception(f'{target} is too late')
 
 
         act = timedelta(seconds = float((act_pts - self._start_time) * self._time_base))
         # if abs(act - target) > timedelta(seconds = 0.1):
         #     log.warning(f'actual time {act} is not close to target time {target}')
         return act, dst
+
+    def free(self):
+        self.decoder.free()
