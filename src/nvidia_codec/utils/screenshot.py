@@ -163,13 +163,13 @@ class Screenshot:
             nonlocal dst
             nonlocal act_pts
             nonlocal found
-            if pts >= target_pts:
+            if pts >= target_pts and not found:
                 surface = pic.map(stream)
-                pic.free()                                
                 act_pts = pts
                 dst = self.convert(surface, dst, stream = stream)
                 surface.free()
                 found = True
+            pic.free()
 
         self.decoder.on_recv = on_recv
 
