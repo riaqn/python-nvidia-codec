@@ -40,14 +40,13 @@ class Surface:
         self.c_devptr = c_ulonglong() # according to cuviddec, the argument type of cuvidmapvideoframe64
         self.c_pitch = c_uint()
 
-        self.decoder.surfaces_sem.acquire()        
-        with cuda.Device(self.decoder.device):
-            try:
+        with self.decoder.condition:
+            self.decoder.condition.wait_for(lambda: self.decoder.surfaces_sem > 0)
+            with cuda.Device(self.decoder.device):
                 cuda.check(nvcuvid.cuvidMapVideoFrame64(self.decoder.cuvid_decoder, c_int(index), byref(self.c_devptr), byref(self.c_pitch), byref(self.params)))
-                # log.warning('mapped')
-            except:
-                self.decoder.surfaces_sem.release()
-                raise
+                    # log.warning('mapped')
+                self.decoder.surfaces_sem -= 1
+            self.decoder.condition.notify_all()
 
     @property
     def format(self):
@@ -85,19 +84,23 @@ class Surface:
         """        
         return {'width':self.width, 'height':self.height}
 
-    def __del__(self):
+    def free(self):
         """free up the surface. 
         Note that the GPU memory involved is managed by decoder and will not be available to other CUDA operations
         free() only notifies the decoder that the surface can be reused for future frames
 
         free() is called automatically when the surface is garbage collected
         """        
-        if self.c_devptr and self.decoder.cuvid_decoder:
-            with cuda.Device(self.decoder.device):   
-                cuda.check(nvcuvid.cuvidUnmapVideoFrame64(self.decoder.cuvid_decoder, self.c_devptr))    
-                # log.warning('unampped')
+        with self.decoder.condition:
+            if self.c_devptr and self.decoder.cuvid_decoder:
+                with cuda.Device(self.decoder.device):   
+                    cuda.check(nvcuvid.cuvidUnmapVideoFrame64(self.decoder.cuvid_decoder, self.c_devptr))
+                    self.decoder.surfaces_sem += 1
+                    self.c_devptr = None
+                    self.decoder.condition.notify_all()
 
-            self.decoder.surfaces_sem.release()        
+    def __del__(self):
+        self.free()
 
     @property
     def shape(self):
@@ -148,10 +151,10 @@ class Picture:
         self.decoder = decoder
         self.index = index
         self.params = proc_params
-        with self.decoder.pictures_cond:
+        with self.decoder.condition:
             self.decoder.pictures_used.add(self.index)
 
-    def __del__(self):
+    def free(self):
         '''
         free up the picture.
         Note that the GPU memory involved is managed by decoder and will not be available to other CUDA operations
@@ -161,13 +164,15 @@ class Picture:
         '''
         log.debug(f'freeing picture {self.index}')
 
-        with self.decoder.pictures_cond:
+        with self.decoder.condition:
             # discard instead of remove
             # so this won't trigger exception
             # which is possible
             self.decoder.pictures_used.discard(self.index)
+            self.decoder.condition.notify_all()    
 
-            self.decoder.pictures_cond.notify_all()    
+    def __del__(self):
+        self.free()
 
     def map(self, stream : int = 0):
         """post-process and output this picture to a surface which can be accessed by user as a CUDA array
@@ -372,8 +377,8 @@ class BaseDecoder:
         # this contains all picture indices that are still being used
         # including the ones in above, and the ones passed to user via on_recv
         self.pictures_used = set() 
-        self.pictures_cond = Condition()
-        self.surfaces_sem = Semaphore(decision['num_surfaces']) # number of surfaces available
+
+        self.surfaces_sem = decision['num_surfaces'] # number of surfaces available
 
         log.debug('sequence successful')
         return decision['num_pictures']
@@ -428,10 +433,10 @@ class BaseDecoder:
 
         if pp.CurrPicIdx in self.pictures_used:
             log.info(f'{self.pictures_used}')
-        with self.pictures_cond:
+        with self.condition:
             # wait until picture slot is available again
             log.debug('wait_for_pictures started')
-            self.pictures_cond.wait_for(lambda:pp.CurrPicIdx not in self.pictures_used)
+            self.condition.wait_for(lambda:pp.CurrPicIdx not in self.pictures_used)
             log.debug('wait_for_pictures finished')
 
             # now we know that the user no longer need this picture
@@ -501,8 +506,8 @@ class BaseDecoder:
 
         self.operating_point = 0
         self.disp_all_layers = False
-        self.cuvid_parser = CUvideoparser() # NULL, to be filled in next 
-        self.cuvid_decoder = CUvideodecoder() # NULL, to be filled in later        
+        self.condition = Condition()
+      
         self.video_format = CUVIDEOFORMAT() # NULL, to be filled in later
 
         self.handleVideoSequenceCallback = PFNVIDSEQUENCECALLBACK(self.catch_exception(self.handleVideoSequence))
@@ -522,7 +527,11 @@ class BaseDecoder:
             )
         
         self.device = cuda.get_current_device(device)
-        cuda.check(nvcuvid.cuvidCreateVideoParser(byref(self.cuvid_parser), byref(p)))
+        with self.condition:        
+            self.cuvid_parser = CUvideoparser() # NULL, to be filled in next 
+            self.cuvid_decoder = CUvideodecoder() # NULL, to be filled in later          
+            cuda.check(nvcuvid.cuvidCreateVideoParser(byref(self.cuvid_parser), byref(p)))
+            self.condition.notify_all()
 
     def send(self, packet, pts = 0):
         """
@@ -571,86 +580,16 @@ class BaseDecoder:
     def flush(self):
         self.send(None)
 
-    def __del__(self):
-
-        cuda.check(nvcuvid.cuvidDestroyVideoParser(self.cuvid_parser))
-        self.cuvid_parser = CUvideoparser()
-        # if the above call failed, the following is not needed at all
-        with cuda.Device(self.device):
-            cuda.check(nvcuvid.cuvidDestroyDecoder(self.cuvid_decoder))
-            self.cuvid_decoder = CUvideodecoder()
-
-class Decoder(BaseDecoder):
-    """A decoder with send/recv paradigm. That is, user send packets to decoder, and receive pictures from decoder. 
-    A queue is used to to buffer received pictures.
-    """    
-    def flush(self):
-        """flush the pipeline. do this before sending new packets to avoid old pictures
-        """        
-        super().flush()
-        self.pictures = Queue()
-
-    def recv(self):
-        """get the next picture; block if empty
-
-        Returns:
-            Picture: Picture decoded
-        """        
-        return self.pictures.get()
-
-    def decode(self, packets, flush = True):
-        """Decode packets; will flush() beforehand
-    
-        Args:
-            packets ([(numpy.array, pts)]): iterator of (annex.B packet, timestamp). 
-                Each packet will be 'del'-ed before the next packet is fetched
-
-        Yields:
-            [(Picture, int)]: iterator of (Picture, timestamp)
-        """        
-        if flush:
-            self.flush()
-
-        for packet, pts in packets:
-            self.send(packet, pts)
-            # single threaded, pictures being filled only because the above line
-            while not self.pictures.empty():
-                yield self.pictures.get_nowait()
-            del packet # to allow buffer reuse
-        
-        # first send EOS
-        self.send(None)
-
-        # then take all remaining pictures
-        while True:
-            pic, pts = self.pictures.get_nowait()
-            if pic is None:
-                break
-            yield pic, pts
-            del pic
-        assert self.pictures.empty() # should have nothing left
-
-    def warmup(self, packets):
-        '''
-        Decode packets until the decoder is initialized (during which user-supplied `decide` is called)
-        Pictures decoded will be discarded.
-        This is useful if user wants to run something right after decide is called.
-        '''
-        self.flush()
-        for packet, pts in packets:
-            self.send(packet, pts)
-            while not self.pictures.empty():
-                self.pictures.get()
+    def free(self):
+        with self.condition:
+            if self.cuvid_parser:
+                cuda.check(nvcuvid.cuvidDestroyVideoParser(self.cuvid_parser))
+                self.cuvid_parser = CUvideoparser()                     
             if self.cuvid_decoder:
-                break
-            del packet
+                with cuda.Device(self.device):
+                    cuda.check(nvcuvid.cuvidDestroyDecoder(self.cuvid_decoder))
+                    self.cuvid_decoder = CUvideodecoder()
+            self.condition.notify_all()
 
-    def __init__(self, codec: cudaVideoCodec, decide=lambda p: {}, device=None):
-        """
-        Args:
-            codec (cudaVideoCodec): codec enum of video
-            decide (callback, optional): See `decide` in `BaseDecoder`
-        """        
-        self.pictures = Queue()
-        on_recv = lambda pic,pts : self.pictures.put((pic, pts))
-        super().__init__(codec, on_recv, decide, device)
+    def __del__(self):
+        self.free()
