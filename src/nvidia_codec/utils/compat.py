@@ -22,7 +22,7 @@ def extract_stream_ptr(stream):
         return stream.handle
     elif hasattr(stream, '_as_parameter_'):
         # torch
-        return stream._as_parameter_.value
+        return stream.cuda_stream
     else:
         raise Exception(f'Unknown stream type {type(stream)}')
 

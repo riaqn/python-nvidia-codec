@@ -26,14 +26,14 @@ class FormatContext:
         check(lib.avformat_open_input(byref(ptr), url, None, None))
         self.av = ptr.contents
     
-    def read_frame(self, pkt : Packet):
+    def read_packet(self, pkt : Packet):
         check(lib.av_read_frame(byref(self.av), byref(pkt.av)))
 
-    def read_frames(self, stream : AVStream):
+    def read_packets(self, stream : AVStream):
         while True:
             pkt = Packet()
             try:
-                self.read_frame(pkt) # we own the packet
+                self.read_packet(pkt) # we own the packet
             except AVException as e:
                 if e.errnum == AVERROR_EOF:
                     break
@@ -50,7 +50,7 @@ class FormatContext:
         # log.warning('infering start time from first packet')
                 # in this case, we get the first packet
         pkt = Packet()
-        self.read_frame(pkt)
+        self.read_packet(pkt)
         start_time = pkt.av.pts
         time_base = pkt.av.time_base
         return start_time * Fraction(time_base.num, time_base.den)
