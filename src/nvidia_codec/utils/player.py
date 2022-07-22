@@ -1,21 +1,22 @@
 from datetime import timedelta
 from fractions import Fraction
+from queue import Queue
 import numpy as np
 
 from ..ffmpeg.libavcodec import BSFContext
 from ..ffmpeg.libavformat import FormatContext, AVMediaType, AVCodecID
 from ..ffmpeg.include.libavutil  import AV_NOPTS_VALUE, AV_TIME_BASE, AVColorRange, AVColorSpace
-from .compat import av2cuda, cuda2av
+from .compat import av2cuda, cuda2av, extract_stream_ptr
 from ..core.decode import BaseDecoder
-from ..utils.color import Converter
+from .color import Converter
 
-from ..core import cuda
+import torch
 
 import logging
 
 log = logging.getLogger(__name__)
 
-class Screenshot:
+class Player:
     def __init__(self, url, target_size = lambda h,w: (h,w), target_typestr = '|u1', device = None):
         self.fc = FormatContext(url)
         l = filter(lambda s: s.codecpar.contents.codec_type == AVMediaType.VIDEO, self.fc.streams)
@@ -59,17 +60,18 @@ class Screenshot:
 
         self.bsf = BSFContext(f, self.stream.codecpar.contents, self.stream.time_base)
 
-        self.device = cuda.get_current_device(device)
+        self.device = torch.cuda.current_device() if device is None else device
         def decide(p):
             return {
                 'num_pictures': p['min_num_pictures'], # to be safe
-                'num_surfaces': 1, # only need one 
+                'num_surfaces': p['min_num_pictures'], # only need one 
                 # will use default surface_format
                 # will use default cropping (no cropping)
                 'target_size': target_size,
                 # will use default target rect (no margin)
             }
         self.decoder = BaseDecoder(av2cuda(self.stream.codecpar.contents.codec_id), None, decide = decide, device = self.device)
+        self.surface_q = Queue()
         self.cvt = None
         self.target_typestr = target_typestr
 
@@ -115,29 +117,33 @@ class Screenshot:
             log.debug(f'color range is {r}')
             return r
 
+    def seek(self, target : timedelta):
+        target_pts = self.time2pts(target)
+        log.debug(f'target_pts: {target_pts}')
+        self.fc.seek_file(self.stream, target_pts, max_ts = target_pts)
+
+    def time2pts(self, time: timedelta):
+        return int(time.total_seconds() / self._time_base) + self._start_time
+
+    def pts2time(self, pts : int):
+        return timedelta(seconds = float((pts - self._start_time) * self._time_base))
+
     '''
-    convert the current surface 
+    convert a surface 
     '''
-    def convert(self, surface, target = 'cupy', stream : int = 0):
-        if isinstance(target, str):
-            shape = Converter.infer_target(surface.shape, cuda2av(surface.format))
-            with cuda.Device(self.device):   
-                if target == 'cupy':
-                    import cupy            
-                    target = cupy.empty(shape, dtype = self.target_typestr)        
-                elif target == 'torch':
-                    import torch
+    def convert(self, surface, target = None):
+        if target is None:
+            with torch.cuda.device(self.device):   
+                    shape = Converter.infer_target(surface.shape, cuda2av(surface.format))                
                     m = {
                         '|u1': torch.uint8,
                         '<f2': torch.float16,
                         '<f4': torch.float32,
                     }
                     target = torch.empty(shape, dtype = m[self.target_typestr], device = 'cuda') 
-                else:
-                    raise Exception(f'unsupported target {target}')
 
         if self.cvt is None:
-            with cuda.Device(self.device):                
+            with torch.cuda.device(self.device):
                 self.cvt = Converter(
                     surface, 
                     cuda2av(surface.format),
@@ -146,49 +152,49 @@ class Screenshot:
                     target,
                     self.target_typestr
                     )
-                    
+        stream = extract_stream_ptr(torch.cuda.current_stream())
         self.cvt(surface, target, stream = stream)
         return target
 
-
-    def shoot(self, target : timedelta, dst = 'cupy', stream : int = 0):
-        target_pts = int(target.total_seconds() / self._time_base) + self._start_time
-        log.debug(f'target_pts: {target_pts}')
-        self.fc.seek_file(self.stream, target_pts, max_ts = target_pts)
-
-        found = False
-        act_pts = None
-
-        def on_recv(pic, pts):
-            nonlocal dst
-            nonlocal act_pts
-            nonlocal found
-            if pts >= target_pts and not found:
+    def step_surface(self):
+        stream = extract_stream_ptr(torch.cuda.current_stream())
+        it = self.bsf.filter(self.fc.read_packets(self.stream), False, True)        
+        while self.surface_q.empty():
+            def on_recv(pic, pts):
                 surface = pic.map(stream)
-                act_pts = pts
-                dst = self.convert(surface, dst, stream = stream)
-                surface.free()
-                found = True
-            pic.free()
+                ev = torch.cuda.Event()
+                ev.record()
+                self.surface_q.put((pts, ev, surface))
+                pic.free()
+            self.decoder.on_recv = on_recv
 
-        self.decoder.on_recv = on_recv
-
-        for pkt in self.bsf.filter(self.fc.read_frames(self.stream), flush = False, reuse = True):
+            pkt = next(it)
             pts = pkt.av.pts
-            log.debug(f'filtered: dts={pkt.av.dts} pts = {pkt.av.pts}')
-                # log.warning(pts)
             arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
             self.decoder.send(arr, pts)
-            if found:
-                break
-        if not found:
-            raise Exception(f'{target} is too late')
 
+        pts, ev, surface = self.surface_q.get()
+        return (self.pts2time(pts), ev, surface)
 
-        act = timedelta(seconds = float((act_pts - self._start_time) * self._time_base))
-        # if abs(act - target) > timedelta(seconds = 0.1):
-        #     log.warning(f'actual time {act} is not close to target time {target}')
-        return act, dst
+    def step_frame(self, dst = None):
+        time, ev, surface = self.step_surface()
+        ev.wait()
+        frame = self.convert(surface, dst)
+        surface.free()
+        return (time, frame)
+
+    def skip_frame(self):
+        time, ev, surface = self.step_surface()
+        surface.free()
+        return time
+
+    def screenshoot(self, target : timedelta, dst = None):
+        self.seek(target)
+
+        while True:
+            time, frame = self.step_frame(dst)
+            if target <= time:
+                return time, frame
 
     def free(self):
         self.decoder.free()

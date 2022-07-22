@@ -71,11 +71,8 @@ class BSFContext:
         if flush:
             self.flush()
 
-        # packets = peekable(packets)
         pkt_out = Packet()
-        for pkt in packets:
-            self.send_packet(pkt) 
-
+        while True:
             while True:
                 try:
                     self.receive_packet(pkt_out)# we still own it
@@ -95,8 +92,12 @@ class BSFContext:
                 else:
                     pkt_out = Packet()
 
-                # after the yield, the other side should be done with the packet
-                
+            try:
+                pkt = next(packets)
+            except StopIteration:
+                pkt = None
+            self.send_packet(pkt)                 
+
     # None means EOF
     def send_packet(self, pkt : Packet = None):
         check(lib.av_bsf_send_packet(byref(self.av), byref(pkt.av) if pkt is not None else None))

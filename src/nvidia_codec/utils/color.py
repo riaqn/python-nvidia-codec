@@ -228,7 +228,7 @@ class Converter:
             assert Converter.strides(t) == self.target_strides
 
         grid = ((self.size[0] - 1) // block[0] + 1, (self.size[1] - 1) // block[1] + 1)
-
+        
         with cuda.Device(self.device):
             with cupy.cuda.ExternalStream(stream):
                 self.convert(grid, block, (s['data'][0], t['data'][0]))
