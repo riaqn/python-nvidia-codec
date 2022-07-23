@@ -64,16 +64,27 @@ class Player:
         def decide(p):
             return {
                 'num_pictures': p['min_num_pictures'], # to be safe
-                'num_surfaces': p['min_num_pictures'], # only need one 
+                'num_surfaces': 2, 
                 # will use default surface_format
                 # will use default cropping (no cropping)
                 'target_size': target_size,
                 # will use default target rect (no margin)
             }
-        self.decoder = BaseDecoder(av2cuda(self.stream.codecpar.contents.codec_id), None, decide = decide, device = self.device)
-        self.surface_q = Queue()
+        self.surface_q = Queue()          
         self.cvt = None
         self.target_typestr = target_typestr
+
+        def on_recv(pic, pts):
+            if pic is None:
+                self.surface_q.put(None)
+                return
+            stream = extract_stream_ptr(torch.cuda.current_stream())
+            surface = pic.map(stream)
+            ev = torch.cuda.Event()
+            ev.record()
+            self.surface_q.put((pts, ev, surface))
+            pic.free()            
+        self.decoder = BaseDecoder(av2cuda(self.stream.codecpar.contents.codec_id), on_recv, decide = decide, device = self.device)
 
     @property
     def _time_base(self):
@@ -117,10 +128,18 @@ class Player:
             log.debug(f'color range is {r}')
             return r
 
-    def seek(self, target : timedelta):
+    def seek(self, target : timedelta, flush = True):
         target_pts = self.time2pts(target)
         log.debug(f'target_pts: {target_pts}')
         self.fc.seek_file(self.stream, target_pts, max_ts = target_pts)
+        if flush:
+            self.bsf.flush()
+            self.decoder.flush()
+            # wait until EOS signal feedback
+            for _ in self.surfaces():
+                pass
+
+        # why no flush? because the above might not jump at all in some cases
 
     def time2pts(self, time: timedelta):
         return int(time.total_seconds() / self._time_base) + self._start_time
@@ -156,45 +175,52 @@ class Player:
         self.cvt(surface, target, stream = stream)
         return target
 
-    def step_surface(self):
-        stream = extract_stream_ptr(torch.cuda.current_stream())
-        it = self.bsf.filter(self.fc.read_packets(self.stream), False, True)        
-        while self.surface_q.empty():
-            def on_recv(pic, pts):
-                surface = pic.map(stream)
-                ev = torch.cuda.Event()
-                ev.record()
-                self.surface_q.put((pts, ev, surface))
-                pic.free()
-            self.decoder.on_recv = on_recv
+    def surfaces(self):
+        it = self.bsf.filter(self.fc.read_packets(self.stream), flush = False, reuse = True)
+        
+        while True:
+            while self.surface_q.empty():           
+                try:
+                    pkt = next(it) # this might trigger StopIteration
+                except StopIteration:
+                    arr = None
+                    pts = 0
+                else:
+                    pts = pkt.av.pts
+                    arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
+                self.decoder.send(arr, pts)
+            p = self.surface_q.get()
+            if p is None:
+                break 
+            pts, ev, surface = p
+            yield (self.pts2time(pts), ev, surface)
 
-            pkt = next(it)
-            pts = pkt.av.pts
-            arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
-            self.decoder.send(arr, pts)
+    def frames(self, dst = None):
+        for time, ev, surface in self.surfaces():
+            ev.wait()
+            frame = self.convert(surface, dst)
+            surface.free()
+            yield (time, frame)
 
-        pts, ev, surface = self.surface_q.get()
-        return (self.pts2time(pts), ev, surface)
+    def screenshoot(self, target : timedelta, dst = None):
+        self.seek(target, True)
 
-    def step_frame(self, dst = None):
-        time, ev, surface = self.step_surface()
+        last = None
+        for time, ev, surface in self.surfaces():
+            if target < time:
+                surface.free()
+                time, ev, surface = last
+                ev.wait()
+                frame = self.convert(surface, dst)
+                surface.free()
+                return (time, frame)
+            last = (time, ev, surface)
+
+        time, ev, surface = last
         ev.wait()
         frame = self.convert(surface, dst)
         surface.free()
         return (time, frame)
-
-    def skip_frame(self):
-        time, ev, surface = self.step_surface()
-        surface.free()
-        return time
-
-    def screenshoot(self, target : timedelta, dst = None):
-        self.seek(target)
-
-        while True:
-            time, frame = self.step_frame(dst)
-            if target <= time:
-                return time, frame
 
     def free(self):
         self.decoder.free()
