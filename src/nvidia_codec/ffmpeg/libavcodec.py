@@ -79,7 +79,8 @@ class BSFContext:
                 except AVException as e:
                     if e.errnum == AVERROR_EOF:
                         # no more to see here
-                        log.warning('bsf output EOF')
+                        # probably as a result of a previous EOS we sent
+                        log.debug('bsf signal EOF')
                         return
                     elif e.errnum == AVERROR(EAGAIN):    
                         # need input, break
@@ -96,7 +97,9 @@ class BSFContext:
                 pkt = next(packets)
             except StopIteration:
                 pkt = None
-            self.send_packet(pkt)                 
+            # we must faithfully filter the stream
+            # including End-of-stream
+            self.send_packet(pkt)
 
     # None means EOF
     def send_packet(self, pkt : Packet = None):
