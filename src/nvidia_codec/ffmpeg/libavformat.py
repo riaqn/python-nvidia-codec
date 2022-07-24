@@ -25,6 +25,9 @@ class FormatContext:
         url = c_char_p(url.encode('utf-8'))
         check(lib.avformat_open_input(byref(ptr), url, None, None))
         self.av = ptr.contents
+
+    def __del__(self):
+        lib.avformat_close_input(byref(pointer(self.av)))
     
     def read_packet(self, pkt : Packet):
         check(lib.av_read_frame(byref(self.av), byref(pkt.av)))
@@ -37,7 +40,8 @@ class FormatContext:
             except AVException as e:
                 if e.errnum == AVERROR_EOF:
                     break
-                raise
+                else:
+                    raise
 
             if pkt.av.stream_index == stream.index:
                 log.debug(f'demuxed dts={pkt.av.dts} pts={pkt.av.pts}')

@@ -64,7 +64,7 @@ class Player:
         def decide(p):
             return {
                 'num_pictures': p['min_num_pictures'], # to be safe
-                'num_surfaces': 2, 
+                'num_surfaces': p['min_num_pictures'],
                 # will use default surface_format
                 # will use default cropping (no cropping)
                 'target_size': target_size,
@@ -159,7 +159,7 @@ class Player:
                         '<f2': torch.float16,
                         '<f4': torch.float32,
                     }
-                    target = torch.empty(shape, dtype = m[self.target_typestr], device = 'cuda') 
+                    target = torch.empty(shape, dtype = m[self.target_typestr], device = 'cuda')
 
         if self.cvt is None:
             with torch.cuda.device(self.device):
@@ -203,20 +203,19 @@ class Player:
             yield (time, frame)
 
     def screenshoot(self, target : timedelta, dst = None):
-        self.seek(target, True)
+        self.seek(target)
 
         last = None
         for time, ev, surface in self.surfaces():
             if target < time:
-                surface.free()
-                time, ev, surface = last
+                surface.free() # free the current surface
+                time, ev, surface = last # get the last surface
                 ev.wait()
                 frame = self.convert(surface, dst)
                 surface.free()
                 return (time, frame)
             last = (time, ev, surface)
 
-        time, ev, surface = last
         ev.wait()
         frame = self.convert(surface, dst)
         surface.free()
