@@ -96,7 +96,7 @@ class Surface:
                 with cuda.Device(self.decoder.device):   
                     cuda.check(nvcuvid.cuvidUnmapVideoFrame64(self.decoder.cuvid_decoder, self.c_devptr))
                     self.decoder.surfaces_sem += 1
-                    self.c_devptr = None
+                    self.c_devptr = c_ulonglong()
                     self.decoder.condition.notify_all()
 
     def __del__(self):

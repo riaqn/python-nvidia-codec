@@ -28,24 +28,13 @@ av_packet_alloc.restype = POINTER(AVPacket)
 class Packet:
     def __init__(self):
         ptr = av_packet_alloc()
-        self._av = ptr.contents
-        self.own = True
-
-    @property
-    def av(self):
-        assert self.own, 'packet is not owned by us'
-        return self._av
-
-    def disown(self):
-        assert self.own, 'packet is not owned by us'
-        self.own = False
+        self.av = ptr.contents
 
     def unref(self):
         lib.av_packet_unref(byref(self.av))
 
     def __del__(self):
-        if self.own:
-            lib.av_packet_free(byref(pointer(self._av)))
+        lib.av_packet_free(byref(pointer(self.av)))
 
 class BSFContext:
     def __init__(self, filters : str, codecpar : AVCodecParameters, time_base : AVRational):
@@ -57,7 +46,10 @@ class BSFContext:
             check(lib.av_bsf_list_parse_str(c_char_p(filters.encode('utf-8')), byref(ptr)))
 
         self.av = ptr.contents
-        self.av.par_in = pointer(codecpar)
+        f = lib.avcodec_parameters_alloc
+        f.restype = POINTER(AVCodecParameters)
+        self.av.par_in = f()
+        check(lib.avcodec_parameters_copy(self.av.par_in, byref(codecpar)))
         self.av.time_base_in = time_base
         check(lib.av_bsf_init(byref(self.av)))
 
@@ -104,8 +96,6 @@ class BSFContext:
     # None means EOF
     def send_packet(self, pkt : Packet = None):
         check(lib.av_bsf_send_packet(byref(self.av), byref(pkt.av) if pkt is not None else None))
-        # in case of exception, the following is not called
-        pkt.disown()
 
     def receive_packet(self, pkt : Packet):
         check(lib.av_bsf_receive_packet(byref(self.av), byref(pkt.av)))
