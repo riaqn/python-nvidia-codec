@@ -17,7 +17,7 @@ import logging
 log = logging.getLogger(__name__)
 
 class Player:
-    def __init__(self, url, target_size = lambda h,w: (h,w), device = None):
+    def __init__(self, url, target_size = lambda h,w: (h,w), device = None, num_surfaces = 2):
         self.fc = FormatContext(url)
         l = filter(lambda s: s.codecpar.contents.codec_type == AVMediaType.VIDEO, self.fc.streams)
 
@@ -64,7 +64,7 @@ class Player:
         def decide(p):
             return {
                 'num_pictures': p['min_num_pictures'], # to be safe
-                'num_surfaces': p['min_num_pictures'],
+                'num_surfaces': num_surfaces,
                 # will use default surface_format
                 # will use default cropping (no cropping)
                 'target_size': target_size,
@@ -135,8 +135,8 @@ class Player:
         self.bsf.flush()
         self.decoder.flush()
 
-        for _ in self.surfaces():
-            pass
+        for surface in self._surfaces():
+            surface.free()
 
     def time2pts(self, time: timedelta):
         return int(time.total_seconds() / self._time_base) + self._start_time
@@ -145,7 +145,7 @@ class Player:
         return timedelta(seconds = float((int(pts) - int(self._start_time)) * self._time_base))
 
 
-    def surfaces(self):
+    def _surfaces(self):
         it = self.bsf.filter(self.fc.read_packets(self.stream), flush = False, reuse = True)
         
         while True:
@@ -168,7 +168,7 @@ class Player:
             yield (self.pts2time(pts), ev, surface)
 
     def frames(self, target_dtype):
-        for time, ev, surface in self.surfaces():
+        for time, ev, surface in self._surfaces():
             ev.wait()
             frame = convert(surface, self.color_space(AVColorSpace.BT470BG), self.color_range(AVColorRange.MPEG), target_dtype)
             surface.free()
@@ -178,7 +178,7 @@ class Player:
         self.seek(target)
 
         last = None
-        for time, ev, surface in self.surfaces():
+        for time, ev, surface in self._surfaces():
             if target < time:
                 surface.free() # free the current surface
                 time, ev, surface = last # get the last surface
