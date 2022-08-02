@@ -8,7 +8,7 @@ from ..ffmpeg.libavformat import FormatContext, AVMediaType, AVCodecID
 from ..ffmpeg.include.libavutil  import AV_NOPTS_VALUE, AV_TIME_BASE, AVColorRange, AVColorSpace
 from .compat import av2cuda, cuda2av, extract_stream_ptr
 from ..core.decode import BaseDecoder
-from .color import Converter
+from .color import convert
 
 import torch
 
@@ -17,7 +17,7 @@ import logging
 log = logging.getLogger(__name__)
 
 class Player:
-    def __init__(self, url, target_size = lambda h,w: (h,w), target_typestr = '|u1', device = None):
+    def __init__(self, url, target_size = lambda h,w: (h,w), device = None):
         self.fc = FormatContext(url)
         l = filter(lambda s: s.codecpar.contents.codec_type == AVMediaType.VIDEO, self.fc.streams)
 
@@ -71,8 +71,7 @@ class Player:
                 # will use default target rect (no margin)
             }
         self.surface_q = Queue()          
-        self.cvt = None
-        self.target_typestr = target_typestr
+
 
         def on_recv(pic, pts):
             if pic is None:
@@ -128,52 +127,23 @@ class Player:
             log.debug(f'color range is {r}')
             return r
 
-    def seek(self, target : timedelta, flush = True):
+    def seek(self, target : timedelta):
         target_pts = self.time2pts(target)
         log.debug(f'target_pts: {target_pts}')
         self.fc.seek_file(self.stream, target_pts, max_ts = target_pts)
-        if flush:
-            self.bsf.flush()
-            self.decoder.flush()
-            # wait until EOS signal feedback
-            for _ in self.surfaces():
-                pass
 
-        # why no flush? because the above might not jump at all in some cases
+        self.bsf.flush()
+        self.decoder.flush()
+
+        for _ in self.surfaces():
+            pass
 
     def time2pts(self, time: timedelta):
         return int(time.total_seconds() / self._time_base) + self._start_time
 
     def pts2time(self, pts : int):
-        return timedelta(seconds = float((pts - self._start_time) * self._time_base))
+        return timedelta(seconds = float((int(pts) - int(self._start_time)) * self._time_base))
 
-    '''
-    convert a surface 
-    '''
-    def convert(self, surface, target = None):
-        if target is None:
-            with torch.cuda.device(self.device):   
-                    shape = Converter.infer_target(surface.shape, cuda2av(surface.format))                
-                    m = {
-                        '|u1': torch.uint8,
-                        '<f2': torch.float16,
-                        '<f4': torch.float32,
-                    }
-                    target = torch.empty(shape, dtype = m[self.target_typestr], device = 'cuda')
-
-        if self.cvt is None:
-            with torch.cuda.device(self.device):
-                self.cvt = Converter(
-                    surface, 
-                    cuda2av(surface.format),
-                    self.color_space(AVColorSpace.BT470BG),
-                    self.color_range(AVColorRange.MPEG),
-                    target,
-                    self.target_typestr
-                    )
-        stream = extract_stream_ptr(torch.cuda.current_stream())
-        self.cvt(surface, target, stream = stream)
-        return target
 
     def surfaces(self):
         it = self.bsf.filter(self.fc.read_packets(self.stream), flush = False, reuse = True)
@@ -183,6 +153,7 @@ class Player:
                 try:
                     pkt = next(it) # this might trigger StopIteration
                 except StopIteration:
+                    # actual end of file
                     arr = None
                     pts = 0
                 else:
@@ -191,18 +162,19 @@ class Player:
                 self.decoder.send(arr, pts)
             p = self.surface_q.get()
             if p is None:
+                # reset
                 break 
             pts, ev, surface = p
             yield (self.pts2time(pts), ev, surface)
 
-    def frames(self, dst = None):
+    def frames(self, target_dtype):
         for time, ev, surface in self.surfaces():
             ev.wait()
-            frame = self.convert(surface, dst)
+            frame = convert(surface, self.color_space(AVColorSpace.BT470BG), self.color_range(AVColorRange.MPEG), target_dtype)
             surface.free()
             yield (time, frame)
 
-    def screenshoot(self, target : timedelta, dst = None):
+    def screenshoot(self, target : timedelta, dtype : torch.dtype):
         self.seek(target)
 
         last = None
@@ -211,13 +183,13 @@ class Player:
                 surface.free() # free the current surface
                 time, ev, surface = last # get the last surface
                 ev.wait()
-                frame = self.convert(surface, dst)
+                frame = convert(surface, self.color_space(AVColorSpace.BT470BG), self.color_range(AVColorRange.MPEG), dtype)
                 surface.free()
                 return (time, frame)
             last = (time, ev, surface)
 
         ev.wait()
-        frame = self.convert(surface, dst)
+        frame = convert(surface, self.color_space(AVColorSpace.BT470BG), self.color_range(AVColorRange.MPEG), dtype)
         surface.free()
         return (time, frame)
 
