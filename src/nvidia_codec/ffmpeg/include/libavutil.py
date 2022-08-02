@@ -62,5 +62,3 @@ class AVPixelFormat(TypedCEnumeration(c_int)):
     YUV420P16LE = 45,
     YUV444P16LE = 49
     # other omitted
-
- 

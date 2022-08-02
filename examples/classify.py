@@ -41,7 +41,7 @@ def test(device_idx, path):
             w = int(math.sqrt(pixels / aspect) // 2) * 2
             return h,w
 
-        player = Player(path, target_size, '<f4')
+        player = Player(path, target_size)
 
         net = torchvision.models.convnext_tiny(weights = torchvision.models.ConvNeXt_Tiny_Weights.DEFAULT).cuda()        
         net.eval()
@@ -52,7 +52,7 @@ def test(device_idx, path):
             if time > player.duration:
                 break
             with torch.cuda.stream(stream):
-                time_act, screen = player.screenshoot(time)
+                time_act, screen = player.screenshoot(time, torch.float)
                 assert abs(time - time_act).total_seconds() < 1
 
                 inp = screen[None, :]

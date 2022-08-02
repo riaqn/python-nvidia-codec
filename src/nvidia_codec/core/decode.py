@@ -49,7 +49,7 @@ class Surface:
             self.decoder.condition.notify_all()
 
     @property
-    def format(self):
+    def format(self) -> cudaVideoSurfaceFormat:
         """the format of the surface
 
         Raises:
