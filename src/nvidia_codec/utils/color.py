@@ -3,9 +3,6 @@ from ..ffmpeg.include.libavutil import AVColorRange, AVColorSpace
 from ..core.cuviddec import cudaVideoSurfaceFormat
 from ..core.decode import Surface
 
-import time
-
-
 def convert(surface : Surface,
         source_space : AVColorSpace, 
         source_range : AVColorRange,
