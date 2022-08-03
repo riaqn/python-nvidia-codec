@@ -16,8 +16,8 @@ import logging
 
 log = logging.getLogger(__name__)
 
-class Player:
-    def __init__(self, url, target_size = lambda h,w: (h,w), device = None, num_surfaces = 2):
+class BasePlayer:
+    def __init__(self, url, num_surfaces, target_size = lambda h,w: (h,w),  device = None):
         self.fc = FormatContext(url)
         l = filter(lambda s: s.codecpar.contents.codec_type == AVMediaType.VIDEO, self.fc.streams)
 
@@ -70,20 +70,7 @@ class Player:
                 'target_size': target_size,
                 # will use default target rect (no margin)
             }
-        self.surface_q = Queue()          
-
-
-        def on_recv(pic, pts):
-            if pic is None:
-                self.surface_q.put(None)
-                return
-            stream = extract_stream_ptr(torch.cuda.current_stream())
-            surface = pic.map(stream)
-            ev = torch.cuda.Event()
-            ev.record()
-            self.surface_q.put((pts, ev, surface))
-            pic.free()            
-        self.decoder = BaseDecoder(av2cuda(self.stream.codecpar.contents.codec_id), on_recv, decide = decide, device = self.device)
+        self.decoder = BaseDecoder(av2cuda(self.stream.codecpar.contents.codec_id), decide = decide, device = self.device)
 
     @property
     def _time_base(self):
@@ -135,63 +122,83 @@ class Player:
         self.bsf.flush()
         self.decoder.flush()
 
-        for surface in self._surfaces():
-            surface.free()
-
     def time2pts(self, time: timedelta):
         return int(time.total_seconds() / self._time_base) + self._start_time
 
     def pts2time(self, pts : int):
         return timedelta(seconds = float((int(pts) - int(self._start_time)) * self._time_base))
 
+    def convert(self, surface, dtype):
+        return convert(surface, self.color_space(AVColorSpace.BT470BG), self.color_range(AVColorRange.MPEG), dtype)        
 
-    def _surfaces(self):
+    def decode(self, on_recv):
         it = self.bsf.filter(self.fc.read_packets(self.stream), flush = False, reuse = True)
+
+        def on_recv_(pic, pts, ret):
+            return on_recv(pic, self.pts2time(pts), ret)
         
-        while True:
-            while self.surface_q.empty():           
-                try:
-                    pkt = next(it) # this might trigger StopIteration
-                except StopIteration:
-                    # actual end of file
-                    arr = None
-                    pts = 0
-                else:
-                    pts = pkt.av.pts
-                    arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
-                self.decoder.send(arr, pts)
-            p = self.surface_q.get()
-            if p is None:
-                # reset
-                break 
-            pts, ev, surface = p
-            yield (self.pts2time(pts), ev, surface)
+        for pkt in it:
+            pts = pkt.av.pts
+            arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
+            ret = self.decoder.send(arr, on_recv_, pts)
+            if ret is not None:
+                return ret
+        return self.decoder.send(None, on_recv_, 0)
 
-    def frames(self, target_dtype):
-        for time, ev, surface in self._surfaces():
-            ev.wait()
-            frame = convert(surface, self.color_space(AVColorSpace.BT470BG), self.color_range(AVColorRange.MPEG), target_dtype)
+class Player(BasePlayer):
+    def __init__(self, url, target_size = lambda h,w: (h,w), device = None):
+        super().__init__(url, num_surfaces=1, target_size=target_size, device=device)
+
+    def frames(self, dtype : torch.dtype):
+        def on_recv(pic, time, frames):
+            if pic is None:
+                return frames
+            stream = extract_stream_ptr(torch.cuda.current_stream())
+            surface = pic.map(stream)
+            pic.free()
+            frame = self.convert(surface, dtype)
             surface.free()
-            yield (time, frame)
+            if frames is None:
+                frames = []
+            frames.append((time, frame))
+            return frames
 
-    def screenshoot(self, target : timedelta, dtype : torch.dtype):
+        while True:
+            frames = self.decode(on_recv)
+            if frames is None:
+                break
+            yield from frames
+
+class Screenshoter(BasePlayer):
+    def __init__(self, url, target_size = lambda h,w : (h,w), device = None):
+        super().__init__(url, 2, target_size, device=device)
+
+    def screenshot(self, target : timedelta, dtype : torch.dtype):
         self.seek(target)
 
         last = None
-        for time, ev, surface in self._surfaces():
-            if target < time:
-                surface.free() # free the current surface
-                time, ev, surface = last # get the last surface
-                ev.wait()
-                frame = convert(surface, self.color_space(AVColorSpace.BT470BG), self.color_range(AVColorRange.MPEG), dtype)
-                surface.free()
-                return (time, frame)
-            last = (time, ev, surface)
 
-        ev.wait()
-        frame = convert(surface, self.color_space(AVColorSpace.BT470BG), self.color_range(AVColorRange.MPEG), dtype)
-        surface.free()
-        return (time, frame)
+        def on_recv(pic, time, frame):
+            if frame is not None:
+                return frame
+            nonlocal last
+            stream = extract_stream_ptr(torch.cuda.current_stream())
+            if target < time:
+                pic.free() # current pic not needed
+                time, surface = last
+                frame = self.convert(surface, dtype)
+                surface.free()
+                return time, frame
+            else:
+                if last is not None: # free the last surface
+                    last[1].free()
+                surface = pic.map(stream)
+                pic.free()
+                last = (time, surface)
+                return None
+
+        frame = self.decode(on_recv)
+        return frame
 
     def free(self):
         self.decoder.free()
