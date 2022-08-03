@@ -8,7 +8,7 @@ import faulthandler
 from tqdm import tqdm
 import numpy as np
 
-from nvidia_codec.utils import Player
+from nvidia_codec.utils import Screenshoter
 
 from PIL import Image
 
@@ -41,7 +41,7 @@ def test(device_idx, path):
             w = int(math.sqrt(pixels / aspect) // 2) * 2
             return h,w
 
-        player = Player(path, target_size)
+        player = Screenshoter(path, target_size)
 
         net = torchvision.models.convnext_tiny(weights = torchvision.models.ConvNeXt_Tiny_Weights.DEFAULT).cuda()        
         net.eval()
@@ -52,7 +52,7 @@ def test(device_idx, path):
             if time > player.duration:
                 break
             with torch.cuda.stream(stream):
-                time_act, screen = player.screenshoot(time, torch.float)
+                time_act, screen = player.screenshot(time, torch.float)
                 assert abs(time - time_act).total_seconds() < 1
 
                 inp = screen[None, :]

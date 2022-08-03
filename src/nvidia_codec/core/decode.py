@@ -450,7 +450,7 @@ class BaseDecoder:
         log.debug('display')
         if not bool(pDispInfo):
             # EOS notification
-            self.on_recv(None, 0)
+            self.ret = self.on_recv(None, 0, self.ret)
             return 1
         # di = cast(pDispInfo, POINTER(CUVIDPARSERDISPINFO)).contents
         di = pDispInfo.contents
@@ -463,7 +463,7 @@ class BaseDecoder:
         )
 
         picture = Picture(self, di.picture_index, params)
-        self.on_recv(picture, di.timestamp)
+        self.ret = self.on_recv(picture, di.timestamp, self.ret)
         return 1
 
     '''
@@ -478,7 +478,7 @@ class BaseDecoder:
                 return self.operating_point | (1 << 10 if self.disp_all_layers else 0)
         return -1
 
-    def __init__(self, codec: cudaVideoCodec, on_recv, decide = lambda p: {}, device = None):
+    def __init__(self, codec: cudaVideoCodec, decide = lambda p: {}, device = None):
         """
         Args:
             codec (cudaVideoCodec): the codec enum of the video
@@ -500,7 +500,6 @@ class BaseDecoder:
                 only include keys that you want to change from the default
         """        
         self.dirty = False
-        self.on_recv = on_recv
         self.decide = decide
         self.exception = None
 
@@ -533,7 +532,7 @@ class BaseDecoder:
             cuda.check(nvcuvid.cuvidCreateVideoParser(byref(self.cuvid_parser), byref(p)))
             self.condition.notify_all()
 
-    def send(self, packet, pts = 0):
+    def send(self, packet, on_recv, pts = 0):
         """
         Currently CUVID parser doesn't tell us in display callback whether a timestamp is attached,
         default to zero; therefore here we are always passing timestamp, default to zero
@@ -566,19 +565,21 @@ class BaseDecoder:
                 payload = packet.ctypes.data_as(POINTER(c_uint8)),
                 timestamp = pts
                 )
+        self.ret = None              
+        self.exception = None
+        self.on_recv = on_recv
         with cuda.Device(self.device):
             cuda.check(nvcuvid.cuvidParseVideoData(self.cuvid_parser, byref(p)))
         # catch: cuvidParseVideoData will not propagate error return code 0 of HandleVideoSequenceCallback
         # it still returns CUDA_SUCCESS and simply ignore all future incoming packets
         # therefore we must check the exception here, even if the last call succeeded
-        if self.exception:
+        if self.exception is not None:
             # the exception is caused by our callback, not by cuvid
-            e = self.exception
-            self.exception = None
-            raise e
+            raise self.exception
+        return self.ret
 
     def flush(self):
-        self.send(None)
+        self.send(None, lambda pic,pts,ret: None) # this will reset the parser internal state completely
 
     def free(self):
         with self.condition:
