@@ -250,28 +250,19 @@ class BaseDecoder:
         vf = pVideoFormat.contents
 
         if self.cuvid_decoder:
-            def cmp(a,b):
-                if type(a) is not type(b):
-                    log.debug(f'{type(a)} {type(b)}')
-                    return False
-                for k,_ in a._fields_:
-                    log.debug(f'checking {k}')
-                    va = getattr(a, k) 
-                    vb = getattr(b, k)
-                    if isinstance(va, Structure) and isinstance(vb, Structure):
-                        if not cmp(va, vb):
-                            log.debug(f'{va} not equal to {vb}')
-                            return False
-                    elif va != vb:
-                        log.debug(f'{va} not equal to {vb}')
-                        return False
-                return True
-
-            # initlized before
-            if cmp(vf, self.video_format):
+            # Only compare fields that affect decoder configuration
+            # frame_rate and other metadata can vary after seek within the same video
+            essential = ['codec', 'coded_width', 'coded_height', 'chroma_format', 'bit_depth_luma_minus8']
+            mismatches = [
+                (f, getattr(self.video_format, f), getattr(vf, f))
+                for f in essential
+                if getattr(self.video_format, f) != getattr(vf, f)
+            ]
+            if not mismatches:
                 return self.decode_create_info.ulNumDecodeSurfaces
             else:
-                raise Exception("decoder already initialized, please create a new decoder for new video sequence")
+                diff = ", ".join(f"{k}: {old} -> {new}" for k, old, new in mismatches)
+                raise Exception(f"decoder already initialized with different format: {diff}")
         memmove(byref(self.video_format), byref(vf), sizeof(CUVIDEOFORMAT))
         # save for user use
 
