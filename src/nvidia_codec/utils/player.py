@@ -173,8 +173,21 @@ class Screenshoter(BasePlayer):
     def __init__(self, url, target_size = lambda h,w : (h,w), device = None):
         super().__init__(url, 2, target_size, device=device)
 
-    def screenshot(self, target : timedelta, dtype : torch.dtype):
+    def screenshot(self, target : timedelta, dtype : torch.dtype, accurate : bool = False):
         self.seek(target)
+
+        if not accurate:
+            def on_recv(pic, time, frame):
+                if frame is not None:
+                    return frame
+                stream = extract_stream_ptr(torch.cuda.current_stream())
+                surface = pic.map(stream)
+                pic.free()
+                frame = self.convert(surface, dtype)
+                surface.free()
+                return time, frame
+
+            return self.decode(on_recv)
 
         last = None
 
