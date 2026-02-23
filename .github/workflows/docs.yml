@@ -28,10 +28,12 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install pdoc
+        run: |
+          pip install pdoc torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e .
 
       - name: Build documentation
-        run: PYTHONPATH=src pdoc nvidia_codec -o docs
+        run: pdoc nvidia_codec !nvidia_codec.core !nvidia_codec.ffmpeg -o docs
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
