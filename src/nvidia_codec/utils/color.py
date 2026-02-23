@@ -1,12 +1,56 @@
+"""Color space conversion utilities for decoded video surfaces.
+
+This module handles conversion from YUV color spaces (as output by NVDEC)
+to RGB format using PyTorch operations on the GPU.
+
+Supported input formats:
+    - NV12 (8-bit 4:2:0)
+    - P016 (16-bit 4:2:0)
+    - YUV444 (8-bit 4:4:4)
+    - YUV444_16Bit (16-bit 4:4:4)
+
+Supported color spaces:
+    - BT.470BG / SMPTE 170M (SD video, PAL/NTSC)
+    - BT.709 (HD video)
+    - BT.2020 NCL (UHD/4K video)
+
+Supported color ranges:
+    - MPEG (limited range: Y 16-235, UV 16-240)
+    - JPEG (full range: 0-255)
+"""
 import torch
 from ..ffmpeg.include.libavutil import AVColorRange, AVColorSpace
 from ..core.cuviddec import cudaVideoSurfaceFormat
 from ..core.decode import Surface
 
 def convert(surface : Surface,
-        source_space : AVColorSpace, 
+        source_space : AVColorSpace,
         source_range : AVColorRange,
         target_dtype : torch.dtype):
+    """Convert a decoded YUV surface to an RGB tensor.
+
+    Performs color space conversion from YUV to RGB on the GPU using PyTorch.
+    The conversion accounts for the video's color space (color matrix) and
+    color range (limited vs full range).
+
+    Args:
+        surface: Decoded Surface object from the NVDEC decoder.
+        source_space: Color space of the input (e.g., AVColorSpace.BT709).
+        source_range: Color range of the input (AVColorRange.MPEG for limited,
+            AVColorRange.JPEG for full range).
+        target_dtype: PyTorch dtype for the output tensor:
+            - torch.uint8: Output values in [0, 255]
+            - torch.float32: Output values normalized to [0, 1]
+            - torch.float16: Output values normalized to [0, 1]
+
+    Returns:
+        torch.Tensor of shape [3, H, W] representing RGB image on GPU.
+        Channel order is R, G, B. Values are clamped to valid range.
+
+    Raises:
+        ValueError: If surface format, color range, or target dtype is unsupported.
+        Exception: If color space is unsupported.
+    """
 
     width = surface.width
     height = surface.height
