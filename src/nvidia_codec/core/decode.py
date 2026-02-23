@@ -1,12 +1,37 @@
-'''
-User sends packets to decoder and receives Pictures from the decoder. Picture contains the data of a decoded frame. However, it is not accessible to the user. To access the data, user has to call Picture.map(). This copies and post-processes (cropping, scaling and padding) the Picture into a Surface, which can be accessed as a regular CUDA array. It is up to the user whether or not to call map() for a particular Picture. For example, when screenshoting a video, only a particular subset of frames are needed as output; the user can therefore choose to only call map() on pictures of those frames for faster processing.
+"""Low-level NVDEC decoder with Picture/Surface memory management.
 
-User owns the Picture and Surfaces; the data they represent will be valid as long as the user holds references to them. When all references are dropped, the graphics resources will  be freed. User can also call Picture.free() and Surface.free() to free the resource early. There are limits on the number of Pictures and Surfaces a user can hold at any given time. The limits are specified by `num_pictures` and `num_surfaces` when creating the decoder, upon which that much of graphics memory is pre-allocated even before user gets any Pictures/Surfaces. All Pictures/Surfaces are backed by those pre-allocated memory. Freeing Pictures/Surfaces marks those memory reusable for future Pictures/Surfaces - still not reusable to other CUDA program. By default the bare minimum required of `num_pictures` and `num_surfaces` is specified. The user can override the limits, for following reasons:
+This module provides the core decoding interface using NVIDIA's CUVID API.
+The decoding pipeline has two stages:
 
-Increase the number of pictures might speed up the decoding. User can also increase the number to establish a look-back cache. Take screenshotting as an example again. Say we want the frame at PTS=350. We start decoding the video and get Picture of PTS=0, 100, 200, 300. We have to keep going, because PTS=300 might not be the target frame since there could be a following frame of PTS=350. So we keep going and get Picture of PTS=400. Now we know that indeed PTS=300 is the target frame. Fortunately we keep a variable `old` always storing the last Picture, and we will just use `old` in this case: map it to Surface and read out its data. For this to work, we must set `num_pictures` to be `min_num_pictures + 1`, since we are using one extra picture slot for this `old` picture. This is in fact the default settings since it is a common scenario. `num_pictures` has an upper limit of `32`.
+1. **Picture**: Raw decoded frame in GPU memory (not directly accessible)
+2. **Surface**: Post-processed frame that can be accessed as a CUDA array
 
-Similarly one might increase the `num_surfaces` if their applications can make use of it. `num_surfaces` does not have upper limit as long as there is sufficient graphics memory. Note that again they are allocated on creation of decoder. Freeing `Surface` and `Picture` only marked the slots as reusable by the decoder for future frames, while the corresponding memory are still owned by the decoder and not usable by other CUDA operations. 
-'''
+Workflow:
+    1. Send compressed packets to BaseDecoder.send()
+    2. Receive Picture objects via the on_recv callback
+    3. Call Picture.map() to get a Surface (applies cropping/scaling)
+    4. Access Surface data via __cuda_array_interface__ (works with PyTorch, CuPy)
+    5. Call Surface.free() and Picture.free() when done (or let them be garbage collected)
+
+Memory Management:
+    - Pictures and Surfaces are backed by pre-allocated GPU memory pools
+    - `num_pictures` controls the decode buffer size (max 32)
+    - `num_surfaces` controls the output buffer size (no hard limit)
+    - Calling free() marks the slot as reusable, but memory stays allocated
+    - The decoder owns all memory until BaseDecoder.free() is called
+
+Example:
+    decoder = BaseDecoder(cudaVideoCodec.H264, decide=my_decide_callback)
+    def on_recv(picture, pts, result):
+        if picture is None:  # End of stream
+            return result
+        surface = picture.map(cuda_stream)
+        tensor = torch.as_tensor(surface, device='cuda')
+        picture.free()
+        surface.free()
+        return tensor
+    result = decoder.send(packet_data, on_recv, pts=12345)
+"""
 from . import cuda
 from .nvcuvid import *
 from .common import *
@@ -22,13 +47,23 @@ log = logging.getLogger(__name__)
 nvcuvid = cdll.LoadLibrary('libnvcuvid.so')
 
 class Surface:
-    '''
-    A CUDA array owned by the decoder to store post-processed frames
-    '''
+    """Post-processed decoded frame accessible as a CUDA array.
+
+    A Surface contains the final decoded frame data after cropping and scaling.
+    It implements __cuda_array_interface__ for zero-copy access from PyTorch,
+    CuPy, and other CUDA-aware libraries.
+
+    Do not instantiate directly; use Picture.map() instead.
+
+    Attributes:
+        format: Surface pixel format (NV12, P016, YUV444, etc.)
+        width: Frame width in pixels
+        height: Frame height in pixels
+        shape: Array shape for __cuda_array_interface__
+    """
+
     def __init__(self, decoder, index, params, stream):
-        """
-        DO NOT call this by yourself; use Picture.map() instead
-        """
+        """Internal constructor. Use Picture.map() instead."""
 
         self.decoder = decoder
 
@@ -51,46 +86,29 @@ class Surface:
 
     @property
     def format(self) -> cudaVideoSurfaceFormat:
-        """the format of the surface
-
-        Raises:
-            ValueError: surface format not supported
-
-        Returns:
-            cudaVideoSurfaceFormat : format of the surface
-        """        
+        """Surface pixel format (NV12, P016, YUV444, or YUV444_16Bit)."""
         return self.decoder.surface_format
 
     @property
     def height(self):
-        """
-        Returns:
-            int: height of the surface
-        """        
+        """Frame height in pixels."""
         return self.decoder.target_height
 
     @property
     def width(self):
-        """
-        Returns:
-            int: width of the surface
-        """        
+        """Frame width in pixels."""
         return self.decoder.target_width
 
     @property
     def size(self):
-        """
-        Returns:
-            dict: size of the surface, with keys 'width' and 'height'
-        """        
+        """Frame dimensions as {'width': int, 'height': int}."""
         return {'width':self.width, 'height':self.height}
 
     def free(self):
-        """free up the surface. 
-        Note that the GPU memory involved is managed by decoder and will not be available to other CUDA operations
-        free() only notifies the decoder that the surface can be reused for future frames
+        """Release this surface back to the decoder's pool.
 
-        free() is called automatically when the surface is garbage collected
+        The underlying GPU memory remains allocated by the decoder and will be
+        reused for future frames. Called automatically on garbage collection.
         """        
         with self.decoder.condition:
             if self.c_devptr and self.decoder.cuvid_decoder:
@@ -140,15 +158,18 @@ class Surface:
         }        
         
 class Picture:
-    '''
-    Frame after decoding but before post-processing
-    Its data is not accessible at all, but still takes up GPU memory
-    User must call Picture.map() to get a Surface for the data
-    '''
+    """Decoded frame before post-processing.
+
+    A Picture holds a reference to a decoded frame in the decoder's internal
+    buffer. The frame data is not directly accessible; call map() to create
+    a Surface that can be read.
+
+    Do not instantiate directly; Pictures are created by the decoder and
+    passed to your on_recv callback.
+    """
+
     def __init__(self, decoder, index, proc_params):
-        '''
-        DO NOT call this by yourself; use Decoder.decode() instead
-        '''
+        """Internal constructor. Pictures are created by the decoder."""
         self.decoder = decoder
         self.index = index
         self.params = proc_params
@@ -156,13 +177,11 @@ class Picture:
             self.decoder.pictures_used.add(self.index)
 
     def free(self):
-        '''
-        free up the picture.
-        Note that the GPU memory involved is managed by decoder and will not be available to other CUDA operations
-        free() only notifies the decoder that the picture can be reused to store future pictures
+        """Release this picture back to the decoder's pool.
 
-        free() is called automatically when the picture is garbage collected        
-        '''
+        The underlying GPU memory remains allocated by the decoder and will be
+        reused for future frames. Called automatically on garbage collection.
+        """
         log.debug(f'freeing picture {self.index}')
 
         with self.decoder.condition:
@@ -176,32 +195,36 @@ class Picture:
         self.free()
 
     def map(self, stream : int = 0):
-        """post-process and output this picture to a surface which can be accessed by user as a CUDA array
+        """Post-process this picture and create an accessible Surface.
+
+        Applies cropping, scaling, and color format conversion as configured
+        in the decoder. The operation is queued on the specified CUDA stream.
 
         Args:
-            stream (optional, int): CUDA stream to queue this map operation. 
-            Defaults to 2 which means per-thread default stream
+            stream: CUDA stream for the operation. Pass 0 or 2 for the
+                per-thread default stream, or a stream pointer/handle.
 
         Returns:
-            Surface : Surface mapped by this picture
+            Surface that can be accessed via __cuda_array_interface__.
         """
         return Surface(self.decoder, self.index, self.params, stream)
 
 def decide_surface_format(chroma_format, bit_depth, supported_surface_formats, allow_high = False):
-    """decide the appropriate surface format for a given chroma format and bit depth
+    """Select the best surface format for the given video parameters.
 
     Args:
-        chroma_format (cudaVideoChromaFormat): chroma format of the video
-        bit_depth (int): bit depth per color channel, usually 8
-        supported_surface_formats (set(cudaVideoSurfaceFormat)): set of supported surface formats
-        allow_high (bool, optional): If False, will use 8bit output even if the video is higher than 8bit. Defaults to False.
-
-    Raises:
-        Exception: if chroma format is not supported
-        Exception: if no surface format is supported
+        chroma_format: Video chroma subsampling (YUV420, YUV444, etc.)
+        bit_depth: Bits per color channel (usually 8 or 10)
+        supported_surface_formats: Formats supported by this GPU/codec combination
+        allow_high: If True, use 16-bit output for >8-bit video. If False,
+            always use 8-bit output (lossy for HDR content).
 
     Returns:
-        cudaVideoSurfaceFormat: the selected surface format
+        The selected cudaVideoSurfaceFormat.
+
+    Raises:
+        Exception: If the chroma format is unsupported or no compatible
+            surface format is available.
     """    
     if chroma_format in [cudaVideoChromaFormat.YUV420, cudaVideoChromaFormat.MONOCHROME]:
         f = cudaVideoSurfaceFormat.P016 if bit_depth > 8 and allow_high else cudaVideoSurfaceFormat.NV12
@@ -228,13 +251,19 @@ def decide_surface_format(chroma_format, bit_depth, supported_surface_formats, a
     return f
 
 class BaseDecoder:
-    """Decoder with send/on-recv paradigm. That is, the user registers a callback which will be called upon decoded frames,
-    and keep sending packets to the decoder.
+    """NVDEC hardware decoder with callback-based frame delivery.
+
+    Decodes video packets using NVIDIA's CUVID API. For each decoded frame,
+    the provided on_recv callback is invoked with a Picture object. This
+    is the low-level decoder; most users should use Player or Screenshoter
+    from nvidia_codec.utils instead.
+
+    The decoder manages GPU memory pools for Pictures and Surfaces. Configure
+    pool sizes via the decide callback to balance memory usage and throughput.
     """
+
     def catch_exception(self, func, return_on_error = 0):
-        '''
-        wrapper for callbacks, so they return the error code as expected by cuvid; 
-        '''
+        """Wrap callbacks to capture exceptions and return error codes."""
         def wrapper(*args, **kwargs):
             try:
                 return func(*args, **kwargs)
@@ -378,44 +407,32 @@ class BaseDecoder:
 
     @property
     def codec(self):
-        """
-        Returns:
-            cudaVideoCodec: the codec enum of the video
-        """        
+        """Video codec (cudaVideoCodec enum)."""
         return self.decode_create_info.CodecType
 
     @property
     def height(self):
+        """Original video height in pixels (before scaling)."""
         return  self.video_format.display_area.bottom - self.video_format.display_area.top
 
     @property
     def width(self):
+        """Original video width in pixels (before scaling)."""
         return self.video_format.display_area.right - self.video_format.display_area.left
 
     @property
     def target_width(self):
-        """
-        Returns:
-            int: the width of the target picture
-        """
+        """Output width in pixels (after scaling)."""
         return self.decode_create_info.ulTargetWidth
-    
+
     @property
     def target_height(self):
-        """
-
-        Returns:
-            int: the height of the target picture
-        """        
+        """Output height in pixels (after scaling)."""
         return self.decode_create_info.ulTargetHeight
 
     @property
     def surface_format(self):
-        """
-
-        Returns:
-            cudaVideoSurfaceFormat: the output surface format of the video
-        """
+        """Output surface format (NV12, P016, YUV444, etc.)."""
         return self.decode_create_info.OutputFormat
 
     def handlePictureDecode(self, pUserData, pPicParams):
@@ -459,10 +476,8 @@ class BaseDecoder:
         self.ret = self.on_recv(picture, di.timestamp, self.ret)
         return 1
 
-    '''
-    I don't understand AV1 operating point, just copying reference implementation
-    '''
     def handleOperatingPoint(self, pUserData, pOPInfo):
+        """Handle AV1 operating point selection (internal callback)."""
         opi = pOPInfo.contents
         if opi.codec == cudaVideoCodec.AV1:
             if opi.av1.operating_points_cnt > 1:
@@ -472,26 +487,28 @@ class BaseDecoder:
         return -1
 
     def __init__(self, codec: cudaVideoCodec, decide = lambda p: {}, device = None, extradata = None, coded_width = 0, coded_height = 0):
-        """
+        """Initialize the decoder.
+
         Args:
-            codec (cudaVideoCodec): the codec enum of the video
-            on_recv (callback): a callback that will be called when a picture is ready to be displayed
-            decide (callback, optional): a callback used to decide decoder parameters. Defaults to lambda p:{}.
-                The callback will be called with a dict containing:
-                    'chroma_format' (cudaVideoChromaFormat) : the chroma format of the video
-                    'bit_depth' (int) : the bit depth of the video, usually 8
-                    'size' (dict) : the size of the video, with keys 'width' and 'height'
-                    'supported_surface_formats' (set) : a set of cudaVideoSurfaceFormat that are supported as output surface for this video
-                    'min_num_pictures' (int) : the minimum number of pictures needed for decoding
-                it should return a dict containing (all optional):
-                    'num_pictures' (int) : the number of pictures used for decoding, by default it is the same as 'min_num_pictures'.
-                    'num_surfaces' (int) : the number of surfaces used for mapping, by default 1
-                    'surface_format' (cudaVideoSurfaceFormat) : the output surface format to use, by default selected by decide_surface_format
-                    'cropping' (dict) : the cropping parameters, with keys 'left', 'top', 'right', 'bottom', by default no cropping
-                    'target_size' (dict) : the target size of the output picture, with keys 'width' and 'height, by default the same as 'size'
-                    'target_rect' (dict) : the target rectangle of the output picture, with keys 'left', 'top', 'right', 'bottom', by default no black margin
-                only include keys that you want to change from the default
-            extradata (bytes, optional): codec extradata/sequence header from container (needed for VC1/WMV3)
+            codec: Video codec (e.g., cudaVideoCodec.H264, cudaVideoCodec.HEVC)
+            decide: Callback to configure decoder parameters. Called with a dict:
+                - 'chroma_format': cudaVideoChromaFormat (YUV420, YUV444, etc.)
+                - 'bit_depth': int (8 or 10)
+                - 'supported_surface_formats': list of cudaVideoSurfaceFormat
+                - 'min_num_pictures': int (minimum decode buffer size)
+
+                Return a dict with any of these optional overrides:
+                - 'num_pictures': Decode buffer size (default: min + 1, max: 32)
+                - 'num_surfaces': Output buffer size (default: 2)
+                - 'surface_format': Output format (default: auto-selected)
+                - 'cropping': Function (h, w) -> {'left', 'top', 'right', 'bottom'}
+                - 'target_size': Function (h, w) -> (new_h, new_w) for scaling
+                - 'target_rect': Function (h, w) -> {'left', 'top', 'right', 'bottom'}
+
+            device: CUDA device ID (default: current device)
+            extradata: Codec sequence header from container (required for VC1/WMV3)
+            coded_width: Video width hint for codecs needing extradata
+            coded_height: Video height hint for codecs needing extradata
         """
         self.dirty = False
         self.decide = decide
@@ -546,20 +563,27 @@ class BaseDecoder:
             self.condition.notify_all()
 
     def send(self, packet, on_recv, pts = 0):
-        """
-        Currently CUVID parser doesn't tell us in display callback whether a timestamp is attached,
-        default to zero; therefore here we are always passing timestamp, default to zero
+        """Send a compressed packet to the decoder.
 
-        There is no need to signal end-of-stream - 
-        the parser eagerly invokes display callback on pictures as soon as their turn in reorder buffer
-        so if you have used send on all packet you have and returned, then garanteed your on_recv
-        is called for all packets. However, if your stream is malformed, there might be leftover packets
-        in parser's reorder buffer; these have been (or will be) decoded, but their display callback 
-        will never be called. In this case flush() should be called
-    
+        The decoder will parse the packet and invoke on_recv for each decoded
+        frame. Frames are delivered in display order (after B-frame reordering).
+
         Args:
-            packet (numpy.ndarray): packet is expected to be a numpy 1d-array; None means end of stream; user can reuse the packet after the call
-            pts (int, optional): PTS of this packet. Defaults to 0.
+            packet: Compressed video data as a 1D numpy array, or None to
+                signal end-of-stream (triggers EOS callback with picture=None).
+            on_recv: Callback function(picture, pts, accumulator) -> result.
+                - picture: Picture object, or None at end of stream
+                - pts: Presentation timestamp passed to send()
+                - accumulator: Return value from previous on_recv call
+                The final on_recv return value is returned by send().
+            pts: Presentation timestamp for this packet (passed to on_recv).
+
+        Returns:
+            The final return value from on_recv, or None if no frames decoded.
+
+        Note:
+            The packet buffer can be reused immediately after send() returns.
+            Call flush() to drain any remaining frames from the reorder buffer.
         """        
 
         if packet is None:
@@ -598,9 +622,19 @@ class BaseDecoder:
         return self.ret
 
     def flush(self):
-        self.send(None, lambda pic,pts,ret: None) # this will reset the parser internal state completely
+        """Flush the decoder, discarding any buffered frames.
+
+        Resets the parser state. Call this after seeking to clear any
+        frames from the previous position.
+        """
+        self.send(None, lambda pic,pts,ret: None)
 
     def free(self):
+        """Release all decoder resources.
+
+        Destroys the CUVID parser and decoder, freeing all GPU memory.
+        The decoder cannot be used after calling free().
+        """
         with self.condition:
             if self.cuvid_parser:
                 cuda.check(nvcuvid.cuvidDestroyVideoParser(self.cuvid_parser))
