@@ -18,6 +18,15 @@ log = logging.getLogger(__name__)
 
 lib = cdll.LoadLibrary('libavformat.so')
 
+# Check FFmpeg version compatibility (requires FFmpeg 8.x / libavformat 62+)
+_version = lib.avformat_version()
+_major = _version >> 16
+if _major < 62:
+    raise ImportError(
+        f"nvidia-codec requires FFmpeg 8.x (libavformat 62+), "
+        f"but found libavformat {_major}.{(_version >> 8) & 0xff}.{_version & 0xff}"
+    )
+
 
 class FormatContext:
     def __init__(self, url : str):
