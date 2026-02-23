@@ -47,11 +47,16 @@ class CUVIDEOFORMAT(Structure):
                 ('coded_height', c_uint),
                 ('display_area', IRECT),
                 ('chroma_format', c_int), # should be cudaVideoChromaFormat
-                # ('bitrate', c_uint),
-                # ('display_aspect_ratio', DISPLAYASPECTRATIO),
-                # ('video_signal_description', VIDEO_SIGNAL_DESCRIPTION),
-                # ('seqhdr_data_length', c_uint)
+                ('bitrate', c_uint),
+                ('display_aspect_ratio', DISPLAYASPECTRATIO),
+                ('video_signal_description', VIDEO_SIGNAL_DESCRIPTION),
+                ('seqhdr_data_length', c_uint)
                 ]
+
+class CUVIDEOFORMATEX(Structure):
+    """Extended video format with sequence header data for codecs like VC1/WMV3"""
+    _fields_ = [('format', CUVIDEOFORMAT),
+                ('raw_seqhdr_data', c_ubyte * 1024)]
 
 
 class CUVIDPICPARAMS(Structure):
@@ -111,7 +116,7 @@ class CUVIDPARSERPARAMS(Structure):
                 ('pfnDisplayPicture', PFNVIDDISPLAYCALLBACK),
                 ('pfnGetOperatingPoint', PFNVIDOPPOINTCALLBACK),
                 ('pvReserved2', c_void_p*6),
-                ('pExtVideoInfo', c_void_p) # not used in examples, just leave empty
+                ('pExtVideoInfo', POINTER(CUVIDEOFORMATEX)) # sequence header for VC1/WMV3 etc
     ]
 CUstream = c_void_p # according to /opt/cuda/include/cuda.h
 CUvideoparser = c_void_p # according to nvcuvid.h
