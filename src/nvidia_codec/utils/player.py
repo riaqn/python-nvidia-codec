@@ -184,8 +184,13 @@ class Screenshoter(BasePlayer):
             nonlocal last
             stream = extract_stream_ptr(torch.cuda.current_stream())
             if target < time:
-                pic.free() # current pic not needed
-                time, surface = last
+                if last is not None:
+                    pic.free() # current pic not needed
+                    time, surface = last
+                else:
+                    # first frame is already past target, use it
+                    surface = pic.map(stream)
+                    pic.free()
                 frame = self.convert(surface, dtype)
                 surface.free()
                 return time, frame
