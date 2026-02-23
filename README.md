@@ -15,12 +15,8 @@ A Pythonic library for NVIDIA Video Codec (NVDEC).
 
 ```bash
 git clone https://github.com/riaqn/python-nvidia-codec.git
-```
-
-Add to your Python path:
-```python
-import sys
-sys.path.insert(0, 'python-nvidia-codec/src')
+cd python-nvidia-codec
+pip install -e .
 ```
 
 ## Usage
