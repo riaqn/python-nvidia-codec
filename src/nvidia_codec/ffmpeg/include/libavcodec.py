@@ -25,7 +25,7 @@ class AVCodecID(TypedCEnumeration(c_int)):
     HEVC = 173
     VP8 = 139
     VP9 = 167
-    AV1 = 226
+    AV1 = 225
 
 class AVCodecParameters(Structure):
     _fields_ = [
