@@ -40,8 +40,8 @@ jobs:
 
           loader = griffe.GriffeLoader(search_paths=["src"])
 
-          # Load only the modules we want, ignore errors
-          modules_to_doc = ["nvidia_codec"]
+          # Load module without resolving aliases (avoids "from ctypes import *" issues)
+          mod = loader.load("nvidia_codec", try_relative_path=False, resolve_aliases=False)
 
           output = ['<!DOCTYPE html><html><head>',
             '<title>nvidia-codec API Reference</title>',
@@ -75,11 +75,7 @@ jobs:
                           lines.extend(render_obj(member, level + 1))
               return lines
 
-          try:
-              mod = loader.load("nvidia_codec", try_relative_path=False)
-              output.extend(render_obj(mod))
-          except Exception as e:
-              output.append(f"<p>Error loading module: {html.escape(str(e))}</p>")
+          output.extend(render_obj(mod))
 
           output.append('</body></html>')
           Path("docs/index.html").write_text('\n'.join(output))
