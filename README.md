@@ -14,6 +14,11 @@ A Pythonic library for NVIDIA Video Codec (NVDEC).
 ## Installation
 
 ```bash
+pip install nvidia-codec
+```
+
+Or from source:
+```bash
 git clone https://github.com/riaqn/python-nvidia-codec.git
 cd python-nvidia-codec
 pip install -e .
