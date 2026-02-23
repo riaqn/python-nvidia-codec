@@ -40,6 +40,8 @@ def av2cuda(x):
             return cudaVideoCodec.H264
         elif x == AVCodecID.VP9:
             return cudaVideoCodec.VP9
+        elif x == AVCodecID.VC1 or x == AVCodecID.WMV3:
+            return cudaVideoCodec.VC1
         else:
             raise Exception(f'unknown codec : {x}')
     else:
