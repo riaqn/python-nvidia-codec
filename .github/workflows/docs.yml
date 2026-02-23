@@ -27,54 +27,87 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install griffe jinja2
-
       - name: Build documentation
         run: |
           mkdir -p docs
           python << 'SCRIPT'
-          import griffe
+          import ast
           from pathlib import Path
-          import html
+          import html as html_mod
 
-          loader = griffe.GriffeLoader(search_paths=["src"])
-          mod = loader.load("nvidia_codec", try_relative_path=False)
-          # Don't call loader.resolve_aliases() - skip resolution to avoid "from ctypes import *" errors
+          def get_docstring(node):
+              return ast.get_docstring(node) or ""
 
-          output = ['<!DOCTYPE html><html><head>',
-            '<title>nvidia-codec API Reference</title>',
-            '<style>',
-            'body { font-family: system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 2rem; line-height: 1.6; }',
-            'pre { background: #f5f5f5; padding: 1rem; overflow-x: auto; border-radius: 4px; }',
-            'code { background: #f5f5f5; padding: 0.2em 0.4em; border-radius: 3px; }',
-            '.docstring { margin-left: 1rem; color: #444; }',
-            'h1 { border-bottom: 2px solid #333; } h2, h3, h4 { border-bottom: 1px solid #ddd; padding-bottom: 0.3em; }',
-            '.sig { color: #666; font-family: monospace; }',
-            '</style></head><body>',
-            '<h1>nvidia-codec API Reference</h1>']
+          def get_signature(node):
+              if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                  return ""
+              args = []
+              for arg in node.args.args:
+                  args.append(arg.arg)
+              return f"({', '.join(args)})"
 
-          def render_obj(obj, level=2):
+          def parse_file(filepath):
+              with open(filepath) as f:
+                  tree = ast.parse(f.read())
+              return tree
+
+          def render_module(filepath, module_name, level=2):
               lines = []
+              tree = parse_file(filepath)
               h = f"h{min(level, 6)}"
-              name = obj.name
-              if hasattr(obj, 'signature'):
-                  sig = str(obj.signature) if obj.signature else "()"
-                  lines.append(f"<{h}>{html.escape(name)}<span class='sig'>{html.escape(sig)}</span></{h}>")
-              else:
-                  lines.append(f"<{h}>{html.escape(name)}</{h}>")
 
-              if obj.docstring:
-                  lines.append(f"<div class='docstring'><pre>{html.escape(obj.docstring.value)}</pre></div>")
+              # Module docstring
+              lines.append(f"<{h}>{html_mod.escape(module_name)}</{h}>")
+              doc = get_docstring(tree)
+              if doc:
+                  lines.append(f"<div class='docstring'><pre>{html_mod.escape(doc)}</pre></div>")
 
-              # Render members
-              if hasattr(obj, 'members'):
-                  for member in obj.members.values():
-                      if not member.name.startswith('_') or member.name in ('__init__',):
-                          lines.extend(render_obj(member, level + 1))
+              # Classes and functions
+              for node in ast.iter_child_nodes(tree):
+                  if isinstance(node, ast.ClassDef) and not node.name.startswith('_'):
+                      lines.append(f"<h{min(level+1, 6)}>class {html_mod.escape(node.name)}</h{min(level+1, 6)}>")
+                      doc = get_docstring(node)
+                      if doc:
+                          lines.append(f"<div class='docstring'><pre>{html_mod.escape(doc)}</pre></div>")
+                      # Methods
+                      for item in ast.iter_child_nodes(node):
+                          if isinstance(item, ast.FunctionDef) and (not item.name.startswith('_') or item.name == '__init__'):
+                              sig = get_signature(item)
+                              lines.append(f"<h{min(level+2, 6)}>{html_mod.escape(item.name)}<span class='sig'>{html_mod.escape(sig)}</span></h{min(level+2, 6)}>")
+                              doc = get_docstring(item)
+                              if doc:
+                                  lines.append(f"<div class='docstring'><pre>{html_mod.escape(doc)}</pre></div>")
+                  elif isinstance(node, ast.FunctionDef) and not node.name.startswith('_'):
+                      sig = get_signature(node)
+                      lines.append(f"<h{min(level+1, 6)}>{html_mod.escape(node.name)}<span class='sig'>{html_mod.escape(sig)}</span></h{min(level+1, 6)}>")
+                      doc = get_docstring(node)
+                      if doc:
+                          lines.append(f"<div class='docstring'><pre>{html_mod.escape(doc)}</pre></div>")
               return lines
 
-          output.extend(render_obj(mod))
+          output = ['''<!DOCTYPE html><html><head>
+          <title>nvidia-codec API Reference</title>
+          <style>
+          body { font-family: system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 2rem; line-height: 1.6; }
+          pre { background: #f5f5f5; padding: 1rem; overflow-x: auto; border-radius: 4px; white-space: pre-wrap; }
+          code { background: #f5f5f5; padding: 0.2em 0.4em; border-radius: 3px; }
+          .docstring { margin-left: 1rem; color: #444; }
+          h1 { border-bottom: 2px solid #333; } h2, h3, h4, h5, h6 { border-bottom: 1px solid #ddd; padding-bottom: 0.3em; }
+          .sig { color: #666; font-family: monospace; }
+          </style></head><body>
+          <h1>nvidia-codec API Reference</h1>''']
+
+          # Document key modules
+          modules = [
+              ("src/nvidia_codec/__init__.py", "nvidia_codec"),
+              ("src/nvidia_codec/utils/__init__.py", "nvidia_codec.utils"),
+              ("src/nvidia_codec/utils/player.py", "nvidia_codec.utils.player"),
+              ("src/nvidia_codec/core/decode.py", "nvidia_codec.core.decode"),
+          ]
+
+          for filepath, name in modules:
+              if Path(filepath).exists():
+                  output.extend(render_module(filepath, name))
 
           output.append('</body></html>')
           Path("docs/index.html").write_text('\n'.join(output))
