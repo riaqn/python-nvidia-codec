@@ -180,6 +180,8 @@ class Screenshoter(BasePlayer):
             def on_recv(pic, time, frame):
                 if frame is not None:
                     return frame
+                if pic is None:
+                    return None
                 stream = extract_stream_ptr(torch.cuda.current_stream())
                 surface = pic.map(stream)
                 pic.free()
@@ -194,6 +196,14 @@ class Screenshoter(BasePlayer):
         def on_recv(pic, time, frame):
             if frame is not None:
                 return frame
+            if pic is None:
+                # End of stream - return last frame if we have one
+                if last is not None:
+                    time, surface = last
+                    frame = self.convert(surface, dtype)
+                    surface.free()
+                    return time, frame
+                return None
             nonlocal last
             stream = extract_stream_ptr(torch.cuda.current_stream())
             if target < time:
