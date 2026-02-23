@@ -29,7 +29,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pdoc torch --index-url https://download.pytorch.org/whl/cpu
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pdoc
           pip install -e .
 
       - name: Build documentation
