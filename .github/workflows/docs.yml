@@ -39,9 +39,8 @@ jobs:
           import html
 
           loader = griffe.GriffeLoader(search_paths=["src"])
-
-          # Load module without resolving aliases (avoids "from ctypes import *" issues)
-          mod = loader.load("nvidia_codec", try_relative_path=False, resolve_aliases=False)
+          mod = loader.load("nvidia_codec", try_relative_path=False)
+          # Don't call loader.resolve_aliases() - skip resolution to avoid "from ctypes import *" errors
 
           output = ['<!DOCTYPE html><html><head>',
             '<title>nvidia-codec API Reference</title>',
