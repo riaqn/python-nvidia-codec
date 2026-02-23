@@ -79,14 +79,14 @@ class CUVIDOPERATINGPOINTINFO(Structure):
     _fields_ = [('codec', c_int), # should be cudaVideoCodec
                 ('u', ANON)]
 
-CUvideotimestamp = c_ulonglong
+CUvideotimestamp = c_longlong
 class CUVIDPARSERDISPINFO(Structure):
     _fields_ = [('picture_index', c_int),
                 ('progressive_frame', c_int),
                 ('top_field_first', c_int),
                 ('repeat_first_field', c_int),
                 ('timestamp', CUvideotimestamp)
-                ]                
+                ]
 
 PFNVIDSEQUENCECALLBACK = PYFUNCTYPE(CUresult, c_void_p, POINTER(CUVIDEOFORMAT))
 PFNVIDDECODECALLBACK = PYFUNCTYPE(CUresult, c_void_p, POINTER(CUVIDPICPARAMS))
@@ -139,18 +139,9 @@ class CUvideopacketflags(Flag):
     ENDOFPICTURE = auto()
     NOTIFY_EOS = auto()
 
-CUvideotimestamp = c_longlong
 class CUVIDSOURCEDATAPACKET(Structure):
     _fields_ = [('flags', c_ulong),
                 ('payload_size', c_ulong),
                 ('payload', POINTER(c_ubyte)),
-                ('timestamp', CUvideotimestamp)
-                ]
-
-class CUVIDPARSERDISPINFO(Structure):
-    _fields_ = [('picture_index', c_int),
-                ('progressive_frame', c_int),
-                ('top_field_first', c_int),
-                ('repeat_first_field', c_int),
                 ('timestamp', CUvideotimestamp)
                 ]
