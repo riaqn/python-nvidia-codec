@@ -275,6 +275,8 @@ class BaseDecoder:
 
         with cuda.Device(self.device):
             cuda.check(nvcuvid.cuvidGetDecoderCaps(byref(caps)))
+        log.debug(f"Video format: codec={vf.codec}, chroma={vf.chroma_format}, bit_depth={vf.bit_depth_luma_minus8+8}, size={vf.coded_width}x{vf.coded_height}")
+        log.debug(f"Caps: supported={caps.bIsSupported}, min={caps.nMinWidth}x{caps.nMinHeight}, max={caps.nMaxWidth}x{caps.nMaxHeight}")
         if caps.bIsSupported != 1:
             log.error(f"Codec not supported - codec={vf.codec}, chroma={vf.chroma_format}, bit_depth={vf.bit_depth_luma_minus8+8}, size={vf.coded_width}x{vf.coded_height}")
             raise CodecNotSupportedError(f"Codec not supported: {cudaVideoCodec(vf.codec)}")
@@ -472,7 +474,7 @@ class BaseDecoder:
                 return self.operating_point | (1 << 10 if self.disp_all_layers else 0)
         return -1
 
-    def __init__(self, codec: cudaVideoCodec, decide = lambda p: {}, device = None):
+    def __init__(self, codec: cudaVideoCodec, decide = lambda p: {}, device = None, extradata = None, coded_width = 0, coded_height = 0):
         """
         Args:
             codec (cudaVideoCodec): the codec enum of the video
@@ -484,15 +486,16 @@ class BaseDecoder:
                     'size' (dict) : the size of the video, with keys 'width' and 'height'
                     'supported_surface_formats' (set) : a set of cudaVideoSurfaceFormat that are supported as output surface for this video
                     'min_num_pictures' (int) : the minimum number of pictures needed for decoding
-                it should return a dict containing (all optional): 
-                    'num_pictures' (int) : the number of pictures used for decoding, by default it is the same as 'min_num_pictures'. 
+                it should return a dict containing (all optional):
+                    'num_pictures' (int) : the number of pictures used for decoding, by default it is the same as 'min_num_pictures'.
                     'num_surfaces' (int) : the number of surfaces used for mapping, by default 1
                     'surface_format' (cudaVideoSurfaceFormat) : the output surface format to use, by default selected by decide_surface_format
                     'cropping' (dict) : the cropping parameters, with keys 'left', 'top', 'right', 'bottom', by default no cropping
                     'target_size' (dict) : the target size of the output picture, with keys 'width' and 'height, by default the same as 'size'
                     'target_rect' (dict) : the target rectangle of the output picture, with keys 'left', 'top', 'right', 'bottom', by default no black margin
                 only include keys that you want to change from the default
-        """        
+            extradata (bytes, optional): codec extradata/sequence header from container (needed for VC1/WMV3)
+        """
         self.dirty = False
         self.decide = decide
         self.exception = None
@@ -507,6 +510,24 @@ class BaseDecoder:
         self.handlePictureDecodeCallback = PFNVIDDECODECALLBACK(self.catch_exception(self.handlePictureDecode))
         self.handlePictureDisplayCallback = PFNVIDDISPLAYCALLBACK(self.catch_exception(self.handlePictureDisplay))
         self.handleOperatingPointCallback = PFNVIDOPPOINTCALLBACK(self.catch_exception(self.handleOperatingPoint, -1))
+
+        # Prepare extended video info with sequence header for codecs like VC1/WMV3
+        self.ext_video_info = None
+        pExtVideoInfo = None
+        if extradata is not None and len(extradata) > 0:
+            self.ext_video_info = CUVIDEOFORMATEX()
+            # Set format info from container (needed for VC1 Simple/Main which lacks in-band headers)
+            self.ext_video_info.format.codec = codec
+            self.ext_video_info.format.coded_width = coded_width
+            self.ext_video_info.format.coded_height = coded_height
+            self.ext_video_info.format.chroma_format = 1  # YUV420 - most common
+            # Copy extradata into raw_seqhdr_data (max 1024 bytes)
+            copy_len = min(len(extradata), 1024)
+            memmove(self.ext_video_info.raw_seqhdr_data, extradata, copy_len)
+            self.ext_video_info.format.seqhdr_data_length = copy_len
+            pExtVideoInfo = pointer(self.ext_video_info)
+            log.debug(f"Passing {copy_len} bytes of extradata to parser, size={coded_width}x{coded_height}")
+
         p = CUVIDPARSERPARAMS(
             CodecType=codec,
             ulMaxNumDecodeSurfaces=0,
@@ -516,7 +537,8 @@ class BaseDecoder:
             pfnSequenceCallback=self.handleVideoSequenceCallback,
             pfnDecodePicture=self.handlePictureDecodeCallback,
             pfnDisplayPicture=self.handlePictureDisplayCallback,
-            pfnGetOperatingPoint=self.handleOperatingPointCallback
+            pfnGetOperatingPoint=self.handleOperatingPointCallback,
+            pExtVideoInfo=pExtVideoInfo
             )
         
         self.device = cuda.get_current_device(device)
@@ -559,11 +581,17 @@ class BaseDecoder:
                 payload = packet.ctypes.data_as(POINTER(c_uint8)),
                 timestamp = pts
                 )
-        self.ret = None              
+        self.ret = None
         self.exception = None
         self.on_recv = on_recv
         with cuda.Device(self.device):
-            cuda.check(nvcuvid.cuvidParseVideoData(self.cuvid_parser, byref(p)))
+            try:
+                cuda.check(nvcuvid.cuvidParseVideoData(self.cuvid_parser, byref(p)))
+            except cuda.CUError:
+                # If a callback stored an exception, raise that instead of CUError
+                if self.exception is not None:
+                    raise self.exception
+                raise
         # catch: cuvidParseVideoData will not propagate error return code 0 of HandleVideoSequenceCallback
         # it still returns CUDA_SUCCESS and simply ignore all future incoming packets
         # therefore we must check the exception here, even if the last call succeeded

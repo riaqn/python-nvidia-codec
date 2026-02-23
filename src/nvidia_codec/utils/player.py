@@ -72,7 +72,21 @@ class BasePlayer:
                 'target_size': target_size,
                 # will use default target rect (no margin)
             }
-        self.decoder = BaseDecoder(av2cuda(self.stream.codecpar.contents.codec_id), decide = decide, device = self.device)
+
+        # Extract extradata (sequence header) for codecs like VC1/WMV3 that need it
+        extradata = None
+        codecpar = self.stream.codecpar.contents
+        if codecpar.extradata_size > 0 and codecpar.extradata:
+            extradata = bytes(codecpar.extradata[:codecpar.extradata_size])
+
+        self.decoder = BaseDecoder(
+            av2cuda(codecpar.codec_id),
+            decide = decide,
+            device = self.device,
+            extradata = extradata,
+            coded_width = codecpar.width,
+            coded_height = codecpar.height
+        )
 
     @property
     def _time_base(self):
