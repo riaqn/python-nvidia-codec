@@ -10,6 +10,7 @@ Similarly one might increase the `num_surfaces` if their applications can make u
 from . import cuda
 from .nvcuvid import *
 from .common import *
+from .. import CodecNotSupportedError
 from queue import Empty, Queue
 import numpy as np
 from ctypes import *
@@ -274,7 +275,9 @@ class BaseDecoder:
 
         with cuda.Device(self.device):
             cuda.check(nvcuvid.cuvidGetDecoderCaps(byref(caps)))
-        assert caps.bIsSupported == 1, "Codec not supported"
+        if caps.bIsSupported != 1:
+            log.error(f"Codec not supported - codec={vf.codec}, chroma={vf.chroma_format}, bit_depth={vf.bit_depth_luma_minus8+8}, size={vf.coded_width}x{vf.coded_height}")
+            raise CodecNotSupportedError(f"Codec not supported: {cudaVideoCodec(vf.codec)}")
         assert vf.coded_width <= caps.nMaxWidth, "width too large"
         assert vf.coded_height <= caps.nMaxHeight, "height too large"
         assert vf.coded_width >= caps.nMinWidth, "width too small"

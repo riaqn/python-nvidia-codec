@@ -9,6 +9,7 @@ from ..ffmpeg.include.libavutil  import AV_NOPTS_VALUE, AV_TIME_BASE, AVColorRan
 from .compat import av2cuda, cuda2av, extract_stream_ptr
 from ..core.decode import BaseDecoder
 from .color import convert
+from .. import NoFrameError
 
 import torch
 
@@ -18,6 +19,7 @@ log = logging.getLogger(__name__)
 
 class BasePlayer:
     def __init__(self, url, num_surfaces, target_size = lambda h,w: (h,w),  device = None):
+        self.url = url
         self.fc = FormatContext(url)
         l = filter(lambda s: s.codecpar.contents.codec_type == AVMediaType.VIDEO, self.fc.streams)
 
@@ -181,7 +183,7 @@ class Screenshoter(BasePlayer):
                 if frame is not None:
                     return frame
                 if pic is None:
-                    return None
+                    raise NoFrameError(f"No frame found at {target} in {self.url}")
                 stream = extract_stream_ptr(torch.cuda.current_stream())
                 surface = pic.map(stream)
                 pic.free()
@@ -194,6 +196,7 @@ class Screenshoter(BasePlayer):
         last = None
 
         def on_recv(pic, time, frame):
+            nonlocal last
             if frame is not None:
                 return frame
             if pic is None:
@@ -203,8 +206,7 @@ class Screenshoter(BasePlayer):
                     frame = self.convert(surface, dtype)
                     surface.free()
                     return time, frame
-                return None
-            nonlocal last
+                raise NoFrameError(f"No frame found at {target} in {self.url}")
             stream = extract_stream_ptr(torch.cuda.current_stream())
             if target < time:
                 if last is not None:
