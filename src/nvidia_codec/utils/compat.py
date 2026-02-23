@@ -1,14 +1,29 @@
+"""Compatibility utilities for converting between FFmpeg and CUDA types.
+
+This module provides conversion functions between FFmpeg codec/format
+identifiers and their NVIDIA CUDA equivalents, as well as utilities
+for extracting raw CUDA stream pointers from various Python wrappers.
+"""
+
 def extract_stream_ptr(stream):
-    """extract cuda stream raw pointer from several known wrappers
+    """Extract raw CUDA stream pointer from various Python wrappers.
+
+    Supports CUDA stream objects from PyTorch, CuPy, PyCUDA, or raw integers.
 
     Args:
-        stream : cuda stream wrapper
-
-    Raises:
-        Exception: the cuda stream wrapper is not supported
+        stream: CUDA stream object, or None for per-thread default stream.
+            Supported types:
+            - None: Returns per-thread default stream (2)
+            - int: Returned as-is
+            - CuPy stream (has .ptr attribute)
+            - PyCUDA stream (has .handle attribute)
+            - PyTorch stream (has ._as_parameter_ attribute)
 
     Returns:
-        [int]: the raw cuda stream pointer, casted to int
+        int: Raw CUDA stream pointer.
+
+    Raises:
+        Exception: If the stream type is not recognized.
     """    
     if stream is None:
         return 2 # default to per-thread default stream
@@ -31,8 +46,26 @@ from ..ffmpeg.include.libavutil import AVPixelFormat
 from ..ffmpeg.libavcodec import AVCodecID
 from ..core.cuviddec import cudaVideoCodec, cudaVideoSurfaceFormat
 
-# convert ffmpeg things to cuda things
 def av2cuda(x):
+    """Convert FFmpeg codec ID to NVIDIA CUDA video codec.
+
+    Args:
+        x: FFmpeg AVCodecID enum value.
+
+    Returns:
+        cudaVideoCodec: Corresponding NVIDIA codec enum.
+
+    Raises:
+        Exception: If the codec is not supported by NVDEC.
+
+    Supported codecs:
+        - H.264 (AVC)
+        - HEVC (H.265)
+        - VP9
+        - AV1 (requires Ampere or newer GPU)
+        - MPEG4
+        - VC1 / WMV3
+    """
     if isinstance(x, AVCodecID):
         if x == AVCodecID.HEVC:
             return cudaVideoCodec.HEVC
@@ -52,6 +85,23 @@ def av2cuda(x):
         raise Exception(f'unknown object to adapt: {x}')
 
 def cuda2av(x):
+    """Convert NVIDIA CUDA surface format to FFmpeg pixel format.
+
+    Args:
+        x: cudaVideoSurfaceFormat enum value.
+
+    Returns:
+        AVPixelFormat: Corresponding FFmpeg pixel format.
+
+    Raises:
+        Exception: If the surface format is not supported.
+
+    Supported formats:
+        - NV12 -> YUV420P (8-bit 4:2:0)
+        - P016 -> YUV420P16LE (16-bit 4:2:0)
+        - YUV444 -> YUV444P (8-bit 4:4:4)
+        - YUV444_16Bit -> YUV444P16LE (16-bit 4:4:4)
+    """
     if isinstance(x, cudaVideoSurfaceFormat):
         if x == cudaVideoSurfaceFormat.NV12:
             return AVPixelFormat.YUV420P
