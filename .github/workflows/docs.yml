@@ -27,17 +27,31 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
       - name: Install Python dependencies
         run: |
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install pdoc
-          pip install -e .
 
       - name: Build documentation
-        run: pdoc nvidia_codec !nvidia_codec.core !nvidia_codec.ffmpeg -o docs
+        run: |
+          python -c "
+          import sys
+          from unittest.mock import MagicMock
+
+          # Mock native libraries
+          class MockCDLL:
+              def __getattr__(self, name):
+                  return MagicMock()
+
+          import ctypes
+          original_cdll = ctypes.CDLL
+          ctypes.CDLL = lambda *args, **kwargs: MockCDLL()
+          ctypes.cdll.LoadLibrary = lambda *args, **kwargs: MockCDLL()
+
+          sys.path.insert(0, 'src')
+          import pdoc
+          pdoc.pdoc('nvidia_codec', '!nvidia_codec.core', '!nvidia_codec.ffmpeg', output_directory='docs')
+          "
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
