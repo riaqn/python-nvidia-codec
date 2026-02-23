@@ -275,10 +275,7 @@ class BaseDecoder:
 
         with cuda.Device(self.device):
             cuda.check(nvcuvid.cuvidGetDecoderCaps(byref(caps)))
-        log.debug(f"Video format: codec={vf.codec}, chroma={vf.chroma_format}, bit_depth={vf.bit_depth_luma_minus8+8}, size={vf.coded_width}x{vf.coded_height}")
-        log.debug(f"Caps: supported={caps.bIsSupported}, min={caps.nMinWidth}x{caps.nMinHeight}, max={caps.nMaxWidth}x{caps.nMaxHeight}")
         if caps.bIsSupported != 1:
-            log.error(f"Codec not supported - codec={vf.codec}, chroma={vf.chroma_format}, bit_depth={vf.bit_depth_luma_minus8+8}, size={vf.coded_width}x{vf.coded_height}")
             raise CodecNotSupportedError(f"Codec not supported: {cudaVideoCodec(vf.codec)}")
         assert vf.coded_width <= caps.nMaxWidth, "width too large"
         assert vf.coded_height <= caps.nMaxHeight, "height too large"
