@@ -58,9 +58,9 @@ def convert(surface : Surface,
     format = surface.format
     
     YUV = torch.as_tensor(surface, device='cuda')
-    h,w = YUV.shape        
 
-    if format in (cudaVideoSurfaceFormat.NV12, cudaVideoSurfaceFormat.P016):   
+    if format in (cudaVideoSurfaceFormat.NV12, cudaVideoSurfaceFormat.P016):
+        h,w = YUV.shape
         assert width == w
         assert height % 2 == 0
         assert width % 2 == 0
@@ -70,14 +70,19 @@ def convert(surface : Surface,
         Y = YUV[:height,:]
         UV = YUV[height:,:]
         U = UV[:,0::2]
-        V = UV[:,1::2]    
+        V = UV[:,1::2]
     elif format in (cudaVideoSurfaceFormat.YUV444, cudaVideoSurfaceFormat.YUV444_16Bit):
-        assert width == w
-        assert height * 3 == h
-        assert YUV.dtype == torch.int16
-        Y = YUV[:height,:]
-        U = YUV[height:height * 2,:]
-        V = YUV[height*2:,:]
+        if YUV.ndim == 3:
+            Y = YUV[0]
+            U = YUV[1]
+            V = YUV[2]
+        else:
+            h,w = YUV.shape
+            assert width == w
+            assert height * 3 == h
+            Y = YUV[:height,:]
+            U = YUV[height:height * 2,:]
+            V = YUV[height*2:,:]
     else:
         raise ValueError(f'unsupported surface format {format}')
 

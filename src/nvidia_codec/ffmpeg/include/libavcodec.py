@@ -18,13 +18,15 @@ class AVCodecID(TypedCEnumeration(c_int)):
     MPEG1 = 1
     MPEG2 = 2
     MPEG4 = 12
+    WMV2 = 18
+    H264 = 27
+    RV40 = 69
     VC1 = 70
     WMV3 = 71
-    H264 = 27
     JPEG = 88
-    HEVC = 173
     VP8 = 139
     VP9 = 167
+    HEVC = 173
     AV1 = 225
 
 class AVCodecParameters(Structure):
