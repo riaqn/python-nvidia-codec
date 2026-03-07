@@ -513,6 +513,8 @@ class BaseDecoder:
         self.dirty = False
         self.decide = decide
         self.exception = None
+        self.cuvid_parser = CUvideoparser()  # NULL
+        self.cuvid_decoder = CUvideodecoder()  # NULL
 
         self.operating_point = 0
         self.disp_all_layers = False
@@ -556,9 +558,21 @@ class BaseDecoder:
             )
         
         self.device = cuda.get_current_device(device)
-        with self.condition:        
-            self.cuvid_parser = CUvideoparser() # NULL, to be filled in next 
-            self.cuvid_decoder = CUvideodecoder() # NULL, to be filled in later          
+
+        # Early codec support check before creating parser
+        # (cuvidCreateVideoParser may succeed even for unsupported codecs,
+        # then cuvidParseVideoData fails with an unhelpful "unknown error")
+        caps = CUVIDDECODECAPS(
+            eCodecType=codec,
+            eChromaFormat=1,  # YUV420 — most common
+            nBitDepthMinus8=0
+        )
+        with cuda.Device(self.device):
+            cuda.check(nvcuvid.cuvidGetDecoderCaps(byref(caps)))
+        if caps.bIsSupported != 1:
+            raise CodecNotSupportedError(f"Codec not supported: {cudaVideoCodec(codec)}")
+
+        with self.condition:
             cuda.check(nvcuvid.cuvidCreateVideoParser(byref(self.cuvid_parser), byref(p)))
             self.condition.notify_all()
 
