@@ -63,11 +63,14 @@ def av2cuda(x):
         - HEVC (H.265)
         - VP9
         - AV1 (requires Ampere or newer GPU)
+        - MPEG2
         - MPEG4
         - VC1 / WMV3
     """
     if isinstance(x, AVCodecID):
-        if x == AVCodecID.HEVC:
+        if x == AVCodecID.MPEG2:
+            return cudaVideoCodec.MPEG2
+        elif x == AVCodecID.HEVC:
             return cudaVideoCodec.HEVC
         elif x == AVCodecID.H264:
             return cudaVideoCodec.H264
