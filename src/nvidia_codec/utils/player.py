@@ -249,6 +249,8 @@ class BasePlayer:
 
     def pts2time(self, pts : int):
         """Convert a presentation timestamp (PTS) to timedelta."""
+        if pts == AV_NOPTS_VALUE:
+            return None
         return timedelta(seconds = float((int(pts) - int(self._start_time)) * self._time_base))
 
     def convert(self, surface, dtype):
@@ -284,7 +286,7 @@ class BasePlayer:
             return on_recv(pic, self.pts2time(pts), ret)
         
         for pkt in it:
-            pts = pkt.av.pts
+            pts = pkt.av.pts if pkt.av.pts != AV_NOPTS_VALUE else pkt.av.dts
             arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
             ret = self.decoder.send(arr, on_recv_, pts)
             if ret is not None:
