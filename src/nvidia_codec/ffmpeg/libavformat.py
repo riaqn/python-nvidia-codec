@@ -36,7 +36,8 @@ class FormatContext:
         self.av = ptr.contents
 
     def __del__(self):
-        lib.avformat_close_input(byref(pointer(self.av)))
+        if hasattr(self, 'av'):
+            lib.avformat_close_input(byref(pointer(self.av)))
     
     def read_packet(self, pkt : Packet):
         check(lib.av_read_frame(byref(self.av), byref(pkt.av)))
