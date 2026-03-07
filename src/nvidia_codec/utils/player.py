@@ -26,6 +26,7 @@ import numpy as np
 from ..ffmpeg.libavcodec import BSFContext
 from ..ffmpeg.libavformat import FormatContext, AVMediaType, AVCodecID
 from ..ffmpeg.include.libavutil  import AV_NOPTS_VALUE, AV_TIME_BASE, AVColorRange, AVColorSpace
+from ..ffmpeg.libavutil import dict_get
 from .compat import av2cuda, cuda2av, extract_stream_ptr
 from ..core.decode import BaseDecoder
 from .color import convert
@@ -93,17 +94,9 @@ class BasePlayer:
             else:
                 self._start_time = int(self._start_time / AV_TIME_BASE / self._time_base)                
 
-        self._duration = self.stream.duration
-        if self._duration == AV_NOPTS_VALUE:
-            # if stream duration is unknown,
-            # get the whole file duration
-            self._duration = self.fc.av.duration
-            if self._duration == AV_NOPTS_VALUE:
-                log.warning('cannot infer duration')
-                self._duration = None
-            else:
-                # remember to convert to stream' time base
-                self._duration = int(self._duration / AV_TIME_BASE / self._time_base)
+        self._duration = self._infer_duration()
+        if self._duration is None:
+            log.warning('cannot infer duration')
 
         codec_id = self.stream.codecpar.contents.codec_id
         if codec_id == AVCodecID.HEVC:
@@ -146,6 +139,33 @@ class BasePlayer:
     def _time_base(self):
         """Stream time base as a Fraction (internal use)."""
         return Fraction(self.stream.time_base.num, self.stream.time_base.den)
+
+    def _infer_duration(self):
+        """Try to determine video duration from various sources.
+
+        Returns duration in stream time_base units, or None if unknown.
+        """
+        tb = self._time_base
+
+        # 1. stream duration
+        d = self.stream.duration
+        if d != AV_NOPTS_VALUE:
+            return d
+
+        # 2. stream metadata tag (e.g. MKV DURATION-eng)
+        for key in ('DURATION', 'DURATION-eng'):
+            tag = dict_get(self.stream.metadata, key)
+            if tag:
+                h, m, s = tag.split(':')
+                td = timedelta(hours=int(h), minutes=int(m), seconds=float(s))
+                return int(td.total_seconds() / tb)
+
+        # 3. container duration (in AV_TIME_BASE units)
+        d = self.fc.av.duration
+        if d != AV_NOPTS_VALUE:
+            return int(d / AV_TIME_BASE / tb)
+
+        return None
 
     @property
     def width(self):

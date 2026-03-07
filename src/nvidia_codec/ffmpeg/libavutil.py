@@ -1,6 +1,17 @@
 from ctypes import *
+from .include.libavutil import AVDictionaryEntry
 
 lib = cdll.LoadLibrary('libavutil.so')
+
+lib.av_dict_get.restype = POINTER(AVDictionaryEntry)
+lib.av_dict_get.argtypes = [c_void_p, c_char_p, c_void_p, c_int]
+
+def dict_get(metadata, key):
+    """Get a metadata tag value. Returns string or None."""
+    entry = lib.av_dict_get(metadata, key.encode('utf-8'), None, 0)
+    if entry:
+        return entry.contents.value.decode('utf-8')
+    return None
 
 def strerror(errnum):
     buf = (c_char * 256)()
