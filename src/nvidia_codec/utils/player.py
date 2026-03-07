@@ -166,6 +166,11 @@ class BasePlayer:
                 td = timedelta(hours=int(h), minutes=int(m), seconds=float(s))
                 return int(td.total_seconds() / tb)
 
+        # 4. container duration (AV_TIME_BASE units)
+        d = self.fc.av.duration
+        if d > 0:
+            return int(d / AV_TIME_BASE / tb)
+
         return None
 
     @property
@@ -190,7 +195,9 @@ class BasePlayer:
 
     @property
     def duration(self):
-        """Video duration as a timedelta."""
+        """Video duration as a timedelta, or None if unknown."""
+        if self._duration is None:
+            return None
         return timedelta(seconds = float(self._duration * self._time_base))
 
     def color_space(self, default = AVColorSpace.UNSPECIFIED):
