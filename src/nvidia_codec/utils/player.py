@@ -147,23 +147,24 @@ class BasePlayer:
         """
         tb = self._time_base
 
-        # 1. stream duration
+        # 1. stream duration (from container header)
         d = self.stream.duration
         if d != AV_NOPTS_VALUE:
             return d
 
-        # 2. stream metadata tag (e.g. MKV DURATION-eng)
+        # 2. probe the file to populate stream duration
+        self.fc.find_stream_info()
+        d = self.stream.duration
+        if d != AV_NOPTS_VALUE:
+            return d
+
+        # 3. stream metadata tag (e.g. MKV DURATION-eng)
         for key in ('DURATION', 'DURATION-eng'):
             tag = dict_get(self.stream.metadata, key)
             if tag:
                 h, m, s = tag.split(':')
                 td = timedelta(hours=int(h), minutes=int(m), seconds=float(s))
                 return int(td.total_seconds() / tb)
-
-        # 3. container duration (in AV_TIME_BASE units)
-        d = self.fc.av.duration
-        if d != AV_NOPTS_VALUE:
-            return int(d / AV_TIME_BASE / tb)
 
         return None
 
