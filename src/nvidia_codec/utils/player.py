@@ -98,6 +98,8 @@ class BasePlayer:
         if self._duration is None:
             log.warning('cannot infer duration')
 
+        self._prepend_extradata = False
+
         codec_id = self.stream.codecpar.contents.codec_id
         if codec_id == AVCodecID.HEVC:
             f = 'hevc_mp4toannexb'
@@ -249,6 +251,7 @@ class BasePlayer:
 
         self.bsf.flush()
         self.decoder.flush()
+        self._prepend_extradata = True
 
     def time2pts(self, time: timedelta):
         """Convert a timedelta to presentation timestamp (PTS)."""
@@ -295,6 +298,12 @@ class BasePlayer:
         for pkt in it:
             pts = pkt.av.pts if pkt.av.pts != AV_NOPTS_VALUE else pkt.av.dts
             arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
+            if self._prepend_extradata:
+                par_out = self.bsf.av.par_out.contents
+                if par_out.extradata_size > 0 and par_out.extradata:
+                    extradata = bytes(par_out.extradata[:par_out.extradata_size])
+                    arr = np.concatenate([np.frombuffer(extradata, dtype=np.uint8), arr])
+                self._prepend_extradata = False
             ret = self.decoder.send(arr, on_recv_, pts)
             if ret is not None:
                 return ret
