@@ -14,9 +14,8 @@ Example usage:
 
     # Extract a single frame at a specific timestamp
     from nvidia_codec.utils import Screenshoter
-    ss = Screenshoter('/path/to/video.mp4')
-    time, frame = ss.screenshot(timedelta(seconds=30), torch.uint8)
-    ss.free()
+    with Screenshoter('/path/to/video.mp4') as ss:
+        time, frame = ss.screenshot(timedelta(seconds=30), torch.uint8)
 """
 from datetime import timedelta
 from fractions import Fraction
@@ -236,6 +235,16 @@ class BasePlayer:
             log.debug(f'color range is {r}')
             return r
 
+    def free(self):
+        """Release decoder resources."""
+        self.decoder.free()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.free()
+
     def seek(self, target : timedelta):
         """Seek to a target timestamp in the video.
 
@@ -380,13 +389,13 @@ class Screenshoter(BasePlayer):
     streaming the entire video.
 
     Example:
-        ss = Screenshoter('/path/to/video.mp4')
-        time, frame = ss.screenshot(timedelta(seconds=30), torch.uint8)
-        # frame is [C, H, W] tensor on GPU
-        ss.free()  # Release decoder resources
+        with Screenshoter('/path/to/video.mp4') as ss:
+            time, frame = ss.screenshot(timedelta(seconds=30), torch.uint8)
+            # frame is [C, H, W] tensor on GPU
 
         # With accurate seeking (slower but exact timestamp)
-        time, frame = ss.screenshot(timedelta(seconds=30), torch.float32, accurate=True)
+        with Screenshoter('video.mp4') as ss:
+            time, frame = ss.screenshot(timedelta(seconds=30), torch.float32, accurate=True)
     """
 
     def __init__(self, url, target_size = lambda h,w : (h,w), device = None):
@@ -474,10 +483,3 @@ class Screenshoter(BasePlayer):
         frame = self.decode(on_recv)
         return frame
 
-    def free(self):
-        """Release decoder resources.
-
-        Call this method when done using the Screenshoter to free GPU memory.
-        After calling free(), the Screenshoter should not be used again.
-        """
-        self.decoder.free()

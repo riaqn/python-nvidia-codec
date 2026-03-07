@@ -647,3 +647,9 @@ class BaseDecoder:
 
     def __del__(self):
         self.free()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.free()
