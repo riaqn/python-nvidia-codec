@@ -1,30 +1,20 @@
-import itertools
-from nvidia_codec.utils.player import Player
+from nvidia_codec.utils import Player
 import torch
-
-# import faulthandler
 from tqdm import tqdm
+import sys
 
-import numpy as np
-# faulthandler.enable()
-
-def test(deviceID, path):
+def test(path):
     '''
-    Simply decode a video file without any further action
+    Decode all frames of a video file and display progress.
     '''
+    player = Player(path)
+    print(f'Duration: {player.duration}')
 
+    for i, (time, frame) in enumerate(tqdm(player.frames(torch.float))):
+        pass  # frame is [3, H, W] tensor on GPU
 
-    player = Player(path, device = deviceID)
-    
-    bar = tqdm(itertools.count())
-    for i in bar:
-        time = player.skip_frame()
-        # seconds = (pts - stream.start_time) * float(stream.time_base)
-        # delta = timedelta(seconds=)
-        bar.set_description(f'{time}')
+    print(f'Decoded {i+1} frames')
 
 if __name__ == '__main__':
-    import sys
-    deviceID = int(sys.argv[1])
-    path = sys.argv[2]
-    test(deviceID, path)
+    path = sys.argv[1]
+    test(path)
