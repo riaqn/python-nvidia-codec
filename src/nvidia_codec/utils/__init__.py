@@ -2,8 +2,7 @@
 
 This module exports the main user-facing classes:
     - Player: Decode video frames (streaming and screenshot)
-    - Screenshoter: Alias for Player (backward compatibility)
     - extract_stream_ptr: Helper for CUDA stream interoperability
 """
 from .compat import extract_stream_ptr
-from .player import Screenshoter, Player
+from .player import Player

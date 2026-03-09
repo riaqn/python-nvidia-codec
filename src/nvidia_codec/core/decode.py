@@ -255,7 +255,7 @@ class BaseDecoder:
 
     Decodes video packets using NVIDIA's CUVID API. For each decoded frame,
     the provided on_recv callback is invoked with a Picture object. This
-    is the low-level decoder; most users should use Player or Screenshoter
+    is the low-level decoder; most users should use Player
     from nvidia_codec.utils instead.
 
     The decoder manages GPU memory pools for Pictures and Surfaces. Configure

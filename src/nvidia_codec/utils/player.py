@@ -287,8 +287,8 @@ class BasePlayer:
     def decode(self, on_recv, keyframes_only=False):
         """Decode packets and invoke callback for each decoded frame.
 
-        This is a low-level method used internally by Player and Screenshoter.
-        For most use cases, use Player.frames() or Screenshoter.screenshot() instead.
+        This is a low-level method used internally.
+        For most use cases, use Player.frames() or Player.screenshot() instead.
 
         Args:
             on_recv: Callback function (picture, time, accumulator) -> result.
@@ -415,6 +415,4 @@ class Player(BasePlayer):
         if last is not None:
             return last
         raise NoFrameError(f"No frame found at {target} in {self.url}")
-
-Screenshoter = Player
 

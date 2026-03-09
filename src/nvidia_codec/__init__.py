@@ -4,7 +4,7 @@ This package provides a Pythonic interface to NVIDIA's NVDEC hardware video
 decoder, allowing fast GPU-accelerated video decoding with PyTorch integration.
 
 Quick Start:
-    from nvidia_codec.utils import Player, Screenshoter
+    from nvidia_codec.utils import Player
     import torch
 
     # Stream all frames from a video
@@ -13,9 +13,8 @@ Quick Start:
         process(frame)  # frame is [C, H, W] tensor on GPU
 
     # Extract a single frame
-    ss = Screenshoter('/path/to/video.mp4')
-    time, frame = ss.screenshot(timedelta(seconds=30), torch.uint8)
-    ss.free()
+    with Player('/path/to/video.mp4') as player:
+        time, frame = player.screenshot(timedelta(seconds=30), torch.uint8)
 
 Requirements:
     - NVIDIA GPU with NVDEC support

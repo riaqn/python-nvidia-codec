@@ -1,4 +1,4 @@
-from nvidia_codec.utils import Screenshoter
+from nvidia_codec.utils import Player
 from nvidia_codec import NoFrameError
 from datetime import timedelta
 from PIL import Image
@@ -8,7 +8,7 @@ import torch
 
 _, path, seconds, out = sys.argv
 
-with Screenshoter(path, lambda h, w: (h // 4 * 2, w // 4 * 2)) as player:
+with Player(path, lambda h, w: (h // 4 * 2, w // 4 * 2)) as player:
     try:
         time, tensor = player.screenshot(timedelta(seconds=int(seconds)), torch.uint8)
     except NoFrameError as e:
