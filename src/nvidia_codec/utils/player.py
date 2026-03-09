@@ -24,6 +24,7 @@ import numpy as np
 
 from ..ffmpeg.libavcodec import BSFContext
 from ..ffmpeg.libavformat import FormatContext, AVMediaType, AVCodecID
+from ..ffmpeg.include.libavcodec import AV_PKT_FLAG_KEY
 from ..ffmpeg.include.libavutil  import AV_NOPTS_VALUE, AV_TIME_BASE, AVColorRange, AVColorSpace
 from ..ffmpeg.libavutil import dict_get
 from .compat import av2cuda, cuda2av, extract_stream_ptr
@@ -284,7 +285,7 @@ class BasePlayer:
         """
         return convert(surface, self.color_space(AVColorSpace.BT470BG), self.color_range(AVColorRange.MPEG), dtype)
 
-    def decode(self, on_recv):
+    def decode(self, on_recv, keyframes_only=False):
         """Decode packets and invoke callback for each decoded frame.
 
         This is a low-level method used internally by Player and Screenshoter.
@@ -295,15 +296,19 @@ class BasePlayer:
                 Called for each decoded frame. picture is a Picture object
                 (or None at end of stream), time is a timedelta, and accumulator
                 is the return value from the previous on_recv call.
+            keyframes_only: If True, only decode keyframe (I-frame) packets.
 
         Returns:
             The final return value from on_recv.
         """
-        it = self.bsf.filter(self.fc.read_packets(self.stream), flush = False, reuse = True)
+        packets = self.fc.read_packets(self.stream)
+        if keyframes_only:
+            packets = (pkt for pkt in packets if pkt.av.flags & AV_PKT_FLAG_KEY)
+        it = self.bsf.filter(packets, flush=False, reuse=True)
 
         def on_recv_(pic, pts, ret):
             return on_recv(pic, self.pts2time(pts), ret)
-        
+
         for pkt in it:
             pts = pkt.av.pts if pkt.av.pts != AV_NOPTS_VALUE else pkt.av.dts
             arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
@@ -346,15 +351,13 @@ class Player(BasePlayer):
         """
         super().__init__(url, num_surfaces=1, target_size=target_size, device=device)
 
-    def frames(self, dtype : torch.dtype):
-        """Iterate over all frames in the video.
-
-        Yields frames from the beginning of the video to the end. Each frame
-        is converted from YUV to RGB and returned as a PyTorch tensor.
+    def frames(self, dtype : torch.dtype, keyframes_only=False):
+        """Iterate over frames in the video.
 
         Args:
             dtype: PyTorch dtype for output tensors. Use torch.float32 for
                 normalized [0, 1] values or torch.uint8 for [0, 255] values.
+            keyframes_only: If True, only decode keyframe (I-frame) packets.
 
         Yields:
             Tuple of (time, frame) where:
@@ -375,7 +378,7 @@ class Player(BasePlayer):
             return frames
 
         while True:
-            frames = self.decode(on_recv)
+            frames = self.decode(on_recv, keyframes_only=keyframes_only)
             if frames is None:
                 break
             yield from frames
