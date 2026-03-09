@@ -13,9 +13,8 @@ Example usage:
         process(frame)
 
     # Extract a single frame at a specific timestamp
-    from nvidia_codec.utils import Screenshoter
-    with Screenshoter('/path/to/video.mp4') as ss:
-        time, frame = ss.screenshot(timedelta(seconds=30), torch.uint8)
+    with Player('/path/to/video.mp4') as player:
+        time, frame = player.screenshot(timedelta(seconds=30), torch.uint8)
 """
 from datetime import timedelta
 from fractions import Fraction
@@ -324,11 +323,10 @@ class BasePlayer:
         return self.decoder.send(None, on_recv_, 0)
 
 class Player(BasePlayer):
-    """Video player for streaming all frames from a video file.
+    """Video player for decoding frames from a video file.
 
-    This class provides an iterator interface to decode and yield all frames
-    from a video file. Frames are decoded using NVIDIA hardware and returned
-    as PyTorch tensors on the GPU.
+    Supports both streaming all frames and extracting individual frames
+    at specific timestamps, using NVIDIA hardware decoding.
 
     Example:
         player = Player('/path/to/video.mp4')
@@ -336,8 +334,9 @@ class Player(BasePlayer):
             # time is a timedelta, frame is [C, H, W] tensor on GPU
             process(frame)
 
-        # With scaling to 720p
-        player = Player('video.mp4', target_size=lambda h,w: (720, 1280))
+        # Extract a frame at a specific timestamp
+        with Player('video.mp4') as player:
+            time, frame = player.screenshot(timedelta(seconds=30), torch.uint8)
     """
 
     def __init__(self, url, target_size = lambda h,w: (h,w), device = None):
@@ -349,7 +348,7 @@ class Player(BasePlayer):
                 scaling. Default is no scaling.
             device: CUDA device ID. If None, uses current device.
         """
-        super().__init__(url, num_surfaces=1, target_size=target_size, device=device)
+        super().__init__(url, num_surfaces=2, target_size=target_size, device=device)
 
     def frames(self, dtype : torch.dtype, keyframes_only=False):
         """Iterate over frames in the video.
@@ -383,35 +382,6 @@ class Player(BasePlayer):
                 break
             yield from frames
 
-class Screenshoter(BasePlayer):
-    """Video frame extractor for capturing frames at specific timestamps.
-
-    This class is optimized for extracting individual frames from a video
-    at specified timestamps, using NVIDIA hardware decoding. It's more
-    efficient than Player when you only need specific frames rather than
-    streaming the entire video.
-
-    Example:
-        with Screenshoter('/path/to/video.mp4') as ss:
-            time, frame = ss.screenshot(timedelta(seconds=30), torch.uint8)
-            # frame is [C, H, W] tensor on GPU
-
-        # With accurate seeking (slower but exact timestamp)
-        with Screenshoter('video.mp4') as ss:
-            time, frame = ss.screenshot(timedelta(seconds=30), torch.float32, accurate=True)
-    """
-
-    def __init__(self, url, target_size = lambda h,w : (h,w), device = None):
-        """Initialize the screenshoter with a video file.
-
-        Args:
-            url: Path or URL to the video file.
-            target_size: Function (height, width) -> (new_height, new_width) for
-                scaling. Default is no scaling.
-            device: CUDA device ID. If None, uses current device.
-        """
-        super().__init__(url, 2, target_size, device=device)
-
     def screenshot(self, target : timedelta, dtype : torch.dtype, accurate : bool = False):
         """Extract a frame at the specified timestamp.
 
@@ -434,55 +404,17 @@ class Screenshoter(BasePlayer):
         """
         self.seek(target)
 
-        if not accurate:
-            def on_recv(pic, time, frame):
-                if frame is not None:
-                    return frame
-                if pic is None:
-                    raise NoFrameError(f"No frame found at {target} in {self.url}")
-                stream = extract_stream_ptr(torch.cuda.current_stream())
-                surface = pic.map(stream)
-                pic.free()
-                frame = self.convert(surface, dtype)
-                surface.free()
-                return time, frame
-
-            return self.decode(on_recv)
-
         last = None
-
-        def on_recv(pic, time, frame):
-            nonlocal last
-            if frame is not None:
-                return frame
-            if pic is None:
-                # End of stream - return last frame if we have one
-                if last is not None:
-                    time, surface = last
-                    frame = self.convert(surface, dtype)
-                    surface.free()
-                    return time, frame
-                raise NoFrameError(f"No frame found at {target} in {self.url}")
-            stream = extract_stream_ptr(torch.cuda.current_stream())
-            if target < time:
-                if last is not None:
-                    pic.free() # current pic not needed
-                    time, surface = last
-                else:
-                    # first frame is already past target, use it
-                    surface = pic.map(stream)
-                    pic.free()
-                frame = self.convert(surface, dtype)
-                surface.free()
+        for time, frame in self.frames(dtype):
+            if not accurate:
                 return time, frame
-            else:
-                if last is not None: # free the last surface
-                    last[1].free()
-                surface = pic.map(stream)
-                pic.free()
-                last = (time, surface)
-                return None
+            if time > target:
+                break
+            last = (time, frame)
 
-        frame = self.decode(on_recv)
-        return frame
+        if last is not None:
+            return last
+        raise NoFrameError(f"No frame found at {target} in {self.url}")
+
+Screenshoter = Player
 
