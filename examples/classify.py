@@ -6,7 +6,7 @@ from tqdm import tqdm
 import numpy as np
 import sys
 
-from nvidia_codec.utils import Screenshoter
+from nvidia_codec.utils import Player
 from nvidia_codec import NoFrameError
 
 import requests
@@ -28,7 +28,7 @@ def test(path):
         w = int(math.sqrt(pixels / aspect) // 2) * 2
         return h, w
 
-    with Screenshoter(path, target_size) as player:
+    with Player(path, target_size) as player:
         if player.duration is None:
             print(f'Cannot determine duration for {path}')
             return

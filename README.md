@@ -29,7 +29,7 @@ pip install -e .
 ### Screenshot (single frame extraction)
 
 ```python
-from nvidia_codec.utils import Screenshoter
+from nvidia_codec.utils import Player
 from datetime import timedelta
 import torch
 
@@ -38,16 +38,14 @@ def target_size(h, w):
     scale = min(1920 / w, 1080 / h, 1.0)
     return (int(h * scale) // 2 * 2, int(w * scale) // 2 * 2)
 
-player = Screenshoter('/path/to/video.mp4', target_size=target_size, device=0)
-print(f'Duration: {player.duration}')
+with Player('/path/to/video.mp4', target_size=target_size, device=0) as player:
+    print(f'Duration: {player.duration}')
 
-# Get frame at 10 seconds (fast keyframe seek by default)
-timestamp, frame = player.screenshot(timedelta(seconds=10), torch.uint8)
+    # Get frame at 10 seconds (fast keyframe seek by default)
+    timestamp, frame = player.screenshot(timedelta(seconds=10), torch.uint8)
 
-# For precise frame timing, use accurate=True (slower)
-timestamp, frame = player.screenshot(timedelta(seconds=10), torch.uint8, accurate=True)
-
-player.free()
+    # For precise frame timing, use accurate=True (slower)
+    timestamp, frame = player.screenshot(timedelta(seconds=10), torch.uint8, accurate=True)
 ```
 
 ### Decode all frames
