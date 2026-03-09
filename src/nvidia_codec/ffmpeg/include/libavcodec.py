@@ -69,6 +69,12 @@ class AVBSFContext(Structure):
     ]
 
 
+AV_PKT_FLAG_KEY     = 0x0001
+AV_PKT_FLAG_CORRUPT = 0x0002
+AV_PKT_FLAG_DISCARD = 0x0004
+AV_PKT_FLAG_TRUSTED = 0x0008
+AV_PKT_FLAG_DISPOSABLE = 0x0010
+
 class AVPacket(Structure):
     _fields_ = [
         ('buf', c_void_p),
