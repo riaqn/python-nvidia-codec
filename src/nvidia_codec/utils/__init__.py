@@ -1,8 +1,8 @@
 """High-level utilities for video decoding.
 
 This module exports the main user-facing classes:
-    - Player: Stream all frames from a video file
-    - Screenshoter: Extract individual frames at specific timestamps
+    - Player: Decode video frames (streaming and screenshot)
+    - Screenshoter: Alias for Player (backward compatibility)
     - extract_stream_ptr: Helper for CUDA stream interoperability
 """
 from .compat import extract_stream_ptr
