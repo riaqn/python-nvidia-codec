@@ -57,7 +57,7 @@ def convert(surface : Surface,
 
     format = surface.format
     
-    YUV = torch.as_tensor(surface, device='cuda')
+    YUV = torch.as_tensor(surface, device=f'cuda:{surface.decoder.device}')
 
     if format in (cudaVideoSurfaceFormat.NV12, cudaVideoSurfaceFormat.P016):
         h,w = YUV.shape
@@ -115,7 +115,7 @@ def convert(surface : Surface,
     else:
         raise Exception(f"Unsupported color space {source_space}")
 
-    m = torch.as_tensor(m, device='cuda')
+    m = torch.as_tensor(m, device=YUV.device)
 
     y = torch.tensordot(m[:,0], y, ([], [])) # will be shape 3, h,w
     u = torch.tensordot(m[:,1], u, ([], []))
