@@ -399,7 +399,7 @@ class Player(BasePlayer):
         def on_recv(pic, time, frames):
             if pic is None:
                 return frames
-            stream = extract_stream_ptr(torch.cuda.current_stream())
+            stream = extract_stream_ptr(torch.cuda.current_stream(self.device))
             surface = pic.map(stream)
             pic.free()
             frame = self.convert(surface, dtype)
