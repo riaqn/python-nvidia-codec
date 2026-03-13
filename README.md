@@ -26,6 +26,20 @@ pip install -e .
 
 ## Usage
 
+### Decode all frames
+
+```python
+from nvidia_codec.utils import Player
+import torch
+
+# Simplest: decode at native resolution
+player = Player('/path/to/video.mp4')
+
+for timestamp, frame in player.frames(torch.uint8):
+    # frame is a torch tensor on GPU (CHW format)
+    print(f'{timestamp}: {frame.shape}')
+```
+
 ### Screenshot (single frame extraction)
 
 ```python
@@ -33,12 +47,7 @@ from nvidia_codec.utils import Player
 from datetime import timedelta
 import torch
 
-# Optional: resize frames to fit within target dimensions
-def target_size(h, w):
-    scale = min(1920 / w, 1080 / h, 1.0)
-    return (int(h * scale) // 2 * 2, int(w * scale) // 2 * 2)
-
-with Player('/path/to/video.mp4', target_size=target_size, device=0) as player:
+with Player('/path/to/video.mp4') as player:
     print(f'Duration: {player.duration}')
 
     # Get frame at 10 seconds (fast keyframe seek by default)
@@ -48,17 +57,27 @@ with Player('/path/to/video.mp4', target_size=target_size, device=0) as player:
     timestamp, frame = player.screenshot(timedelta(seconds=10), torch.uint8, accurate=True)
 ```
 
-### Decode all frames
+### Advanced: crop, scale, and letterbox in hardware
+
+All post-processing is done by the NVDEC hardware during decoding — no extra GPU passes needed.
 
 ```python
 from nvidia_codec.utils import Player
 import torch
 
-player = Player('/path/to/video.mp4', device=0)
+player = Player(
+    '/path/to/video.mp4',
+    # Crop 100px from left/right, 50px from top/bottom
+    cropping=lambda h, w: {'left': 100, 'top': 50, 'right': w - 100, 'bottom': h - 50},
+    # Output buffer dimensions
+    target_size=lambda h, w: (384, 384),
+    # Place frame centered vertically; scaled to fit this rect, black bars outside
+    target_rect=lambda h, w: {'left': 0, 'top': 36, 'right': 384, 'bottom': 348},
+)
 
-for timestamp, frame in player.frames(torch.uint8):
-    # frame is a torch tensor on GPU (CHW format)
-    print(f'{timestamp}: {frame.shape}')
+for timestamp, frame in player.frames(torch.float32):
+    # frame is [3, 384, 384] with letterboxing
+    process(frame)
 ```
 
 ## Supported Codecs

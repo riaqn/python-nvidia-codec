@@ -5,7 +5,7 @@ NVIDIA's NVDEC hardware decoder. The decoded frames are returned as PyTorch
 tensors on the GPU.
 
 Example usage:
-    # Stream all frames from a video
+    # Stream all frames at native resolution (simplest usage)
     from nvidia_codec.utils import Player
     player = Player('/path/to/video.mp4')
     for time, frame in player.frames(torch.float32):
@@ -15,6 +15,14 @@ Example usage:
     # Extract a single frame at a specific timestamp
     with Player('/path/to/video.mp4') as player:
         time, frame = player.screenshot(timedelta(seconds=30), torch.uint8)
+
+    # Advanced: crop, scale, and letterbox in hardware
+    player = Player(
+        '/path/to/video.mp4',
+        cropping=lambda h, w: {'left': 100, 'top': 50, 'right': w - 100, 'bottom': h - 50},
+        target_size=lambda h, w: (384, 384),
+        target_rect=lambda h, w: {'left': 0, 'top': 36, 'right': 384, 'bottom': 348},
+    )
 """
 from datetime import timedelta
 from fractions import Fraction
@@ -51,21 +59,27 @@ class BasePlayer:
         url: Path or URL of the video file.
         width: Original video width in pixels.
         height: Original video height in pixels.
-        target_width: Output width after scaling (if target_size was specified).
-        target_height: Output height after scaling (if target_size was specified).
+        target_width: Output buffer width in pixels (if target_size was specified).
+        target_height: Output buffer height in pixels (if target_size was specified).
         duration: Video duration as a timedelta.
     """
 
-    def __init__(self, url, num_surfaces, target_size = lambda h,w: (h,w),  device = None):
+    def __init__(self, url, num_surfaces, target_size = None, cropping = None, target_rect = None, device = None):
         """Initialize the player with a video file.
 
         Args:
             url: Path or URL to the video file.
             num_surfaces: Number of output surfaces to allocate. More surfaces
                 allow holding multiple decoded frames simultaneously.
-            target_size: Function (height, width) -> (new_height, new_width) for
-                scaling the output. The decoder performs scaling in hardware.
-                Default is no scaling (identity function).
+            target_size: Function (height, width) -> (new_height, new_width) defining
+                the output buffer dimensions. Default is native resolution.
+            cropping: Function (height, width) -> {'left', 'top', 'right', 'bottom'}
+                defining the source crop rectangle. Default is no cropping (full frame).
+            target_rect: Function (target_height, target_width) -> {'left', 'top', 'right', 'bottom'}
+                defining where within the output buffer the frame is placed. The
+                source (or cropped region) is scaled to fit this rectangle. Area
+                outside is filled with black (letterboxing). Default fills the
+                entire target buffer.
             device: CUDA device ID to use for decoding. If None, uses the
                 current device from torch.cuda.current_device().
 
@@ -112,14 +126,17 @@ class BasePlayer:
 
         self.device = torch.cuda.current_device() if device is None else device
         def decide(p):
-            return {
+            d = {
                 'num_pictures': p['min_num_pictures'], # to be safe
                 'num_surfaces': num_surfaces,
-                # will use default surface_format
-                # will use default cropping (no cropping)
-                'target_size': target_size,
-                # will use default target rect (no margin)
             }
+            if target_size is not None:
+                d['target_size'] = target_size
+            if cropping is not None:
+                d['cropping'] = cropping
+            if target_rect is not None:
+                d['target_rect'] = target_rect
+            return d
 
         # Extract extradata (sequence header) for codecs like VC1/WMV3 that need it
         extradata = None
@@ -329,6 +346,7 @@ class Player(BasePlayer):
     at specific timestamps, using NVIDIA hardware decoding.
 
     Example:
+        # Simplest: native resolution, all frames
         player = Player('/path/to/video.mp4')
         for time, frame in player.frames(torch.float32):
             # time is a timedelta, frame is [C, H, W] tensor on GPU
@@ -337,18 +355,33 @@ class Player(BasePlayer):
         # Extract a frame at a specific timestamp
         with Player('video.mp4') as player:
             time, frame = player.screenshot(timedelta(seconds=30), torch.uint8)
+
+        # Advanced: crop center, scale to 384x384, letterbox with black bars
+        player = Player(
+            '/path/to/video.mp4',
+            cropping=lambda h, w: {'left': 100, 'top': 50, 'right': w - 100, 'bottom': h - 50},
+            target_size=lambda h, w: (384, 384),
+            target_rect=lambda h, w: {'left': 0, 'top': 36, 'right': 384, 'bottom': 348},
+        )
     """
 
-    def __init__(self, url, target_size = lambda h,w: (h,w), device = None):
+    def __init__(self, url, target_size = None, cropping = None, target_rect = None, device = None):
         """Initialize the player with a video file.
 
         Args:
             url: Path or URL to the video file.
-            target_size: Function (height, width) -> (new_height, new_width) for
-                scaling. Default is no scaling.
+            target_size: Function (height, width) -> (new_height, new_width) defining
+                the output buffer dimensions. Default is native resolution.
+            cropping: Function (height, width) -> {'left', 'top', 'right', 'bottom'}
+                defining the source crop rectangle. Default is no cropping (full frame).
+            target_rect: Function (target_height, target_width) -> {'left', 'top', 'right', 'bottom'}
+                defining where within the output buffer the frame is placed. The
+                source (or cropped region) is scaled to fit this rectangle. Area
+                outside is filled with black (letterboxing). Default fills the
+                entire target buffer.
             device: CUDA device ID. If None, uses current device.
         """
-        super().__init__(url, num_surfaces=2, target_size=target_size, device=device)
+        super().__init__(url, num_surfaces=2, target_size=target_size, cropping=cropping, target_rect=target_rect, device=device)
 
     def frames(self, dtype : torch.dtype, keyframes_only=False):
         """Iterate over frames in the video.
