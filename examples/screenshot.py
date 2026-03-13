@@ -8,7 +8,11 @@ import torch
 
 _, path, seconds, out = sys.argv
 
-with Player(path, lambda h, w: (h // 4 * 2, w // 4 * 2)) as player:
+# Simple: screenshot at native resolution
+# with Player(path) as player:
+
+# With scaling: downscale by 2x
+with Player(path, target_size=lambda h, w: (h // 4 * 2, w // 4 * 2)) as player:
     try:
         time, tensor = player.screenshot(timedelta(seconds=int(seconds)), torch.uint8)
     except NoFrameError as e:

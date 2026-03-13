@@ -22,13 +22,14 @@ def test(path):
 
     pixels = 384 * 384
 
+    # Scale to ~384x384 pixels while preserving aspect ratio
     def target_size(h, w):
         aspect = h / w
         h = int(math.sqrt(pixels * aspect) // 2) * 2
         w = int(math.sqrt(pixels / aspect) // 2) * 2
         return h, w
 
-    with Player(path, target_size) as player:
+    with Player(path, target_size=target_size) as player:
         if player.duration is None:
             print(f'Cannot determine duration for {path}')
             return
