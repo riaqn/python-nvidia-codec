@@ -32,7 +32,7 @@ import numpy as np
 from ..ffmpeg.libavcodec import BSFContext
 from ..ffmpeg.libavformat import FormatContext, AVMediaType, AVCodecID
 from ..ffmpeg.include.libavcodec import AV_PKT_FLAG_KEY
-from ..ffmpeg.include.libavutil  import AV_NOPTS_VALUE, AV_TIME_BASE, AVColorRange, AVColorSpace
+from ..ffmpeg.include.libavutil  import AV_NOPTS_VALUE, AV_TIME_BASE, AVColorRange, AVColorSpace, AVDISCARD_NONE, AVDISCARD_NONKEY
 from ..ffmpeg.libavutil import dict_get
 from .compat import av2cuda, cuda2av, extract_stream_ptr
 from ..core.decode import BaseDecoder
@@ -317,6 +317,10 @@ class BasePlayer:
         Returns:
             The final return value from on_recv.
         """
+        if keyframes_only:
+            self.stream.discard = AVDISCARD_NONKEY
+        else:
+            self.stream.discard = AVDISCARD_NONE
         packets = self.fc.read_packets(self.stream)
         if keyframes_only:
             packets = (pkt for pkt in packets if pkt.av.flags & AV_PKT_FLAG_KEY)

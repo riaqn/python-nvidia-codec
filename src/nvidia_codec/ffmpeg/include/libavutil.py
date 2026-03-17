@@ -8,6 +8,14 @@ AVERROR_EOF = FFERRTAG('E', 'O', 'F', ' ')
 AVERROR = lambda errnum: -errnum
 
 AV_NOPTS_VALUE= -(2**63)
+
+# AVDiscard - used in AVStream.discard to tell the demuxer which packets to discard
+AVDISCARD_NONE    = -16  # discard nothing
+AVDISCARD_DEFAULT = 0    # discard useless packets (e.g. 0-size)
+AVDISCARD_NONREF  = 8    # discard non-reference frames
+AVDISCARD_BIDIR   = 16   # discard bidirectional frames
+AVDISCARD_NONKEY  = 32   # discard all frames except keyframes
+AVDISCARD_ALL     = 48   # discard all frames
 AV_TIME_BASE = 1000000
 
 class AVRational(Structure):
