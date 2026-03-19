@@ -38,4 +38,7 @@ def TypedCEnumeration(tp):
 
             return type(self) == type(other) and self.value == other.value
 
+        def __hash__(self):
+            return hash(self.value)
+
     return CEnumeration
