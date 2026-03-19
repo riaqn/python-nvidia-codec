@@ -23,11 +23,31 @@ class AVCodecID(TypedCEnumeration(c_int)):
     RV40 = 69
     VC1 = 70
     WMV3 = 71
-    JPEG = 88
+    MJPEG = 7
+    JPEG2000 = 88
     VP8 = 139
     VP9 = 167
     HEVC = 173
     AV1 = 225
+    # Audio codecs — values must match ffmpeg's avcodec.h
+    MP2 = 0x15000
+    MP3 = 0x15001
+    AAC = 0x15002
+    AC3 = 0x15003
+    DTS = 0x15004
+    VORBIS = 0x15005
+    WMAV2 = 0x15008
+    FLAC = 0x1500C
+    ALAC = 0x15010
+    WAVPACK = 0x15019
+    MLP = 0x1501D
+    SPEEX = 0x15023
+    WMAPRO = 0x15025
+    WMALOSSLESS = 0x15026
+    EAC3 = 0x15028
+    TRUEHD = 0x1502C
+    AAC_LATM = 0x15031
+    OPUS = 0x1503C
 
 class AVCodecParameters(Structure):
     _fields_ = [
@@ -52,9 +72,17 @@ class AVCodecParameters(Structure):
         ('color_range', AVColorRange),
         ('color_primaries', c_int),
         ('color_trc', c_int),
-        ('color_space', AVColorSpace)
+        ('color_space', AVColorSpace),
+        ('chroma_location', c_int),
+        ('video_delay', c_int),
+        # AVChannelLayout: order(4) + nb_channels(4) + union(8) + opaque(8) = 24
+        ('_ch_order', c_int),
+        ('nb_channels', c_int),
+        ('_ch_union', c_uint8 * 8),
+        ('_ch_opaque', c_void_p),
+        ('sample_rate', c_int),
         # following are skipped
-    ]    
+    ]
 
 
 class AVBSFContext(Structure):
