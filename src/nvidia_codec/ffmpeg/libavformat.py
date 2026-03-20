@@ -63,6 +63,24 @@ class FormatContext:
     def seek_file(self, stream : AVStream, ts : int, min_ts = -(2**63), max_ts = (2**63) - 1):
         check(lib.avformat_seek_file( byref(self.av), c_int(stream.index), c_int64(min_ts), c_int64(ts), c_int64(max_ts), c_int(0)))
 
+    @staticmethod
+    def index_get_entry_from_timestamp(stream : AVStream, timestamp : int, flags : int = 0):
+        """Find the index entry with the nearest timestamp at or before the given timestamp.
+
+        Args:
+            stream: The AVStream to search.
+            timestamp: Target timestamp in stream time_base units.
+            flags: AVSEEK_FLAG_BACKWARD (1) to find entry at or before timestamp.
+
+        Returns:
+            AVIndexEntry or None if not found.
+        """
+        lib.avformat_index_get_entry_from_timestamp.restype = POINTER(AVIndexEntry)
+        result = lib.avformat_index_get_entry_from_timestamp(byref(stream), c_int64(timestamp), c_int(flags))
+        if result:
+            return result.contents
+        return None
+
     def infer_start_time(self):
         # log.warning('infering start time from first packet')
                 # in this case, we get the first packet

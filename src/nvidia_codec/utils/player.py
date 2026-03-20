@@ -31,6 +31,7 @@ import numpy as np
 
 from ..ffmpeg.libavcodec import BSFContext
 from ..ffmpeg.libavformat import FormatContext, AVMediaType, AVCodecID
+from ..ffmpeg.include.libavformat import AVINDEX_KEYFRAME
 from ..ffmpeg.include.libavcodec import AV_PKT_FLAG_KEY
 from ..ffmpeg.include.libavutil  import AV_NOPTS_VALUE, AV_TIME_BASE, AVColorRange, AVColorSpace, AVDISCARD_NONE, AVDISCARD_NONKEY
 from ..ffmpeg.libavutil import dict_get
@@ -278,6 +279,7 @@ class BasePlayer:
         self.bsf.flush()
         self.decoder.flush()
         self._prepend_extradata = True
+        self._last_decoded_pts = None
 
     def time2pts(self, time: timedelta):
         """Convert a timedelta to presentation timestamp (PTS)."""
@@ -439,10 +441,27 @@ class Player(BasePlayer):
         Raises:
             NoFrameError: If no frame could be extracted at the target timestamp.
         """
-        self.seek(target)
+        target_pts = self.time2pts(target)
+
+        # Decide whether to seek or decode forward.
+        # If we have a current position and the nearest keyframe before target
+        # is behind our position, decoding forward is faster than seeking back.
+        should_seek = True
+        if hasattr(self, '_last_decoded_pts') and self._last_decoded_pts is not None:
+            if self._last_decoded_pts <= target_pts:
+                entry = FormatContext.index_get_entry_from_timestamp(
+                    self.stream, target_pts, 1  # AVSEEK_FLAG_BACKWARD
+                )
+                if entry is not None and entry.timestamp <= self._last_decoded_pts:
+                    # Nearest keyframe is behind us — decode forward
+                    should_seek = False
+
+        if should_seek:
+            self.seek(target)
 
         last = None
         for time, frame in self.frames(dtype):
+            self._last_decoded_pts = self.time2pts(time)
             if not accurate:
                 return time, frame
             if time > target:
