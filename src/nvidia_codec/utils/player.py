@@ -4,6 +4,11 @@ This module provides user-friendly classes for decoding video files using
 NVIDIA's NVDEC hardware decoder. The decoded frames are returned as PyTorch
 tensors on the GPU.
 
+Architecture:
+    Parser      — opens a file, returns VideoTrack objects (no GPU needed)
+    TrackPlayer — takes a VideoTrack, decodes frames on GPU
+    Player      — convenience: Parser + pick best track + TrackPlayer
+
 Example usage:
     # Stream all frames at native resolution (simplest usage)
     from nvidia_codec.utils import Player
@@ -16,17 +21,13 @@ Example usage:
     with Player('/path/to/video.mp4') as player:
         time, frame = player.screenshot(timedelta(seconds=30), torch.uint8)
 
-    # Advanced: crop, scale, and letterbox in hardware
-    player = Player(
-        '/path/to/video.mp4',
-        cropping=lambda h, w: {'left': 100, 'top': 50, 'right': w - 100, 'bottom': h - 50},
-        target_size=lambda h, w: (384, 384),
-        target_rect=lambda h, w: {'left': 0, 'top': 36, 'right': 384, 'bottom': 348},
-    )
+    # Just probe metadata (no GPU)
+    parser = Parser('/path/to/video.mp4')
+    for track in parser.video_tracks:
+        print(track.width, track.height, track.mime_codec, track.duration)
 """
 from datetime import timedelta
 from fractions import Fraction
-from queue import Queue
 import numpy as np
 
 from ..ffmpeg.libavcodec import BSFContext
@@ -41,94 +42,174 @@ from .color import convert
 from .. import NoFrameError
 
 import torch
-
 import logging
 
 log = logging.getLogger(__name__)
 
-class BasePlayer:
-    """Base class for video players using NVIDIA hardware decoding.
 
-    This class handles video file opening, stream selection, seeking, and
-    provides the foundation for frame decoding. It automatically selects
-    the highest bitrate video stream if multiple are present.
-
-    Supported codecs: H.264, HEVC, VP9, AV1, MPEG4, VC1/WMV3
-    (actual support depends on GPU capabilities)
+class VideoTrack:
+    """Metadata for a single video track in a container. No GPU needed.
 
     Attributes:
-        url: Path or URL of the video file.
-        width: Original video width in pixels.
-        height: Original video height in pixels.
-        target_width: Output buffer width in pixels (if target_size was specified).
-        target_height: Output buffer height in pixels (if target_size was specified).
-        duration: Video duration as a timedelta.
+        stream: The underlying AVStream (for seeking/reading).
+        fc: The parent FormatContext.
+        codec_id: AVCodecID enum value.
+        mime_codec: MIME codec string (e.g. 'avc1.640028', 'hev1.1.6.L93.B0') or None.
+        width: Video width in pixels.
+        height: Video height in pixels.
+        bit_rate: Stream bitrate.
+        duration: Video duration as timedelta, or None.
+        extradata: Codec extradata bytes, or None.
+        color_space: AVColorSpace enum value.
+        color_range: AVColorRange enum value.
     """
 
-    def __init__(self, url, num_surfaces, target_size = None, cropping = None, target_rect = None, device = None):
-        """Initialize the player with a video file.
+    def __init__(self, fc, stream):
+        self.fc = fc
+        self.stream = stream
+        cp = stream.codecpar.contents
+        self.codec_id = cp.codec_id
+        self.width = cp.width
+        self.height = cp.height
+        self.bit_rate = cp.bit_rate
+        self._color_space = cp.color_space
+        self._color_range = cp.color_range
 
-        Args:
-            url: Path or URL to the video file.
-            num_surfaces: Number of output surfaces to allocate. More surfaces
-                allow holding multiple decoded frames simultaneously.
-            target_size: Function (height, width) -> (new_height, new_width) defining
-                the output buffer dimensions. Default is native resolution.
-            cropping: Function (height, width) -> {'left', 'top', 'right', 'bottom'}
-                defining the source crop rectangle. Default is no cropping (full frame).
-            target_rect: Function (target_height, target_width) -> {'left', 'top', 'right', 'bottom'}
-                defining where within the output buffer the frame is placed. The
-                source (or cropped region) is scaled to fit this rectangle. Area
-                outside is filled with black (letterboxing). Default fills the
-                entire target buffer.
-            device: CUDA device ID to use for decoding. If None, uses the
-                current device from torch.cuda.current_device().
+        # Extradata
+        if cp.extradata_size > 0 and cp.extradata:
+            self.extradata = bytes(cp.extradata[:cp.extradata_size])
+        else:
+            self.extradata = None
 
-        Raises:
-            AssertionError: If the file has no video stream.
-            CodecNotSupportedError: If the video codec is not supported by the GPU.
-        """
-        self.url = url
-        self.fc = FormatContext(url)
-        l = filter(lambda s: s.codecpar.contents.codec_type == AVMediaType.VIDEO, self.fc.streams)
+        # MIME codec string
+        self.mime_codec = self._parse_mime_codec()
 
-        l = sorted(l, key = lambda s: s.codecpar.contents.bit_rate, reverse = True)
+        # Time base
+        self._time_base = Fraction(stream.time_base.num, stream.time_base.den)
 
-        assert len(l) > 0, 'file has no video stream'
-        self.stream = l[0]         
-        if len(l) > 1:
-            log.warning(f'{url} has multiple video streams, picking the highest bitrate @ {self.stream.codecpar.contents.bit_rate}')
-
-        self._start_time = self.stream.start_time
+        # Start time
+        self._start_time = stream.start_time
         if self._start_time == AV_NOPTS_VALUE:
-            self._start_time = self.fc.av.start_time
+            self._start_time = fc.av.start_time
             if self._start_time == AV_NOPTS_VALUE:
-                start_time = self.fc.infer_start_time()
+                start_time = fc.infer_start_time()
                 self._start_time = int(start_time / self._time_base)
             else:
-                self._start_time = int(self._start_time / AV_TIME_BASE / self._time_base)                
+                self._start_time = int(self._start_time / AV_TIME_BASE / self._time_base)
 
-        self._duration = self._infer_duration()
-        if self._duration is None:
-            log.warning('cannot infer duration')
+        # Duration
+        self._duration_pts = self._infer_duration()
 
+    def _parse_mime_codec(self):
+        ed = self.extradata
+        if self.codec_id == AVCodecID.H264 and ed and len(ed) >= 4:
+            return f'avc1.{ed[1]:02x}{ed[2]:02x}{ed[3]:02x}'
+        if self.codec_id == AVCodecID.HEVC and ed and len(ed) >= 13:
+            profile_space = ['', 'A', 'B', 'C'][(ed[1] >> 6) & 0x3]
+            tier = 'H' if (ed[1] >> 5) & 0x1 else 'L'
+            profile_idc = ed[1] & 0x1f
+            level_idc = ed[12]
+            return f'hev1.{profile_space}{profile_idc}.4.{tier}{level_idc}'
+        if self.codec_id == AVCodecID.VP9:
+            return 'vp09.00.10.08'
+        if self.codec_id == AVCodecID.AV1 and ed and len(ed) >= 4:
+            profile = (ed[1] >> 5) & 0x7
+            level = ed[1] & 0x1f
+            tier = (ed[2] >> 7) & 0x1
+            bit_depth = {'0': 8, '1': 10, '2': 12}.get(str((ed[2] >> 5) & 0x3), 8)
+            return f'av01.{profile}.{level:02d}{"H" if tier else "M"}.{bit_depth:02d}'
+        log.warning(f'unknown mime codec for codec_id={self.codec_id}')
+
+    def _infer_duration(self):
+        tb = self._time_base
+        d = self.stream.duration
+        if d != AV_NOPTS_VALUE:
+            return d
+        self.fc.find_stream_info()
+        d = self.stream.duration
+        if d != AV_NOPTS_VALUE:
+            return d
+        for key in ('DURATION', 'DURATION-eng'):
+            tag = dict_get(self.stream.metadata, key)
+            if tag:
+                h, m, s = tag.split(':')
+                td = timedelta(hours=int(h), minutes=int(m), seconds=float(s))
+                return int(td.total_seconds() / tb)
+        d = self.fc.av.duration
+        if d > 0:
+            return int(d / AV_TIME_BASE / tb)
+        return None
+
+    @property
+    def duration(self):
+        """Video duration as a timedelta, or None if unknown."""
+        if self._duration_pts is None:
+            return None
+        return timedelta(seconds=float(self._duration_pts * self._time_base))
+
+    def color_space(self, default=AVColorSpace.UNSPECIFIED):
+        r = self._color_space
+        return default if r == AVColorSpace.UNSPECIFIED else r
+
+    def color_range(self, default=AVColorRange.UNSPECIFIED):
+        r = self._color_range
+        return default if r == AVColorRange.UNSPECIFIED else r
+
+    def time2pts(self, time: timedelta):
+        return int(time.total_seconds() / self._time_base) + self._start_time
+
+    def pts2time(self, pts: int):
+        if pts == AV_NOPTS_VALUE:
+            return None
+        return timedelta(seconds=float((int(pts) - int(self._start_time)) * self._time_base))
+
+
+def parse(url):
+    """Open a video file and return a list of VideoTrack objects. No GPU needed.
+
+    Example:
+        tracks = parse('/path/to/video.mp4')
+        for track in tracks:
+            print(track.width, track.height, track.mime_codec)
+    """
+    fc = FormatContext(url)
+    video_streams = [s for s in fc.streams if s.codecpar.contents.codec_type == AVMediaType.VIDEO]
+    return [VideoTrack(fc, s) for s in video_streams]
+
+
+class TrackPlayer:
+    """GPU-accelerated decoder for a single VideoTrack.
+
+    Handles seeking, packet reading, bitstream filtering, and NVDEC decoding.
+
+    Attributes:
+        track: The VideoTrack being played.
+        width: Original video width.
+        height: Original video height.
+        target_width: Output width after scaling.
+        target_height: Output height after scaling.
+        duration: Video duration as timedelta.
+    """
+
+    def __init__(self, track, num_surfaces=2, target_size=None, cropping=None, target_rect=None, device=None):
+        self.track = track
         self._prepend_extradata = False
 
-        codec_id = self.stream.codecpar.contents.codec_id
+        codec_id = track.codec_id
         if codec_id == AVCodecID.HEVC:
             f = 'hevc_mp4toannexb'
         elif codec_id == AVCodecID.H264:
             f = 'h264_mp4toannexb'
         else:
             f = None
-            # raise Exception(f'unsupported codec {codec_id}')                
 
-        self.bsf = BSFContext(f, self.stream.codecpar.contents, self.stream.time_base)
+        self.bsf = BSFContext(f, track.stream.codecpar.contents, track.stream.time_base)
 
         self.device = torch.cuda.current_device() if device is None else device
+
         def decide(p):
             d = {
-                'num_pictures': p['min_num_pictures'], # to be safe
+                'num_pictures': p['min_num_pictures'],
                 'num_surfaces': num_surfaces,
             }
             if target_size is not None:
@@ -139,197 +220,64 @@ class BasePlayer:
                 d['target_rect'] = target_rect
             return d
 
-        # Extract extradata (sequence header) for codecs like VC1/WMV3 that need it
-        extradata = None
-        codecpar = self.stream.codecpar.contents
-        if codecpar.extradata_size > 0 and codecpar.extradata:
-            extradata = bytes(codecpar.extradata[:codecpar.extradata_size])
-
         self.decoder = BaseDecoder(
-            av2cuda(codecpar.codec_id),
-            decide = decide,
-            device = self.device,
-            extradata = extradata,
-            coded_width = codecpar.width,
-            coded_height = codecpar.height
+            av2cuda(codec_id),
+            decide=decide,
+            device=self.device,
+            extradata=track.extradata,
+            coded_width=track.width,
+            coded_height=track.height,
         )
 
     @property
-    def _time_base(self):
-        """Stream time base as a Fraction (internal use)."""
-        return Fraction(self.stream.time_base.num, self.stream.time_base.den)
-
-    def _infer_duration(self):
-        """Try to determine video duration from various sources.
-
-        Returns duration in stream time_base units, or None if unknown.
-        """
-        tb = self._time_base
-
-        # 1. stream duration (from container header)
-        d = self.stream.duration
-        if d != AV_NOPTS_VALUE:
-            return d
-
-        # 2. probe the file to populate stream duration
-        self.fc.find_stream_info()
-        d = self.stream.duration
-        if d != AV_NOPTS_VALUE:
-            return d
-
-        # 3. stream metadata tag (e.g. MKV DURATION-eng)
-        for key in ('DURATION', 'DURATION-eng'):
-            tag = dict_get(self.stream.metadata, key)
-            if tag:
-                h, m, s = tag.split(':')
-                td = timedelta(hours=int(h), minutes=int(m), seconds=float(s))
-                return int(td.total_seconds() / tb)
-
-        # 4. container duration (AV_TIME_BASE units)
-        d = self.fc.av.duration
-        if d > 0:
-            return int(d / AV_TIME_BASE / tb)
-
-        return None
-
-    @property
     def width(self):
-        """Original video width in pixels."""
-        return self.decoder.width
+        return self.track.width
 
     @property
     def height(self):
-        """Original video height in pixels."""
-        return self.decoder.height
+        return self.track.height
 
     @property
     def target_width(self):
-        """Output width in pixels after scaling."""
         return self.decoder.target_width
 
     @property
     def target_height(self):
-        """Output height in pixels after scaling."""
         return self.decoder.target_height
 
     @property
     def duration(self):
-        """Video duration as a timedelta, or None if unknown."""
-        if self._duration is None:
-            return None
-        return timedelta(seconds = float(self._duration * self._time_base))
+        return self.track.duration
 
-    def color_space(self, default = AVColorSpace.UNSPECIFIED):
-        """Get the video's color space (e.g., BT.709, BT.601).
+    @property
+    def mime_codec(self):
+        return self.track.mime_codec
 
-        Args:
-            default: Color space to return if the video doesn't specify one.
+    def convert(self, surface, dtype):
+        return convert(surface, self.track.color_space(AVColorSpace.BT470BG), self.track.color_range(AVColorRange.MPEG), dtype)
 
-        Returns:
-            AVColorSpace enum value.
-        """
-        r = self.stream.codecpar.contents.color_space
-        if r == AVColorSpace.UNSPECIFIED:
-            log.debug(f'color space is unspecified, using {default}')
-            return default
-        else:
-            log.debug(f'color space is {r}')
-            return r
-    
-    def color_range(self, default = AVColorRange.UNSPECIFIED):
-        """Get the video's color range (limited/full).
-
-        Args:
-            default: Color range to return if the video doesn't specify one.
-
-        Returns:
-            AVColorRange enum value (MPEG for limited, JPEG for full).
-        """
-        r = self.stream.codecpar.contents.color_range
-        if r == AVColorRange.UNSPECIFIED:
-            log.debug(f'color range is unspecified, using {default}')
-            return default
-        else:
-            log.debug(f'color range is {r}')
-            return r
-
-    def free(self):
-        """Release decoder resources."""
-        self.decoder.free()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.free()
-
-    def seek(self, target : timedelta):
-        """Seek to a target timestamp in the video.
-
-        Seeks to the nearest keyframe at or before the target timestamp.
-        Also flushes the decoder state.
-
-        Args:
-            target: Target timestamp as a timedelta.
-        """
-        target_pts = self.time2pts(target)
+    def seek(self, target: timedelta):
+        target_pts = self.track.time2pts(target)
         log.debug(f'target_pts: {target_pts}')
-        self.fc.seek_file(self.stream, target_pts, max_ts = target_pts)
-
+        self.track.fc.seek_file(self.track.stream, target_pts, max_ts=target_pts)
         self.bsf.flush()
         self.decoder.flush()
         self._prepend_extradata = True
         self._last_decoded_pts = None
 
-    def time2pts(self, time: timedelta):
-        """Convert a timedelta to presentation timestamp (PTS)."""
-        return int(time.total_seconds() / self._time_base) + self._start_time
-
-    def pts2time(self, pts : int):
-        """Convert a presentation timestamp (PTS) to timedelta."""
-        if pts == AV_NOPTS_VALUE:
-            return None
-        return timedelta(seconds = float((int(pts) - int(self._start_time)) * self._time_base))
-
-    def convert(self, surface, dtype):
-        """Convert a decoded surface to an RGB tensor.
-
-        Args:
-            surface: Decoded Surface object from the NVDEC decoder.
-            dtype: PyTorch dtype for the output tensor (e.g., torch.float32, torch.uint8).
-
-        Returns:
-            torch.Tensor of shape [3, H, W] (RGB) on the GPU.
-        """
-        return convert(surface, self.color_space(AVColorSpace.BT470BG), self.color_range(AVColorRange.MPEG), dtype)
-
     def decode(self, on_recv, keyframes_only=False):
-        """Decode packets and invoke callback for each decoded frame.
-
-        This is a low-level method used internally.
-        For most use cases, use Player.frames() or Player.screenshot() instead.
-
-        Args:
-            on_recv: Callback function (picture, time, accumulator) -> result.
-                Called for each decoded frame. picture is a Picture object
-                (or None at end of stream), time is a timedelta, and accumulator
-                is the return value from the previous on_recv call.
-            keyframes_only: If True, only decode keyframe (I-frame) packets.
-
-        Returns:
-            The final return value from on_recv.
-        """
+        track = self.track
         if keyframes_only:
-            self.stream.discard = AVDISCARD_NONKEY
+            track.stream.discard = AVDISCARD_NONKEY
         else:
-            self.stream.discard = AVDISCARD_NONE
-        packets = self.fc.read_packets(self.stream)
+            track.stream.discard = AVDISCARD_NONE
+        packets = track.fc.read_packets(track.stream)
         if keyframes_only:
             packets = (pkt for pkt in packets if pkt.av.flags & AV_PKT_FLAG_KEY)
         it = self.bsf.filter(packets, flush=False, reuse=True)
 
         def on_recv_(pic, pts, ret):
-            return on_recv(pic, self.pts2time(pts), ret)
+            return on_recv(pic, track.pts2time(pts), ret)
 
         for pkt in it:
             pts = pkt.av.pts if pkt.av.pts != AV_NOPTS_VALUE else pkt.av.dts
@@ -345,62 +293,11 @@ class BasePlayer:
                 return ret
         return self.decoder.send(None, on_recv_, 0)
 
-class Player(BasePlayer):
-    """Video player for decoding frames from a video file.
-
-    Supports both streaming all frames and extracting individual frames
-    at specific timestamps, using NVIDIA hardware decoding.
-
-    Example:
-        # Simplest: native resolution, all frames
-        player = Player('/path/to/video.mp4')
-        for time, frame in player.frames(torch.float32):
-            # time is a timedelta, frame is [C, H, W] tensor on GPU
-            process(frame)
-
-        # Extract a frame at a specific timestamp
-        with Player('video.mp4') as player:
-            time, frame = player.screenshot(timedelta(seconds=30), torch.uint8)
-
-        # Advanced: crop center, scale to 384x384, letterbox with black bars
-        player = Player(
-            '/path/to/video.mp4',
-            cropping=lambda h, w: {'left': 100, 'top': 50, 'right': w - 100, 'bottom': h - 50},
-            target_size=lambda h, w: (384, 384),
-            target_rect=lambda h, w: {'left': 0, 'top': 36, 'right': 384, 'bottom': 348},
-        )
-    """
-
-    def __init__(self, url, target_size = None, cropping = None, target_rect = None, device = None):
-        """Initialize the player with a video file.
-
-        Args:
-            url: Path or URL to the video file.
-            target_size: Function (height, width) -> (new_height, new_width) defining
-                the output buffer dimensions. Default is native resolution.
-            cropping: Function (height, width) -> {'left', 'top', 'right', 'bottom'}
-                defining the source crop rectangle. Default is no cropping (full frame).
-            target_rect: Function (target_height, target_width) -> {'left', 'top', 'right', 'bottom'}
-                defining where within the output buffer the frame is placed. The
-                source (or cropped region) is scaled to fit this rectangle. Area
-                outside is filled with black (letterboxing). Default fills the
-                entire target buffer.
-            device: CUDA device ID. If None, uses current device.
-        """
-        super().__init__(url, num_surfaces=2, target_size=target_size, cropping=cropping, target_rect=target_rect, device=device)
-
-    def frames(self, dtype : torch.dtype, keyframes_only=False):
-        """Iterate over frames in the video.
-
-        Args:
-            dtype: PyTorch dtype for output tensors. Use torch.float32 for
-                normalized [0, 1] values or torch.uint8 for [0, 255] values.
-            keyframes_only: If True, only decode keyframe (I-frame) packets.
+    def frames(self, dtype: torch.dtype, keyframes_only=False):
+        """Iterate over decoded frames.
 
         Yields:
-            Tuple of (time, frame) where:
-                - time: timedelta of the frame's presentation timestamp
-                - frame: torch.Tensor of shape [3, H, W] (RGB) on GPU
+            Tuple of (time, frame) where time is timedelta, frame is [C, H, W] tensor on GPU.
         """
         def on_recv(pic, time, frames):
             if pic is None:
@@ -421,39 +318,29 @@ class Player(BasePlayer):
                 break
             yield from frames
 
-    def screenshot(self, target : timedelta, dtype : torch.dtype, accurate : bool = False):
+    def screenshot(self, target: timedelta, dtype: torch.dtype, accurate: bool = False):
         """Extract a frame at the specified timestamp.
 
         Args:
             target: Target timestamp as a timedelta.
-            dtype: PyTorch dtype for the output tensor. Use torch.float32 for
-                normalized [0, 1] values or torch.uint8 for [0, 255] values.
-            accurate: If False (default), returns the first frame after seeking
-                (faster, may be slightly after target). If True, decodes until
-                finding the frame closest to but not after target (slower but
-                more precise).
+            dtype: PyTorch dtype for the output tensor.
+            accurate: If True, decode until finding the frame closest to target.
 
         Returns:
-            Tuple of (time, frame) where:
-                - time: timedelta of the actual frame timestamp (may differ from target)
-                - frame: torch.Tensor of shape [3, H, W] (RGB) on GPU
+            Tuple of (time, frame).
 
         Raises:
-            NoFrameError: If no frame could be extracted at the target timestamp.
+            NoFrameError: If no frame could be extracted.
         """
-        target_pts = self.time2pts(target)
+        target_pts = self.track.time2pts(target)
 
-        # Decide whether to seek or decode forward.
-        # If we have a current position and the nearest keyframe before target
-        # is behind our position, decoding forward is faster than seeking back.
         should_seek = True
         if hasattr(self, '_last_decoded_pts') and self._last_decoded_pts is not None:
             if self._last_decoded_pts <= target_pts:
                 entry = FormatContext.index_get_entry_from_timestamp(
-                    self.stream, target_pts, 1  # AVSEEK_FLAG_BACKWARD
+                    self.track.stream, target_pts, 1
                 )
                 if entry is not None and entry.timestamp <= self._last_decoded_pts:
-                    # Nearest keyframe is behind us — decode forward
                     should_seek = False
 
         if should_seek:
@@ -461,7 +348,7 @@ class Player(BasePlayer):
 
         last = None
         for time, frame in self.frames(dtype):
-            self._last_decoded_pts = self.time2pts(time)
+            self._last_decoded_pts = self.track.time2pts(time)
             if not accurate:
                 return time, frame
             if time > target:
@@ -470,5 +357,37 @@ class Player(BasePlayer):
 
         if last is not None:
             return last
-        raise NoFrameError(f"No frame found at {target} in {self.url}")
+        raise NoFrameError(f"No frame found at {target} in {self.track.fc}")
 
+    def free(self):
+        self.decoder.free()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.free()
+
+
+class Player(TrackPlayer):
+    """Convenience class: opens a file, picks the best video track, decodes.
+
+    This is the simplest way to decode video — equivalent to:
+        parser = Parser(url)
+        track = parser.best_video_track()
+        player = TrackPlayer(track, ...)
+
+    Example:
+        player = Player('/path/to/video.mp4')
+        for time, frame in player.frames(torch.float32):
+            process(frame)
+    """
+
+    def __init__(self, url, target_size=None, cropping=None, target_rect=None, device=None):
+        tracks = parse(url)
+        assert tracks, f'{url} has no video stream'
+        track = max(tracks, key=lambda t: t.bit_rate)
+        if len(tracks) > 1:
+            log.warning(f'{url} has {len(tracks)} video tracks, picking highest bitrate @ {track.bit_rate}')
+        super().__init__(track, num_surfaces=2, target_size=target_size, cropping=cropping, target_rect=target_rect, device=device)
+        self.url = url
