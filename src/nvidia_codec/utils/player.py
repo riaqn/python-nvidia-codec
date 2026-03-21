@@ -369,23 +369,28 @@ class VideoTrackPlayer:
     def convert(self, surface, dtype):
         return convert(surface, self.track.color_space(AVColorSpace.BT470BG), self.track.color_range(AVColorRange.MPEG), dtype)
 
-    def seek(self, target):
-        """Seek to a position. target can be timedelta or int (PTS)."""
-        target_pts = target if isinstance(target, int) else self.track.time2pts(target)
-        log.debug(f'target_pts: {target_pts}')
-        self.track.fc.seek_file(self.track.stream, target_pts, max_ts=target_pts)
+    def flush(self):
+        """Reset decoder state. Call before feeding discontinuous packets."""
         self.bsf.flush()
         self.decoder.flush()
         self._prepend_extradata = True
         self._last_decoded_pts = None
 
-    def decode(self, on_recv):
+    def seek(self, target: timedelta):
+        target_pts = self.track.time2pts(target)
+        log.debug(f'target_pts: {target_pts}')
+        self.track.fc.seek_file(self.track.stream, target_pts, max_ts=target_pts)
+        self.flush()
+
+    def decode(self, on_recv, keyframes_only=False):
         track = self.track
-        track.stream.discard = AVDISCARD_NONE
+        track.stream.discard = AVDISCARD_NONKEY if keyframes_only else AVDISCARD_NONE
         packets = track.fc.read_packets(track.stream)
         it = self.bsf.filter(packets, flush=False, reuse=True)
 
         for pkt in it:
+            if keyframes_only:
+                self.flush()
             pts = pkt.av.pts if pkt.av.pts != AV_NOPTS_VALUE else pkt.av.dts
             arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
             if self._prepend_extradata:
@@ -397,13 +402,18 @@ class VideoTrackPlayer:
             ret = self.decoder.send(arr, on_recv, pts)
             if ret is not None:
                 return ret
+            if keyframes_only:
+                ret = self.decoder.send(None, on_recv, 0)
+                if ret is not None:
+                    return ret
         return self.decoder.send(None, on_recv, 0)
 
-    def frames(self, dtype: torch.dtype, pts=False):
-        """Iterate over all decoded frames sequentially.
+    def frames(self, dtype: torch.dtype, keyframes_only=False, pts=False):
+        """Iterate over decoded frames.
 
         Args:
             dtype: PyTorch dtype for output tensors.
+            keyframes_only: If True, yield only keyframes (flushes decoder between each).
             pts: If True, yield (pts_int, frame) instead of (timedelta, frame).
 
         Yields:
@@ -425,57 +435,26 @@ class VideoTrackPlayer:
             return frames
 
         while True:
-            frames = self.decode(on_recv)
+            frames = self.decode(on_recv, keyframes_only=keyframes_only)
             if frames is None:
                 break
             yield from frames
 
-    @functools.cached_property
-    def keyframe_pts(self):
-        """List of all keyframe PTS values in the stream."""
-        track = self.track
-        track.stream.discard = AVDISCARD_NONKEY
-        pts = [pkt.av.pts if pkt.av.pts != AV_NOPTS_VALUE else pkt.av.dts
-               for pkt in track.fc.read_packets(track.stream)
-               if pkt.av.flags & AV_PKT_FLAG_KEY]
-        track.stream.discard = AVDISCARD_NONE
-        return pts
-
-    def keyframes(self, dtype: torch.dtype, pts=False):
-        """Iterate over keyframes only, using seek+decode per keyframe.
-
-        Args:
-            dtype: PyTorch dtype for output tensors.
-            pts: If True, yield (pts_int, frame) instead of (timedelta, frame).
-
-        Yields:
-            Tuple of (time, frame) where time is timedelta or int PTS.
-        """
-        track = self.track
-        for kf_pts in self.keyframe_pts:
-            try:
-                _, frame = self.screenshot(kf_pts, dtype)
-                t = kf_pts if pts else track.pts2time(kf_pts)
-                yield (t, frame)
-            except NoFrameError:
-                continue
-
-    def screenshot(self, target, dtype: torch.dtype, accurate: bool = False):
+    def screenshot(self, target: timedelta, dtype: torch.dtype, accurate: bool = False):
         """Extract a frame at the specified timestamp.
 
         Args:
-            target: Target as timedelta or int (PTS in stream time_base units).
+            target: Target timestamp as a timedelta.
             dtype: PyTorch dtype for the output tensor.
             accurate: If True, decode until finding the frame closest to target.
 
         Returns:
-            Tuple of (time, frame). time matches target type (timedelta or PTS int).
+            Tuple of (time, frame) where time is timedelta.
 
         Raises:
             NoFrameError: If no frame could be extracted.
         """
-        use_pts = isinstance(target, int)
-        target_pts = target if use_pts else self.track.time2pts(target)
+        target_pts = self.track.time2pts(target)
 
         should_seek = True
         if hasattr(self, '_last_decoded_pts') and self._last_decoded_pts is not None:
@@ -487,22 +466,19 @@ class VideoTrackPlayer:
                     should_seek = False
 
         if should_seek:
-            self.seek(target_pts)
+            self.seek(target)
 
         last = None
-        for frame_pts, frame in self.frames(dtype, pts=True):
-            self._last_decoded_pts = frame_pts
+        for time, frame in self.frames(dtype):
+            self._last_decoded_pts = self.track.time2pts(time)
             if not accurate:
-                t = frame_pts if use_pts else self.track.pts2time(frame_pts)
-                return (t, frame)
-            if frame_pts > target_pts:
+                return (time, frame)
+            if time > target:
                 break
-            last = (frame_pts, frame)
+            last = (time, frame)
 
         if last is not None:
-            result_pts, frame = last
-            t = result_pts if use_pts else self.track.pts2time(result_pts)
-            return (t, frame)
+            return last
         raise NoFrameError(f"No frame found at {target} in {self.track.fc}")
 
     def free(self):
