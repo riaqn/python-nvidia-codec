@@ -6,8 +6,8 @@ tensors on the GPU.
 
 Architecture:
     Parser      — opens a file, returns VideoTrack objects (no GPU needed)
-    TrackPlayer — takes a VideoTrack, decodes frames on GPU
-    Player      — convenience: Parser + pick best track + TrackPlayer
+    VideoTrackPlayer — takes a VideoTrack, decodes frames on GPU
+    Player      — convenience: Parser + pick best track + VideoTrackPlayer
 
 Example usage:
     # Stream all frames at native resolution (simplest usage)
@@ -67,6 +67,7 @@ class VideoTrack:
     def __init__(self, fc, stream):
         self.fc = fc
         self.stream = stream
+        self.index = stream.index
         cp = stream.codecpar.contents
         self.codec_id = cp.codec_id
         self.width = cp.width
@@ -164,20 +165,62 @@ class VideoTrack:
         return timedelta(seconds=float((int(pts) - int(self._start_time)) * self._time_base))
 
 
+class AudioTrack:
+    """Metadata for a single audio track in a container.
+
+    Attributes:
+        index: Stream index in the container.
+        codec_id: AVCodecID enum value.
+        mime_codec: MIME codec string (e.g. 'mp4a.40.2') or None.
+        sample_rate: Sample rate in Hz.
+        bit_rate: Stream bitrate.
+    """
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.index = stream.index
+        cp = stream.codecpar.contents
+        self.codec_id = cp.codec_id
+        self.sample_rate = cp.sample_rate
+        self.bit_rate = cp.bit_rate
+        self.mime_codec = self._parse_mime_codec()
+
+    def _parse_mime_codec(self):
+        if self.codec_id == AVCodecID.AAC:
+            return 'mp4a.40.2'
+        if self.codec_id == AVCodecID.MP3:
+            return 'mp4a.40.34'
+        if self.codec_id == AVCodecID.OPUS:
+            return 'opus'
+        if self.codec_id == AVCodecID.FLAC:
+            return 'flac'
+        if self.codec_id == AVCodecID.AC3:
+            return 'ac-3'
+        if self.codec_id == AVCodecID.EAC3:
+            return 'ec-3'
+        log.warning(f'unknown audio mime codec for codec_id={self.codec_id}')
+
+
 def parse(url):
-    """Open a video file and return a list of VideoTrack objects. No GPU needed.
+    """Open a media file and return a list of tracks (VideoTrack and AudioTrack). No GPU needed.
 
     Example:
         tracks = parse('/path/to/video.mp4')
-        for track in tracks:
-            print(track.width, track.height, track.mime_codec)
+        video = [t for t in tracks if isinstance(t, VideoTrack)]
+        audio = [t for t in tracks if isinstance(t, AudioTrack)]
     """
     fc = FormatContext(url)
-    video_streams = [s for s in fc.streams if s.codecpar.contents.codec_type == AVMediaType.VIDEO]
-    return [VideoTrack(fc, s) for s in video_streams]
+    tracks = []
+    for s in fc.streams:
+        codec_type = s.codecpar.contents.codec_type
+        if codec_type == AVMediaType.VIDEO:
+            tracks.append(VideoTrack(fc, s))
+        elif codec_type == AVMediaType.AUDIO:
+            tracks.append(AudioTrack(s))
+    return tracks
 
 
-class TrackPlayer:
+class VideoTrackPlayer:
     """GPU-accelerated decoder for a single VideoTrack.
 
     Handles seeking, packet reading, bitstream filtering, and NVDEC decoding.
@@ -369,13 +412,13 @@ class TrackPlayer:
         self.free()
 
 
-class Player(TrackPlayer):
+class Player(VideoTrackPlayer):
     """Convenience class: opens a file, picks the best video track, decodes.
 
     This is the simplest way to decode video — equivalent to:
         parser = Parser(url)
         track = parser.best_video_track()
-        player = TrackPlayer(track, ...)
+        player = VideoTrackPlayer(track, ...)
 
     Example:
         player = Player('/path/to/video.mp4')
@@ -384,7 +427,7 @@ class Player(TrackPlayer):
     """
 
     def __init__(self, url, target_size=None, cropping=None, target_rect=None, device=None):
-        tracks = parse(url)
+        tracks = [t for t in parse(url) if isinstance(t, VideoTrack)]
         assert tracks, f'{url} has no video stream'
         track = max(tracks, key=lambda t: t.bit_rate)
         if len(tracks) > 1:
