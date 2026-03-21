@@ -380,10 +380,10 @@ class VideoTrackPlayer:
             surface.free()
         self._decoded_surfaces.clear()
 
-    def seek_keyframe(self, pts: int):
-        """Seek to an exact PTS (must be a keyframe PTS)."""
-        log.debug(f'seek to pts: {pts}')
-        self.track.fc.seek_file(self.track.stream, pts, min_ts=pts, max_ts=pts)
+    def seek_keyframe(self, dts: int):
+        """Seek to a keyframe by its DTS (as stored in the container index)."""
+        log.debug(f'seek to dts: {dts}')
+        self.track.fc.seek_file(self.track.stream, dts, min_ts=dts, max_ts=dts)
         self.flush()
 
     def seek(self, target: timedelta):
@@ -459,21 +459,28 @@ class VideoTrackPlayer:
             yield from frames
 
     def should_seek(self, target_pts: int):
-        """Return the keyframe PTS to seek to, or None if no seek needed.
+        """Return the keyframe DTS to seek to, or None if no seek needed.
 
-        Returns None if we can reach target_pts by decoding forward from current position.
+        target_pts is in PTS space (from decoded frames or time2pts).
+        Index entries use DTS. Due to B-frames, DTS <= PTS for any given frame.
+        We use target_pts as an approximation for the DTS lookup — close enough
+        since we just need the nearest keyframe.
         """
         entry = FormatContext.index_get_entry_from_timestamp(
-            self.track.stream, target_pts, 1
+            self.track.stream, target_pts, 1  # find keyframe DTS at-or-before target
         )
         if entry is None:
-            return target_pts
-        keyframe_pts = entry.timestamp
+            return target_pts  # no index entry, try seeking to target directly
+        keyframe_dts = entry.timestamp
         if len(self._decoded_surfaces) > 0:
             last_pts = self._decoded_surfaces[-1][0]
-            if last_pts <= target_pts and keyframe_pts <= last_pts:
+            # We can decode forward if:
+            # 1. We haven't passed the target yet (last_pts <= target_pts)
+            # 2. The keyframe we'd seek to is at-or-before where we already are
+            #    (keyframe_dts <= last_pts; comparing DTS to PTS is safe since DTS <= PTS)
+            if last_pts <= target_pts and keyframe_dts <= last_pts:
                 return None  # can decode forward
-        return keyframe_pts
+        return keyframe_dts
 
     def screenshot(self, target: timedelta, dtype: torch.dtype, accurate: bool = False):
         """Extract a frame at the specified timestamp.
@@ -491,9 +498,10 @@ class VideoTrackPlayer:
         """
         target_pts = self.track.time2pts(target)
 
-        seek_keyframe = self.should_seek(target_pts)
-        if seek_keyframe is not None:
-            self.seek_keyframe(seek_keyframe)
+        seek_dts = self.should_seek(target_pts)
+        did_seek = seek_dts is not None
+        if did_seek:
+            self.seek_keyframe(seek_dts)
 
         def on_recv(surface, pts, ret):
             if surface is None:
@@ -511,13 +519,86 @@ class VideoTrackPlayer:
 
         if len(self._decoded_surfaces) == 0:
             raise NoFrameError(f"No frame found at {target} in {self.track.fc}")
-        if self._decoded_surfaces[-1][0] > target_pts:
-            assert len(self._decoded_surfaces) >= 2, "overshot target but no previous frame"
-            assert self._decoded_surfaces[-2][0] <= target_pts, "previous frame is also past target"
-            pts, surface = self._decoded_surfaces[-2]
+
+        overshot = self._decoded_surfaces[-1][0] > target_pts
+        if overshot:
+            if not did_seek:
+                assert len(self._decoded_surfaces) >= 2, "overshot target but no previous frame"
+            if len(self._decoded_surfaces) >= 2:
+                assert self._decoded_surfaces[-2][0] <= target_pts, "previous frame is also past target"
+                pts, surface = self._decoded_surfaces[-2]
+            else:
+                # After seek: only 1 surface due to DTS/PTS gap
+                pts, surface = self._decoded_surfaces[-1]
         else:
             pts, surface = self._decoded_surfaces[-1]
         return (self.track.pts2time(pts), self.convert(surface, dtype))
+
+    def screenshots(self, dtype: torch.dtype, max_interval: timedelta):
+        """Take screenshots throughout the video with interval <= max_interval.
+
+        Walks keyframe index (DTS space). For dense keyframes, skips ahead.
+        For sparse gaps, decodes forward with evenly spaced screenshots.
+
+        Yields:
+            Tuple of (timedelta, frame) where frame is [C, H, W] tensor on GPU.
+        """
+        track = self.track
+        max_gap = int(max_interval.total_seconds() / float(track._time_base))
+
+        # Find first keyframe (DTS space) — use INT_MIN to catch negative-DTS keyframes
+        entry = FormatContext.index_get_entry_from_timestamp(track.stream, -(2**63), 0)
+        if entry is None:
+            return
+
+        while True:
+            # Seek to this keyframe and yield the first decoded frame
+            self.seek_keyframe(entry.timestamp)
+            first_frame = None
+            def on_recv(surface, pts, ret):
+                nonlocal first_frame
+                if surface is not None:
+                    first_frame = True
+                    return True
+                return ret
+            self.decode(on_recv)
+            if not first_frame:
+                break
+            kf_pts = self._decoded_surfaces[-1][0]
+            yield (track.pts2time(kf_pts), self.convert(self._decoded_surfaces[-1][1], dtype))
+
+            # Find next keyframe entry (DTS space)
+            next_entry = FormatContext.index_get_entry_from_timestamp(
+                track.stream, entry.timestamp + 1, 0
+            )
+            if next_entry is None:
+                break
+
+            gap_dts = next_entry.timestamp - entry.timestamp
+
+            if gap_dts <= max_gap:
+                # Dense keyframes — skip ahead to the farthest keyframe within max_interval
+                kf = next_entry
+                while True:
+                    kf_after = FormatContext.index_get_entry_from_timestamp(
+                        track.stream, kf.timestamp + 1, 0
+                    )
+                    if kf_after is None:
+                        break
+                    if kf_after.timestamp - entry.timestamp > max_gap:
+                        break
+                    kf = kf_after
+                entry = kf
+            else:
+                # Sparse keyframes — fill the gap with evenly spaced screenshots
+                n = gap_dts // max_gap + 1
+                step_td = (track.pts2time(next_entry.timestamp) - track.pts2time(entry.timestamp)) / n
+                last_yield_time = track.pts2time(kf_pts)
+                for j in range(1, n):
+                    fill_time = last_yield_time + step_td * j
+                    t, frame = self.screenshot(fill_time, dtype, accurate=True)
+                    yield (t, frame)
+                entry = next_entry
 
     def free(self):
         self.decoder.free()
