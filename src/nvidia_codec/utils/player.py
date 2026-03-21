@@ -400,24 +400,23 @@ class VideoTrackPlayer:
                     arr = np.concatenate([np.frombuffer(extradata, dtype=np.uint8), arr])
                 self._prepend_extradata = False
             ret = self.decoder.send(arr, on_recv, pts)
+            if keyframes_only:
+                ret = ret or self.decoder.send(None, on_recv, 0)
+                if ret is None:
+                    raise NoFrameError(f'keyframe at pts={pts} produced no output')
             if ret is not None:
                 return ret
-            if keyframes_only:
-                ret = self.decoder.send(None, on_recv, 0)
-                if ret is not None:
-                    return ret
         return self.decoder.send(None, on_recv, 0)
 
-    def frames(self, dtype: torch.dtype, keyframes_only=False, pts=False):
+    def frames(self, dtype: torch.dtype, keyframes_only=False):
         """Iterate over decoded frames.
 
         Args:
             dtype: PyTorch dtype for output tensors.
             keyframes_only: If True, yield only keyframes (flushes decoder between each).
-            pts: If True, yield (pts_int, frame) instead of (timedelta, frame).
 
         Yields:
-            Tuple of (time, frame) where time is timedelta or int PTS.
+            Tuple of (timedelta, frame) where frame is [C, H, W] tensor on GPU.
         """
         track = self.track
         def on_recv(pic, frame_pts, frames):
@@ -430,8 +429,7 @@ class VideoTrackPlayer:
             surface.free()
             if frames is None:
                 frames = []
-            t = frame_pts if pts else track.pts2time(frame_pts)
-            frames.append((t, frame))
+            frames.append((track.pts2time(frame_pts), frame))
             return frames
 
         while True:
