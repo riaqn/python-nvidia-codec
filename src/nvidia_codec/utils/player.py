@@ -380,11 +380,20 @@ class VideoTrackPlayer:
             surface.free()
         self._decoded_surfaces.clear()
 
-    def seek(self, target: timedelta):
-        target_pts = self.track.time2pts(target)
-        log.debug(f'target_pts: {target_pts}')
-        self.track.fc.seek_file(self.track.stream, target_pts, max_ts=target_pts)
+    def seek_keyframe(self, pts: int):
+        """Seek to an exact PTS (must be a keyframe PTS)."""
+        log.debug(f'seek to pts: {pts}')
+        self.track.fc.seek_file(self.track.stream, pts, min_ts=pts, max_ts=pts)
         self.flush()
+
+    def seek(self, target: timedelta):
+        """Seek to the keyframe at or before target."""
+        target_pts = self.track.time2pts(target)
+        entry = FormatContext.index_get_entry_from_timestamp(
+            self.track.stream, target_pts, 1
+        )
+        self.seek_keyframe(entry.timestamp if entry is not None else target_pts)
+
 
     def decode(self, on_recv, keyframes_only=False):
         track = self.track
@@ -449,19 +458,22 @@ class VideoTrackPlayer:
                 break
             yield from frames
 
-    def should_seek(self, target_pts: int) -> bool:
-        """Check if we need to seek before decoding to reach target_pts."""
-        if len(self._decoded_surfaces) == 0:
-            return True
-        last_pts = self._decoded_surfaces[-1][0]
-        if last_pts > target_pts:
-            return True
+    def should_seek(self, target_pts: int):
+        """Return the keyframe PTS to seek to, or None if no seek needed.
+
+        Returns None if we can reach target_pts by decoding forward from current position.
+        """
         entry = FormatContext.index_get_entry_from_timestamp(
             self.track.stream, target_pts, 1
         )
-        if entry is not None and entry.timestamp <= last_pts:
-            return False
-        return True
+        if entry is None:
+            return target_pts
+        keyframe_pts = entry.timestamp
+        if len(self._decoded_surfaces) > 0:
+            last_pts = self._decoded_surfaces[-1][0]
+            if last_pts <= target_pts and keyframe_pts <= last_pts:
+                return None  # can decode forward
+        return keyframe_pts
 
     def screenshot(self, target: timedelta, dtype: torch.dtype, accurate: bool = False):
         """Extract a frame at the specified timestamp.
@@ -479,8 +491,9 @@ class VideoTrackPlayer:
         """
         target_pts = self.track.time2pts(target)
 
-        if self.should_seek(target_pts):
-            self.seek(target)
+        seek_keyframe = self.should_seek(target_pts)
+        if seek_keyframe is not None:
+            self.seek_keyframe(seek_keyframe)
 
         def on_recv(surface, pts, ret):
             if surface is None:
