@@ -28,6 +28,7 @@ Example usage:
 """
 from datetime import timedelta
 from fractions import Fraction
+import functools
 import numpy as np
 
 from ..ffmpeg.libavcodec import BSFContext
@@ -378,19 +379,11 @@ class VideoTrackPlayer:
         self._prepend_extradata = True
         self._last_decoded_pts = None
 
-    def decode(self, on_recv, keyframes_only=False):
+    def decode(self, on_recv):
         track = self.track
-        if keyframes_only:
-            track.stream.discard = AVDISCARD_NONKEY
-        else:
-            track.stream.discard = AVDISCARD_NONE
+        track.stream.discard = AVDISCARD_NONE
         packets = track.fc.read_packets(track.stream)
-        if keyframes_only:
-            packets = (pkt for pkt in packets if pkt.av.flags & AV_PKT_FLAG_KEY)
         it = self.bsf.filter(packets, flush=False, reuse=True)
-
-        def on_recv_(pic, pts, ret):
-            return on_recv(pic, pts, ret)
 
         for pkt in it:
             pts = pkt.av.pts if pkt.av.pts != AV_NOPTS_VALUE else pkt.av.dts
@@ -401,26 +394,21 @@ class VideoTrackPlayer:
                     extradata = bytes(par_out.extradata[:par_out.extradata_size])
                     arr = np.concatenate([np.frombuffer(extradata, dtype=np.uint8), arr])
                 self._prepend_extradata = False
-            ret = self.decoder.send(arr, on_recv_, pts)
+            ret = self.decoder.send(arr, on_recv, pts)
             if ret is not None:
                 return ret
-        return self.decoder.send(None, on_recv_, 0)
+        return self.decoder.send(None, on_recv, 0)
 
-    def frames(self, dtype: torch.dtype, keyframes_only=False, pts=False):
-        """Iterate over decoded frames.
+    def frames(self, dtype: torch.dtype, pts=False):
+        """Iterate over all decoded frames sequentially.
 
         Args:
             dtype: PyTorch dtype for output tensors.
-            keyframes_only: If True, yield only keyframes (uses seek per keyframe).
             pts: If True, yield (pts_int, frame) instead of (timedelta, frame).
 
         Yields:
             Tuple of (time, frame) where time is timedelta or int PTS.
         """
-        if keyframes_only:
-            yield from self._keyframes_by_seek(dtype, pts=pts)
-            return
-
         track = self.track
         def on_recv(pic, frame_pts, frames):
             if pic is None:
@@ -442,22 +430,30 @@ class VideoTrackPlayer:
                 break
             yield from frames
 
-    def _keyframes_by_seek(self, dtype, pts=False):
-        """Yield keyframes by seeking to each one. Works with NVDEC."""
+    @functools.cached_property
+    def keyframe_pts(self):
+        """List of all keyframe PTS values in the stream."""
         track = self.track
-        # Collect keyframe positions from demuxer
         track.stream.discard = AVDISCARD_NONKEY
-        keyframe_pts = []
-        for pkt in track.fc.read_packets(track.stream):
-            if pkt.av.flags & AV_PKT_FLAG_KEY:
-                p = pkt.av.pts if pkt.av.pts != AV_NOPTS_VALUE else pkt.av.dts
-                keyframe_pts.append(p)
+        pts = [pkt.av.pts if pkt.av.pts != AV_NOPTS_VALUE else pkt.av.dts
+               for pkt in track.fc.read_packets(track.stream)
+               if pkt.av.flags & AV_PKT_FLAG_KEY]
         track.stream.discard = AVDISCARD_NONE
+        return pts
 
-        # Seek to each keyframe and decode one frame
-        for kf_pts in keyframe_pts:
+    def keyframes(self, dtype: torch.dtype, pts=False):
+        """Iterate over keyframes only, using seek+decode per keyframe.
+
+        Args:
+            dtype: PyTorch dtype for output tensors.
+            pts: If True, yield (pts_int, frame) instead of (timedelta, frame).
+
+        Yields:
+            Tuple of (time, frame) where time is timedelta or int PTS.
+        """
+        track = self.track
+        for kf_pts in self.keyframe_pts:
             try:
-                # Pass PTS directly to screenshot
                 _, frame = self.screenshot(kf_pts, dtype)
                 t = kf_pts if pts else track.pts2time(kf_pts)
                 yield (t, frame)
