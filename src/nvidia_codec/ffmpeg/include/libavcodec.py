@@ -24,13 +24,22 @@ class AVCodecID(TypedCEnumeration(c_int)):
     VC1 = 70
     WMV3 = 71
     MJPEG = 7
+    DVVIDEO = 24
+    PNG = 61
     JPEG2000 = 88
+    VP6F = 92
+    GIF = 97
+    PRORES = 147
+    WEBP = 171
     VP8 = 139
     VP9 = 167
     HEVC = 173
     AV1 = 225
     # Audio codecs — values must match ffmpeg's avcodec.h
+    PCM_S16LE = 0x10000
+    PCM_S16BE = 0x10001
     MP2 = 0x15000
+    COOK = 0x15014
     MP3 = 0x15001
     AAC = 0x15002
     AC3 = 0x15003

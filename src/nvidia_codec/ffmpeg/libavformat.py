@@ -58,7 +58,9 @@ class FormatContext:
                 yield pkt # ownership transferred outside
 
     def find_stream_info(self):
-        check(lib.avformat_find_stream_info(byref(self.av), None))
+        if not getattr(self, '_probed', False):
+            check(lib.avformat_find_stream_info(byref(self.av), None))
+            self._probed = True
 
     def seek_file(self, stream : AVStream, ts : int, min_ts = -(2**63), max_ts = (2**63) - 1):
         check(lib.avformat_seek_file( byref(self.av), c_int(stream.index), c_int64(min_ts), c_int64(ts), c_int64(max_ts), c_int(0)))
