@@ -495,11 +495,17 @@ class Player(VideoTrackPlayer):
             process(frame)
     """
 
-    def __init__(self, url, target_size=None, cropping=None, target_rect=None, device=None):
+    def __init__(self, url, target_size=None, cropping=None, target_rect=None, device=None, track_idx=None):
         tracks = [t for t in parse(url) if isinstance(t, VideoTrack)]
-        assert tracks, f'{url} has no video stream'
-        track = max(tracks, key=lambda t: t.bit_rate)
-        if len(tracks) > 1:
-            log.warning(f'{url} has {len(tracks)} video tracks, picking highest bitrate @ {track.bit_rate}')
+        if not tracks:
+            raise ValueError(f'{url} has no video stream')
+        if track_idx is not None:
+            track = next((t for t in tracks if t.index == track_idx), None)
+            if not track:
+                raise ValueError(f'{url} has no video track with index {track_idx}')
+        elif len(tracks) == 1:
+            track = tracks[0]
+        else:
+            raise ValueError(f'{url} has {len(tracks)} video tracks, specify track_idx')
         super().__init__(track, num_surfaces=2, target_size=target_size, cropping=cropping, target_rect=target_rect, device=device)
         self.url = url
