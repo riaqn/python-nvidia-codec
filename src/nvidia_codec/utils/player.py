@@ -76,17 +76,18 @@ class VideoTrack:
         self._color_space = cp.color_space
         self._color_range = cp.color_range
 
-        # Extradata
-        if cp.extradata_size > 0 and cp.extradata:
-            self.extradata = bytes(cp.extradata[:cp.extradata_size])
-        else:
-            self.extradata = None
-
-        # MIME codec string
-        self.mime_codec = self._parse_mime_codec()
-
         # Time base
         self._time_base = Fraction(stream.time_base.num, stream.time_base.den)
+
+        # Eagerly read extradata and mime_codec (may be incomplete before probe)
+        self._read_extradata()
+        self.mime_codec = self._parse_mime_codec()
+
+        # If mime_codec failed, probe and retry
+        if self.mime_codec is None and self.codec_id.value != 0:
+            self._probe()
+            self._read_extradata()
+            self.mime_codec = self._parse_mime_codec()
 
         # Start time
         self._start_time = stream.start_time
@@ -98,13 +99,31 @@ class VideoTrack:
             else:
                 self._start_time = int(self._start_time / AV_TIME_BASE / self._time_base)
 
-        # Duration
+        # Duration (lazy — probes only if needed)
         self._duration_pts = self._infer_duration()
+
+    def _probe(self):
+        self.fc.find_stream_info()
+
+    def _read_extradata(self):
+        cp = self.stream.codecpar.contents
+        if cp.extradata_size > 0 and cp.extradata:
+            self.extradata = bytes(cp.extradata[:cp.extradata_size])
+        else:
+            self.extradata = None
 
     def _parse_mime_codec(self):
         ed = self.extradata
         if self.codec_id == AVCodecID.H264 and ed and len(ed) >= 4:
-            return f'avc1.{ed[1]:02x}{ed[2]:02x}{ed[3]:02x}'
+            if ed[0] == 1:
+                # AVCDecoderConfigurationRecord: version=1, profile, compat, level
+                return f'avc1.{ed[1]:02x}{ed[2]:02x}{ed[3]:02x}'
+            # Annexb format (e.g. TS files): find SPS NAL (type 0x67)
+            for i in range(len(ed) - 4):
+                if ed[i:i+3] == b'\x00\x00\x01' and (ed[i+3] & 0x1f) == 7:
+                    sps = i + 4
+                    if sps + 2 < len(ed):
+                        return f'avc1.{ed[sps]:02x}{ed[sps+1]:02x}{ed[sps+2]:02x}'
         if self.codec_id == AVCodecID.HEVC and ed and len(ed) >= 13:
             profile_space = ['', 'A', 'B', 'C'][(ed[1] >> 6) & 0x3]
             tier = 'H' if (ed[1] >> 5) & 0x1 else 'L'
@@ -119,14 +138,44 @@ class VideoTrack:
             tier = (ed[2] >> 7) & 0x1
             bit_depth = {'0': 8, '1': 10, '2': 12}.get(str((ed[2] >> 5) & 0x3), 8)
             return f'av01.{profile}.{level:02d}{"H" if tier else "M"}.{bit_depth:02d}'
-        log.warning(f'unknown mime codec for codec_id={self.codec_id}')
+        if self.codec_id == AVCodecID.MPEG4:
+            return 'mp4v.20.9'
+        if self.codec_id == AVCodecID.MPEG2:
+            return 'mp4v.61'
+        if self.codec_id == AVCodecID.MPEG1:
+            return 'mp4v.6b'
+        if self.codec_id == AVCodecID.VP8:
+            return 'vp8'
+        if self.codec_id == AVCodecID.WMV3:
+            return 'wmv3'
+        if self.codec_id == AVCodecID.WMV2:
+            return 'wmv2'
+        if self.codec_id == AVCodecID.GIF:
+            return 'gif'
+        if self.codec_id == AVCodecID.MJPEG:
+            return 'mjpeg'
+        if self.codec_id == AVCodecID.DVVIDEO:
+            return 'dvvideo'
+        if self.codec_id == AVCodecID.PRORES:
+            return 'prores'
+        if self.codec_id == AVCodecID.RV40:
+            return 'rv40'
+        if self.codec_id == AVCodecID.VC1:
+            return 'vc1'
+        if self.codec_id == AVCodecID.VP6F:
+            return 'vp6f'
+        if self.codec_id == AVCodecID.PNG:
+            return 'png'
+        if self.codec_id == AVCodecID.WEBP:
+            return 'webp'
+        raise ValueError(f'unknown video mime codec for codec_id={self.codec_id}')
 
     def _infer_duration(self):
         tb = self._time_base
         d = self.stream.duration
         if d != AV_NOPTS_VALUE:
             return d
-        self.fc.find_stream_info()
+        self._probe()
         d = self.stream.duration
         if d != AV_NOPTS_VALUE:
             return d
@@ -198,7 +247,27 @@ class AudioTrack:
             return 'ac-3'
         if self.codec_id == AVCodecID.EAC3:
             return 'ec-3'
-        log.warning(f'unknown audio mime codec for codec_id={self.codec_id}')
+        if self.codec_id == AVCodecID.PCM_S16LE:
+            return 'pcm'
+        if self.codec_id == AVCodecID.PCM_S16BE:
+            return 'pcm'
+        if self.codec_id == AVCodecID.WMAV2:
+            return 'wmav2'
+        if self.codec_id == AVCodecID.COOK:
+            return 'cook'
+        if self.codec_id == AVCodecID.DTS:
+            return 'dts'
+        if self.codec_id == AVCodecID.VORBIS:
+            return 'vorbis'
+        if self.codec_id == AVCodecID.MP2:
+            return 'mp4a.40.33'
+        if self.codec_id == AVCodecID.WMAPRO:
+            return 'wmapro'
+        if self.codec_id == AVCodecID.WMALOSSLESS:
+            return 'wmalossless'
+        if self.codec_id.value in (65560,):  # pcm_bluray
+            return 'pcm'
+        raise ValueError(f'unknown audio mime codec for codec_id={self.codec_id}')
 
 
 def parse(url):
