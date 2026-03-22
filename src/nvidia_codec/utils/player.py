@@ -517,9 +517,12 @@ class VideoTrackPlayer:
             self._out_q.shutdown()
             while True:
                 try:
-                    _, pic = self._out_q.get()
+                    item = self._out_q.get()
                 except ShutDown:
                     break
+                if item is None:
+                    break
+                _, pic = item
                 pic.free()
             self._out_q = None
 
@@ -664,16 +667,28 @@ class VideoTrackPlayer:
             kf_frame = self.convert(surface, dtype)
             yield (track.pts2time(kf_pts), kf_frame, track.pts2time(entry.timestamp))
 
-            # Find next keyframe entry
+            # Find next keyframe entry, or use duration as end marker
             next_entry = FormatContext.index_get_entry_from_timestamp(
                 track.stream, entry.timestamp + 1, 0
             )
-            if next_entry is None:
-                break
-
-            gap_ts = next_entry.timestamp - entry.timestamp
+            is_last = next_entry is None
+            if is_last:
+                # No more keyframes — treat video end as the boundary
+                if track._duration_pts is None:
+                    break
+                end_ts = track._duration_pts + track._start_time
+                gap_ts = end_ts - entry.timestamp
+            else:
+                gap_ts = next_entry.timestamp - entry.timestamp
 
             if gap_ts <= max_gap:
+                if is_last:
+                    # Fill one last frame near the end
+                    fill_time = track.duration - timedelta(seconds=0.1)
+                    if fill_time > track.pts2time(kf_pts):
+                        t, frame = self.screenshot_forward(fill_time, dtype)
+                        yield (t, frame, None)
+                    break
                 # Dense keyframes — skip ahead to the farthest keyframe within max_interval
                 kf = next_entry
                 while True:
@@ -687,17 +702,20 @@ class VideoTrackPlayer:
                     kf = kf_after
                 entry = kf
             else:
-                # Sparse keyframes — fill the gap with evenly spaced screenshots
+                # Sparse gap — fill with evenly spaced screenshots
+                end_time = (
+                    track.duration if is_last else track.pts2time(next_entry.timestamp)
+                )
                 n = gap_ts // max_gap + 1
-                step_td = (
-                    track.pts2time(next_entry.timestamp)
-                    - track.pts2time(entry.timestamp)
-                ) / n
+                step_td = (end_time - track.pts2time(entry.timestamp)) / n
                 last_yield_time = track.pts2time(kf_pts)
-                for j in range(1, n):
+                end_range = n + 1 if is_last else n
+                for j in range(1, end_range):
                     fill_time = last_yield_time + step_td * j
                     t, frame = self.screenshot_forward(fill_time, dtype)
                     yield (t, frame, None)
+                if is_last:
+                    break
                 entry = next_entry
 
     def free(self):
