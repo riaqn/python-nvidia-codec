@@ -314,12 +314,12 @@ class DecodeWorker:
     Pushes (pts, pic) tuples to out_q. Consumer maps pics to surfaces.
     """
 
-    def __init__(self, cmd_q, track, bsf, decoder):
+    def __init__(self, cmd_q, track, bsf, decoder, prepend_extradata=False):
         self.cmd_q = cmd_q
         self.track = track
         self.bsf = bsf
         self.decoder = decoder
-        self.prepend_extradata = False
+        self.prepend_extradata = prepend_extradata
 
     def flush(self):
         """Flush bsf and decoder, discarding buffered frames."""
@@ -327,7 +327,6 @@ class DecodeWorker:
         self.decoder.send(
             None, lambda pic, pts: pic.free() if pic is not None else None
         )
-        self.prepend_extradata = True
 
     def run(self):
         while True:
@@ -339,9 +338,8 @@ class DecodeWorker:
                 self.decode(kts, out_q, keyframes_only)
             except ShutDown:
                 pass
-            except Exception:
-                log.exception("decode thread error")
-                out_q.shutdown()
+            except Exception as e:
+                out_q.put(e)
 
     def decode(self, kts, out_q, keyframes_only):
         """Seek to keyframe timestamp, then demux and decode all packets."""
@@ -448,7 +446,13 @@ class VideoTrackPlayer:
 
         self._cmd_q = Queue()
         self._out_q = None
-        self._worker = DecodeWorker(self._cmd_q, track, self.bsf, self.decoder)
+        self._worker = DecodeWorker(
+            self._cmd_q,
+            track,
+            self.bsf,
+            self.decoder,
+            prepend_extradata=(f is None),
+        )
         self._thread = threading.Thread(target=self._worker.run, daemon=True)
         self._thread.start()
 
@@ -495,10 +499,13 @@ class VideoTrackPlayer:
 
     def _recv_surface(self):
         """Get next decoded frame from queue, map to surface, store in ring buffer.
-        Returns (pts, surface) or None if stream ended."""
+        Returns (pts, surface) or None if stream ended. Raises if decode thread errored.
+        """
         item = self._out_q.get()
         if item is None:
             return None
+        if isinstance(item, Exception):
+            raise item
         pts, pic = item
         try:
             if len(self._decoded_surfaces) >= self._num_surfaces:
@@ -520,7 +527,7 @@ class VideoTrackPlayer:
                     item = self._out_q.get()
                 except ShutDown:
                     break
-                if item is None:
+                if item is None or isinstance(item, Exception):
                     break
                 _, pic = item
                 pic.free()
