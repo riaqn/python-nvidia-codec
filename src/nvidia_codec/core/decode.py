@@ -460,7 +460,7 @@ class BaseDecoder:
         log.debug('display')
         if not bool(pDispInfo):
             # EOS notification
-            self.ret = self.on_recv(None, 0, self.ret)
+            self.on_recv(None, 0)
             return 1
         # di = cast(pDispInfo, POINTER(CUVIDPARSERDISPINFO)).contents
         di = pDispInfo.contents
@@ -473,7 +473,11 @@ class BaseDecoder:
         )
 
         picture = Picture(self, di.picture_index, params)
-        self.ret = self.on_recv(picture, di.timestamp, self.ret)
+        try:
+            self.on_recv(picture, di.timestamp)
+        except:
+            picture.free()
+            raise
         return 1
 
     def handleOperatingPoint(self, pUserData, pOPInfo):
@@ -585,20 +589,15 @@ class BaseDecoder:
         Args:
             packet: Compressed video data as a 1D numpy array, or None to
                 signal end-of-stream (triggers EOS callback with picture=None).
-            on_recv: Callback function(picture, pts, accumulator) -> result.
+            on_recv: Callback function(picture, pts) called for each decoded frame.
                 - picture: Picture object, or None at end of stream
                 - pts: Presentation timestamp passed to send()
-                - accumulator: Return value from previous on_recv call
-                The final on_recv return value is returned by send().
             pts: Presentation timestamp for this packet (passed to on_recv).
-
-        Returns:
-            The final return value from on_recv, or None if no frames decoded.
 
         Note:
             The packet buffer can be reused immediately after send() returns.
             Call flush() to drain any remaining frames from the reorder buffer.
-        """        
+        """
 
         if packet is None:
             # this will reset the parser internal state
@@ -608,7 +607,7 @@ class BaseDecoder:
                 payload_size = 0,
                 payload = None,
                 timestamp = 0
-            )            
+            )
         else:
             p = CUVIDSOURCEDATAPACKET(
                 flags = CUvideopacketflags.TIMESTAMP.value,
@@ -616,7 +615,6 @@ class BaseDecoder:
                 payload = packet.ctypes.data_as(POINTER(c_uint8)),
                 timestamp = pts
                 )
-        self.ret = None
         self.exception = None
         self.on_recv = on_recv
         with cuda.Device(self.device):
@@ -633,15 +631,6 @@ class BaseDecoder:
         if self.exception is not None:
             # the exception is caused by our callback, not by cuvid
             raise self.exception
-        return self.ret
-
-    def flush(self):
-        """Flush the decoder, discarding any buffered frames.
-
-        Resets the parser state. Call this after seeking to clear any
-        frames from the previous position.
-        """
-        self.send(None, lambda pic,pts,ret: None)
 
     def free(self):
         """Release all decoder resources.

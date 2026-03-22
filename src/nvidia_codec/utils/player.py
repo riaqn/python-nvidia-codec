@@ -30,6 +30,8 @@ from datetime import timedelta
 from fractions import Fraction
 import functools
 import numpy as np
+from queue import Queue, ShutDown
+import threading
 
 from ..ffmpeg.libavcodec import BSFContext
 from ..ffmpeg.libavformat import FormatContext, AVMediaType, AVCodecID
@@ -289,6 +291,74 @@ def parse(url):
             tracks.append(AudioTrack(s))
     return tracks
 
+class DecodeWorker:
+    """Background decode worker. Runs on a dedicated thread.
+
+    Commands via cmd_q:
+        (ts_or_none, out_q, keyframes_only) — seek (if ts not None), then decode into out_q
+        None — stop
+
+    Pushes (pts, pic) tuples to out_q. Consumer maps pics to surfaces.
+    """
+
+    def __init__(self, cmd_q, track, bsf, decoder):
+        self.cmd_q = cmd_q
+        self.track = track
+        self.bsf = bsf
+        self.decoder = decoder
+        self.prepend_extradata = False
+
+    def flush(self):
+        """Flush bsf and decoder, discarding buffered frames."""
+        self.bsf.flush()
+        self.decoder.send(None, lambda pic, pts: pic.free() if pic is not None else None)
+        self.prepend_extradata = True
+
+    def run(self):
+        while True:
+            cmd = self.cmd_q.get()
+            if cmd is None:
+                break
+            kts, out_q, keyframes_only = cmd
+            try:
+                self.decode(kts, out_q, keyframes_only)
+            except ShutDown:
+                pass
+            except Exception:
+                log.exception('decode thread error')
+                out_q.shutdown()
+
+    def decode(self, kts, out_q, keyframes_only):
+        """Seek to keyframe timestamp, then demux and decode all packets."""
+        track = self.track
+        track.fc.seek_file(track.stream, kts, min_ts=kts, max_ts=kts)
+        self.flush()
+        track.stream.discard = AVDISCARD_NONKEY if keyframes_only else AVDISCARD_NONE
+        packets = track.fc.read_packets(track.stream)
+        it = self.bsf.filter(packets, flush=False, reuse=True)
+
+        def on_recv(pic, pts):
+            if pic is None:
+                return
+            out_q.put((pts, pic))
+
+        for pkt in it:
+            # workaround: use DTS when PTS is not available
+            pts = pkt.av.pts if pkt.av.pts != AV_NOPTS_VALUE else pkt.av.dts
+            arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
+            if self.prepend_extradata:
+                par_out = self.bsf.av.par_out.contents
+                if par_out.extradata_size > 0 and par_out.extradata:
+                    extradata = bytes(par_out.extradata[:par_out.extradata_size])
+                    arr = np.concatenate([np.frombuffer(extradata, dtype=np.uint8), arr])
+                self.prepend_extradata = False
+            self.decoder.send(arr, on_recv, pts)
+            if keyframes_only:
+                # force the decoder to give the keyframe
+                self.decoder.send(None, on_recv, 0)
+                self.flush()
+        self.decoder.send(None, on_recv, 0)
+        out_q.put(None)
 
 class VideoTrackPlayer:
     """GPU-accelerated decoder for a single VideoTrack.
@@ -305,10 +375,16 @@ class VideoTrackPlayer:
     """
 
     def __init__(self, track, num_surfaces=2, target_size=None, cropping=None, target_rect=None, device=None):
+
         self.track = track
         self._num_surfaces = num_surfaces
+
+        # the last few decoded frames, guaranteed to be continuous. i.e., if you
+        # fetch another surface from self.out_q, it's guaranteed to strictly
+        # follow the last element in this list. when in [keyframes_only] mode,
+        # it contains at most one element (the keyframe just decoded) and get
+        # cleared before decoding the next keyframe.
         self._decoded_surfaces = []
-        self._prepend_extradata = False
 
         codec_id = track.codec_id
         if codec_id == AVCodecID.HEVC:
@@ -344,6 +420,12 @@ class VideoTrackPlayer:
             coded_height=track.height,
         )
 
+        self._cmd_q = Queue()
+        self._out_q = None
+        self._worker = DecodeWorker(self._cmd_q, track, self.bsf, self.decoder)
+        self._thread = threading.Thread(target=self._worker.run, daemon=True)
+        self._thread.start()
+
     @property
     def width(self):
         return self.track.width
@@ -371,124 +453,101 @@ class VideoTrackPlayer:
     def convert(self, surface, dtype):
         return convert(surface, self.track.color_space(AVColorSpace.BT470BG), self.track.color_range(AVColorRange.MPEG), dtype)
 
-    def flush(self):
-        """Reset decoder state. Call before feeding discontinuous packets."""
-        self.bsf.flush()
-        self.decoder.flush()
-        self._prepend_extradata = True
-        for _, surface in self._decoded_surfaces:
-            surface.free()
-        self._decoded_surfaces.clear()
-
-    def seek_keyframe(self, dts: int):
-        """Seek to a keyframe by its DTS (as stored in the container index)."""
-        log.debug(f'seek to dts: {dts}')
-        self.track.fc.seek_file(self.track.stream, dts, min_ts=dts, max_ts=dts)
-        self.flush()
-
-    def seek(self, target: timedelta):
-        """Seek to the keyframe at or before target."""
+    def seek(self, target: timedelta, keyframes_only=False):
+        """Seek to target position and start decoding. Call frames() after."""
         target_pts = self.track.time2pts(target)
         entry = FormatContext.index_get_entry_from_timestamp(
             self.track.stream, target_pts, 1
         )
-        self.seek_keyframe(entry.timestamp if entry is not None else target_pts)
+        assert entry is not None, f"no keyframe found at or before {target}"
+        self._start_decode(entry.timestamp, keyframes_only=keyframes_only)
 
-
-    def decode(self, on_recv, keyframes_only=False):
-        track = self.track
-        track.stream.discard = AVDISCARD_NONKEY if keyframes_only else AVDISCARD_NONE
-        packets = track.fc.read_packets(track.stream)
-        it = self.bsf.filter(packets, flush=False, reuse=True)
-
-        def _on_recv(pic, pts, ret):
-            if pic is None:
-                return on_recv(None, pts, ret)
+    def _recv_surface(self):
+        """Get next decoded frame from queue, map to surface, store in ring buffer.
+        Returns (pts, surface) or None if stream ended."""
+        item = self._out_q.get()
+        if item is None:
+            return None
+        pts, pic = item
+        try:
             if len(self._decoded_surfaces) >= self._num_surfaces:
                 self._decoded_surfaces.pop(0)[1].free()
             stream = extract_stream_ptr(torch.cuda.current_stream(self.device))
             surface = pic.map(stream)
-            pic.free()
             self._decoded_surfaces.append((pts, surface))
-            return on_recv(surface, pts, ret)
+            return (pts, surface)
+        finally:
+            pic.free()
 
-        for pkt in it:
-            if keyframes_only:
-                self.flush()
-            pts = pkt.av.pts if pkt.av.pts != AV_NOPTS_VALUE else pkt.av.dts
-            arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
-            if self._prepend_extradata:
-                par_out = self.bsf.av.par_out.contents
-                if par_out.extradata_size > 0 and par_out.extradata:
-                    extradata = bytes(par_out.extradata[:par_out.extradata_size])
-                    arr = np.concatenate([np.frombuffer(extradata, dtype=np.uint8), arr])
-                self._prepend_extradata = False
-            ret = self.decoder.send(arr, _on_recv, pts)
-            if keyframes_only:
-                ret = ret or self.decoder.send(None, _on_recv, 0)
-                if ret is None:
-                    raise NoFrameError(f'keyframe at pts={pts} produced no output')
-            if ret is not None:
-                return ret
-        return self.decoder.send(None, _on_recv, 0)
+    def _discard(self):
+        """Free all held surfaces and drain/shutdown the output queue."""
 
-    def frames(self, dtype: torch.dtype, keyframes_only=False):
-        """Iterate over decoded frames.
+        if self._out_q is not None:
+            self._out_q.shutdown()
+            while True:
+                try:
+                    _, pic = self._out_q.get()
+                except ShutDown:
+                    break
+                pic.free()
+            self._out_q = None
 
-        Args:
-            dtype: PyTorch dtype for output tensors.
-            keyframes_only: If True, yield only keyframes (flushes decoder between each).
+        while len(self._decoded_surfaces) > 0:
+            _, s = self._decoded_surfaces.pop()
+            s.free()
+
+    def _start_decode(self, kts: int, keyframes_only=False):
+        """Seek to keyframe timestamp and start decoding. Returns the output queue.
+
+        kts must be a keyframe timestamp from the container index.
+        """
+        self._discard()
+        self._out_q = Queue()
+        self._cmd_q.put((kts, self._out_q, keyframes_only))
+
+    def frames(self, dtype: torch.dtype):
+        """Iterate over decoded frames from current position.
+
+        Caller must seek() or _start_decode() first.
 
         Yields:
             Tuple of (timedelta, frame) where frame is [C, H, W] tensor on GPU.
         """
-        track = self.track
-        def on_recv(surface, frame_pts, frames):
-            if surface is None:
-                return frames
-            frame = self.convert(surface, dtype)
-            if frames is None:
-                frames = []
-            frames.append((track.pts2time(frame_pts), frame))
-            return frames
-
+        assert self._out_q is not None, "must seek() before frames()"
         while True:
-            frames = self.decode(on_recv, keyframes_only=keyframes_only)
-            if frames is None:
+            result = self._recv_surface()
+            if result is None:
                 break
-            yield from frames
+            pts, surface = result
+            yield (self.track.pts2time(pts), self.convert(surface, dtype))
 
     def should_seek(self, target_pts: int):
         """Return the keyframe DTS to seek to, or None if no seek needed.
 
         target_pts is in PTS space (from decoded frames or time2pts).
         Index entries use DTS. Due to B-frames, DTS <= PTS for any given frame.
-        We use target_pts as an approximation for the DTS lookup — close enough
+        We use target_pts as an approximation for the index lookup — close enough
         since we just need the nearest keyframe.
         """
         entry = FormatContext.index_get_entry_from_timestamp(
-            self.track.stream, target_pts, 1  # find keyframe DTS at-or-before target
+            self.track.stream, target_pts, 1  # find keyframe at-or-before target
         )
-        if entry is None:
-            return target_pts  # no index entry, try seeking to target directly
-        keyframe_dts = entry.timestamp
+        assert entry is not None, f"no keyframe found at or before pts={target_pts}"
+        kts = entry.timestamp
         if len(self._decoded_surfaces) > 0:
             last_pts = self._decoded_surfaces[-1][0]
             # We can decode forward if:
             # 1. We haven't passed the target yet (last_pts <= target_pts)
             # 2. The keyframe we'd seek to is at-or-before where we already are
-            #    (keyframe_dts <= last_pts; comparing DTS to PTS is safe since DTS <= PTS)
-            if last_pts <= target_pts and keyframe_dts <= last_pts:
+            #    (kts <= last_pts)
+            if last_pts <= target_pts and kts <= last_pts:
                 return None  # can decode forward
-        return keyframe_dts
+        return kts
 
-    def screenshot(self, target: timedelta, dtype: torch.dtype, accurate: bool = False):
-        """Extract a frame at the specified timestamp.
+    def screenshot_forward(self, target: timedelta, dtype: torch.dtype):
+        """Decode forward from current position to the frame closest to target.
 
-        Args:
-            target: Target timestamp as a timedelta.
-            dtype: PyTorch dtype for the output tensor.
-            accurate: If True, decode until finding the frame closest to target.
+        Does NOT seek. Caller must ensure the decoder is positioned before target.
 
         Returns:
             Tuple of (time, frame) where time is timedelta.
@@ -498,23 +557,12 @@ class VideoTrackPlayer:
         """
         target_pts = self.track.time2pts(target)
 
-        seek_dts = self.should_seek(target_pts)
-        did_seek = seek_dts is not None
-        if did_seek:
-            self.seek_keyframe(seek_dts)
-
-        def on_recv(surface, pts, ret):
-            if surface is None:
-                return ret
-            if not accurate:
-                return True  # stop after first frame
-            if pts > target_pts:
-                return True  # stop, we've passed the target
-            return ret
-
         while True:
-            done = self.decode(on_recv)
-            if done:
+            result = self._recv_surface()
+            if result is None:
+                break
+            pts, surface = result
+            if pts > target_pts:
                 break
 
         if len(self._decoded_surfaces) == 0:
@@ -522,17 +570,37 @@ class VideoTrackPlayer:
 
         overshot = self._decoded_surfaces[-1][0] > target_pts
         if overshot:
-            if not did_seek:
-                assert len(self._decoded_surfaces) >= 2, "overshot target but no previous frame"
-            if len(self._decoded_surfaces) >= 2:
-                assert self._decoded_surfaces[-2][0] <= target_pts, "previous frame is also past target"
-                pts, surface = self._decoded_surfaces[-2]
-            else:
-                # After seek: only 1 surface due to DTS/PTS gap
-                pts, surface = self._decoded_surfaces[-1]
+            # IMPORTANT: DO NOT remove these assertions. They catch real bugs.
+            assert len(self._decoded_surfaces) >= 2, "overshot target but no previous frame"
+            assert self._decoded_surfaces[-2][0] <= target_pts, "previous frame is also past target"
+            pts, surface = self._decoded_surfaces[-2]
         else:
             pts, surface = self._decoded_surfaces[-1]
         return (self.track.pts2time(pts), self.convert(surface, dtype))
+
+    def screenshot(self, target: timedelta, dtype: torch.dtype, accurate: bool = False):
+        """Extract a frame at the specified timestamp. Seeks if needed.
+
+        Returns:
+            Tuple of (time, frame) where time is timedelta.
+
+        Raises:
+            NoFrameError: If no frame could be extracted.
+        """
+        target_pts = self.track.time2pts(target)
+        seek_kts = self.should_seek(target_pts)
+        if seek_kts is not None:
+            self._start_decode(seek_kts)
+        if accurate:
+            return self.screenshot_forward(target, dtype)
+        else:
+            if seek_kts is None:
+                pts, surface = self._decoded_surfaces[-1]
+            else:
+                result = self._recv_surface()
+                assert result is not None, "seeked to keyframe but got no output"
+                pts, surface = result
+            return (self.track.pts2time(pts), self.convert(surface, dtype))
 
     def screenshots(self, dtype: torch.dtype, max_interval: timedelta):
         """Take screenshots throughout the video with interval <= max_interval.
@@ -548,35 +616,27 @@ class VideoTrackPlayer:
 
         # Find first keyframe (DTS space) — use INT_MIN to catch negative-DTS keyframes
         entry = FormatContext.index_get_entry_from_timestamp(track.stream, -(2**63), 0)
-        if entry is None:
-            return
+        assert entry is not None, "no keyframes found in stream"
 
         while True:
-            # Seek to this keyframe and yield the first decoded frame
-            self.seek_keyframe(entry.timestamp)
-            first_frame = None
-            def on_recv(surface, pts, ret):
-                nonlocal first_frame
-                if surface is not None:
-                    first_frame = True
-                    return True
-                return ret
-            self.decode(on_recv)
-            if not first_frame:
-                break
-            kf_pts = self._decoded_surfaces[-1][0]
-            yield (track.pts2time(kf_pts), self.convert(self._decoded_surfaces[-1][1], dtype))
+            # Seek to this keyframe and decode first frame
+            self._start_decode(entry.timestamp)
+            result = self._recv_surface()
+            assert result is not None, f"keyframe at ts={entry.timestamp} produced no output"
+            kf_pts, surface = result
+            kf_frame = self.convert(surface, dtype)
+            yield (track.pts2time(kf_pts), kf_frame, track.pts2time(entry.timestamp))
 
-            # Find next keyframe entry (DTS space)
+            # Find next keyframe entry
             next_entry = FormatContext.index_get_entry_from_timestamp(
                 track.stream, entry.timestamp + 1, 0
             )
             if next_entry is None:
                 break
 
-            gap_dts = next_entry.timestamp - entry.timestamp
+            gap_ts = next_entry.timestamp - entry.timestamp
 
-            if gap_dts <= max_gap:
+            if gap_ts <= max_gap:
                 # Dense keyframes — skip ahead to the farthest keyframe within max_interval
                 kf = next_entry
                 while True:
@@ -591,17 +651,23 @@ class VideoTrackPlayer:
                 entry = kf
             else:
                 # Sparse keyframes — fill the gap with evenly spaced screenshots
-                n = gap_dts // max_gap + 1
+                n = gap_ts // max_gap + 1
                 step_td = (track.pts2time(next_entry.timestamp) - track.pts2time(entry.timestamp)) / n
                 last_yield_time = track.pts2time(kf_pts)
                 for j in range(1, n):
                     fill_time = last_yield_time + step_td * j
-                    t, frame = self.screenshot(fill_time, dtype, accurate=True)
-                    yield (t, frame)
+                    t, frame = self.screenshot_forward(fill_time, dtype)
+                    yield (t, frame, None)
                 entry = next_entry
 
     def free(self):
+        self._discard()
+        self._cmd_q.put(None)
+        self._thread.join()
         self.decoder.free()
+
+    def __del__(self):
+        self.free()
 
     def __enter__(self):
         return self
@@ -638,3 +704,4 @@ class Player(VideoTrackPlayer):
             raise ValueError(f'{url} has {len(tracks)} video tracks, specify track_idx')
         super().__init__(track, num_surfaces=2, target_size=target_size, cropping=cropping, target_rect=target_rect, device=device)
         self.url = url
+        self.seek(timedelta(0))
