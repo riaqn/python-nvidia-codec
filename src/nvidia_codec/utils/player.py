@@ -650,18 +650,54 @@ class VideoTrackPlayer:
     def screenshots(self, dtype: torch.dtype, max_interval: timedelta):
         """Take screenshots throughout the video with interval <= max_interval.
 
-        Walks keyframe index (DTS space). For dense keyframes, skips ahead.
-        For sparse gaps, decodes forward with evenly spaced screenshots.
+        If the file has a keyframe index, walks it efficiently (seeking + fills).
+        Otherwise, falls back to sequential keyframe decode.
 
         Yields:
-            Tuple of (timedelta, frame) where frame is [C, H, W] tensor on GPU.
+            Tuple of (timedelta, frame, kts_timedelta_or_none).
         """
         track = self.track
-        max_gap = int(max_interval.total_seconds() / float(track._time_base))
 
-        # Find first keyframe (DTS space) — use INT_MIN to catch negative-DTS keyframes
-        entry = FormatContext.index_get_entry_from_timestamp(track.stream, -(2**63), 0)
-        assert entry is not None, "no keyframes found in stream"
+        # Detect if file has a usable keyframe index
+        first = FormatContext.index_get_entry_from_timestamp(track.stream, -(2**63), 0)
+        assert first is not None, "no keyframes found in stream"
+        second = FormatContext.index_get_entry_from_timestamp(
+            track.stream, first.timestamp + 1, 0
+        )
+        has_index = second is not None
+
+        if has_index:
+            yield from self._screenshots_indexed(dtype, max_interval, first)
+        else:
+            yield from self._screenshots_sequential(dtype, max_interval)
+
+    def _screenshots_sequential(self, dtype, max_interval):
+        """Fallback for files without keyframe index. Decode all keyframes sequentially."""
+        track = self.track
+        self.seek(timedelta(0), keyframes_only=True)
+        last_yield_time = None
+        while True:
+            result = self._recv_surface()
+            if result is None:
+                break
+            pts, surface = result
+            t = track.pts2time(pts)
+            if (
+                last_yield_time is None
+                or (t - last_yield_time).total_seconds() >= max_interval.total_seconds()
+            ):
+                yield (t, self.convert(surface, dtype), None)
+                last_yield_time = t
+        # Fill last frame near video end
+        if track.duration is not None and last_yield_time is not None:
+            if track.duration > last_yield_time:
+                t, frame = self.screenshot_forward(track.duration, dtype)
+                yield (t, frame, None)
+
+    def _screenshots_indexed(self, dtype, max_interval, entry):
+        """Walk keyframe index for files with a full index."""
+        track = self.track
+        max_gap = int(max_interval.total_seconds() / float(track._time_base))
 
         while True:
             # Seek to this keyframe and decode first frame
@@ -690,10 +726,9 @@ class VideoTrackPlayer:
 
             if gap_ts <= max_gap:
                 if is_last:
-                    # Fill one last frame near the end
-                    fill_time = track.duration - timedelta(seconds=0.1)
-                    if fill_time > track.pts2time(kf_pts):
-                        t, frame = self.screenshot_forward(fill_time, dtype)
+                    # Fill one last frame at the end
+                    if track.duration > track.pts2time(kf_pts):
+                        t, frame = self.screenshot_forward(track.duration, dtype)
                         yield (t, frame, None)
                     break
                 # Dense keyframes — skip ahead to the farthest keyframe within max_interval
