@@ -26,6 +26,7 @@ Example usage:
     for track in parser.video_tracks:
         print(track.width, track.height, track.mime_codec, track.duration)
 """
+
 from datetime import timedelta
 from fractions import Fraction
 import functools
@@ -37,7 +38,14 @@ from ..ffmpeg.libavcodec import BSFContext
 from ..ffmpeg.libavformat import FormatContext, AVMediaType, AVCodecID
 from ..ffmpeg.include.libavformat import AVINDEX_KEYFRAME
 from ..ffmpeg.include.libavcodec import AV_PKT_FLAG_KEY
-from ..ffmpeg.include.libavutil  import AV_NOPTS_VALUE, AV_TIME_BASE, AVColorRange, AVColorSpace, AVDISCARD_NONE, AVDISCARD_NONKEY
+from ..ffmpeg.include.libavutil import (
+    AV_NOPTS_VALUE,
+    AV_TIME_BASE,
+    AVColorRange,
+    AVColorSpace,
+    AVDISCARD_NONE,
+    AVDISCARD_NONKEY,
+)
 from ..ffmpeg.libavutil import dict_get
 from .compat import av2cuda, cuda2av, extract_stream_ptr
 from ..core.decode import BaseDecoder
@@ -100,7 +108,9 @@ class VideoTrack:
                 start_time = fc.infer_start_time()
                 self._start_time = int(start_time / self._time_base)
             else:
-                self._start_time = int(self._start_time / AV_TIME_BASE / self._time_base)
+                self._start_time = int(
+                    self._start_time / AV_TIME_BASE / self._time_base
+                )
 
         # Duration (lazy — probes only if needed)
         self._duration_pts = self._infer_duration()
@@ -111,7 +121,7 @@ class VideoTrack:
     def _read_extradata(self):
         cp = self.stream.codecpar.contents
         if cp.extradata_size > 0 and cp.extradata:
-            self.extradata = bytes(cp.extradata[:cp.extradata_size])
+            self.extradata = bytes(cp.extradata[: cp.extradata_size])
         else:
             self.extradata = None
 
@@ -120,58 +130,58 @@ class VideoTrack:
         if self.codec_id == AVCodecID.H264 and ed and len(ed) >= 4:
             if ed[0] == 1:
                 # AVCDecoderConfigurationRecord: version=1, profile, compat, level
-                return f'avc1.{ed[1]:02x}{ed[2]:02x}{ed[3]:02x}'
+                return f"avc1.{ed[1]:02x}{ed[2]:02x}{ed[3]:02x}"
             # Annexb format (e.g. TS files): find SPS NAL (type 0x67)
             for i in range(len(ed) - 4):
-                if ed[i:i+3] == b'\x00\x00\x01' and (ed[i+3] & 0x1f) == 7:
+                if ed[i : i + 3] == b"\x00\x00\x01" and (ed[i + 3] & 0x1F) == 7:
                     sps = i + 4
                     if sps + 2 < len(ed):
-                        return f'avc1.{ed[sps]:02x}{ed[sps+1]:02x}{ed[sps+2]:02x}'
+                        return f"avc1.{ed[sps]:02x}{ed[sps+1]:02x}{ed[sps+2]:02x}"
         if self.codec_id == AVCodecID.HEVC and ed and len(ed) >= 13:
-            profile_space = ['', 'A', 'B', 'C'][(ed[1] >> 6) & 0x3]
-            tier = 'H' if (ed[1] >> 5) & 0x1 else 'L'
-            profile_idc = ed[1] & 0x1f
+            profile_space = ["", "A", "B", "C"][(ed[1] >> 6) & 0x3]
+            tier = "H" if (ed[1] >> 5) & 0x1 else "L"
+            profile_idc = ed[1] & 0x1F
             level_idc = ed[12]
-            return f'hev1.{profile_space}{profile_idc}.4.{tier}{level_idc}'
+            return f"hev1.{profile_space}{profile_idc}.4.{tier}{level_idc}"
         if self.codec_id == AVCodecID.VP9:
-            return 'vp09.00.10.08'
+            return "vp09.00.10.08"
         if self.codec_id == AVCodecID.AV1 and ed and len(ed) >= 4:
             profile = (ed[1] >> 5) & 0x7
-            level = ed[1] & 0x1f
+            level = ed[1] & 0x1F
             tier = (ed[2] >> 7) & 0x1
-            bit_depth = {'0': 8, '1': 10, '2': 12}.get(str((ed[2] >> 5) & 0x3), 8)
+            bit_depth = {"0": 8, "1": 10, "2": 12}.get(str((ed[2] >> 5) & 0x3), 8)
             return f'av01.{profile}.{level:02d}{"H" if tier else "M"}.{bit_depth:02d}'
         if self.codec_id == AVCodecID.MPEG4:
-            return 'mp4v.20.9'
+            return "mp4v.20.9"
         if self.codec_id == AVCodecID.MPEG2:
-            return 'mp4v.61'
+            return "mp4v.61"
         if self.codec_id == AVCodecID.MPEG1:
-            return 'mp4v.6b'
+            return "mp4v.6b"
         if self.codec_id == AVCodecID.VP8:
-            return 'vp8'
+            return "vp8"
         if self.codec_id == AVCodecID.WMV3:
-            return 'wmv3'
+            return "wmv3"
         if self.codec_id == AVCodecID.WMV2:
-            return 'wmv2'
+            return "wmv2"
         if self.codec_id == AVCodecID.GIF:
-            return 'gif'
+            return "gif"
         if self.codec_id == AVCodecID.MJPEG:
-            return 'mjpeg'
+            return "mjpeg"
         if self.codec_id == AVCodecID.DVVIDEO:
-            return 'dvvideo'
+            return "dvvideo"
         if self.codec_id == AVCodecID.PRORES:
-            return 'prores'
+            return "prores"
         if self.codec_id == AVCodecID.RV40:
-            return 'rv40'
+            return "rv40"
         if self.codec_id == AVCodecID.VC1:
-            return 'vc1'
+            return "vc1"
         if self.codec_id == AVCodecID.VP6F:
-            return 'vp6f'
+            return "vp6f"
         if self.codec_id == AVCodecID.PNG:
-            return 'png'
+            return "png"
         if self.codec_id == AVCodecID.WEBP:
-            return 'webp'
-        raise ValueError(f'unknown video mime codec for codec_id={self.codec_id}')
+            return "webp"
+        raise ValueError(f"unknown video mime codec for codec_id={self.codec_id}")
 
     def _infer_duration(self):
         tb = self._time_base
@@ -182,10 +192,10 @@ class VideoTrack:
         d = self.stream.duration
         if d != AV_NOPTS_VALUE:
             return d
-        for key in ('DURATION', 'DURATION-eng'):
+        for key in ("DURATION", "DURATION-eng"):
             tag = dict_get(self.stream.metadata, key)
             if tag:
-                h, m, s = tag.split(':')
+                h, m, s = tag.split(":")
                 td = timedelta(hours=int(h), minutes=int(m), seconds=float(s))
                 return int(td.total_seconds() / tb)
         d = self.fc.av.duration
@@ -214,7 +224,9 @@ class VideoTrack:
     def pts2time(self, pts: int):
         if pts == AV_NOPTS_VALUE:
             return None
-        return timedelta(seconds=float((int(pts) - int(self._start_time)) * self._time_base))
+        return timedelta(
+            seconds=float((int(pts) - int(self._start_time)) * self._time_base)
+        )
 
 
 class AudioTrack:
@@ -239,38 +251,38 @@ class AudioTrack:
 
     def _parse_mime_codec(self):
         if self.codec_id == AVCodecID.AAC:
-            return 'mp4a.40.2'
+            return "mp4a.40.2"
         if self.codec_id == AVCodecID.MP3:
-            return 'mp4a.40.34'
+            return "mp4a.40.34"
         if self.codec_id == AVCodecID.OPUS:
-            return 'opus'
+            return "opus"
         if self.codec_id == AVCodecID.FLAC:
-            return 'flac'
+            return "flac"
         if self.codec_id == AVCodecID.AC3:
-            return 'ac-3'
+            return "ac-3"
         if self.codec_id == AVCodecID.EAC3:
-            return 'ec-3'
+            return "ec-3"
         if self.codec_id == AVCodecID.PCM_S16LE:
-            return 'pcm'
+            return "pcm"
         if self.codec_id == AVCodecID.PCM_S16BE:
-            return 'pcm'
+            return "pcm"
         if self.codec_id == AVCodecID.WMAV2:
-            return 'wmav2'
+            return "wmav2"
         if self.codec_id == AVCodecID.COOK:
-            return 'cook'
+            return "cook"
         if self.codec_id == AVCodecID.DTS:
-            return 'dts'
+            return "dts"
         if self.codec_id == AVCodecID.VORBIS:
-            return 'vorbis'
+            return "vorbis"
         if self.codec_id == AVCodecID.MP2:
-            return 'mp4a.40.33'
+            return "mp4a.40.33"
         if self.codec_id == AVCodecID.WMAPRO:
-            return 'wmapro'
+            return "wmapro"
         if self.codec_id == AVCodecID.WMALOSSLESS:
-            return 'wmalossless'
+            return "wmalossless"
         if self.codec_id.value in (65560,):  # pcm_bluray
-            return 'pcm'
-        raise ValueError(f'unknown audio mime codec for codec_id={self.codec_id}')
+            return "pcm"
+        raise ValueError(f"unknown audio mime codec for codec_id={self.codec_id}")
 
 
 def parse(url):
@@ -290,6 +302,7 @@ def parse(url):
         elif codec_type == AVMediaType.AUDIO:
             tracks.append(AudioTrack(s))
     return tracks
+
 
 class DecodeWorker:
     """Background decode worker. Runs on a dedicated thread.
@@ -311,7 +324,9 @@ class DecodeWorker:
     def flush(self):
         """Flush bsf and decoder, discarding buffered frames."""
         self.bsf.flush()
-        self.decoder.send(None, lambda pic, pts: pic.free() if pic is not None else None)
+        self.decoder.send(
+            None, lambda pic, pts: pic.free() if pic is not None else None
+        )
         self.prepend_extradata = True
 
     def run(self):
@@ -325,7 +340,7 @@ class DecodeWorker:
             except ShutDown:
                 pass
             except Exception:
-                log.exception('decode thread error')
+                log.exception("decode thread error")
                 out_q.shutdown()
 
     def decode(self, kts, out_q, keyframes_only):
@@ -349,8 +364,10 @@ class DecodeWorker:
             if self.prepend_extradata:
                 par_out = self.bsf.av.par_out.contents
                 if par_out.extradata_size > 0 and par_out.extradata:
-                    extradata = bytes(par_out.extradata[:par_out.extradata_size])
-                    arr = np.concatenate([np.frombuffer(extradata, dtype=np.uint8), arr])
+                    extradata = bytes(par_out.extradata[: par_out.extradata_size])
+                    arr = np.concatenate(
+                        [np.frombuffer(extradata, dtype=np.uint8), arr]
+                    )
                 self.prepend_extradata = False
             self.decoder.send(arr, on_recv, pts)
             if keyframes_only:
@@ -359,6 +376,7 @@ class DecodeWorker:
                 self.flush()
         self.decoder.send(None, on_recv, 0)
         out_q.put(None)
+
 
 class VideoTrackPlayer:
     """GPU-accelerated decoder for a single VideoTrack.
@@ -374,7 +392,15 @@ class VideoTrackPlayer:
         duration: Video duration as timedelta.
     """
 
-    def __init__(self, track, num_surfaces=2, target_size=None, cropping=None, target_rect=None, device=None):
+    def __init__(
+        self,
+        track,
+        num_surfaces=2,
+        target_size=None,
+        cropping=None,
+        target_rect=None,
+        device=None,
+    ):
 
         self.track = track
         self._num_surfaces = num_surfaces
@@ -388,9 +414,9 @@ class VideoTrackPlayer:
 
         codec_id = track.codec_id
         if codec_id == AVCodecID.HEVC:
-            f = 'hevc_mp4toannexb'
+            f = "hevc_mp4toannexb"
         elif codec_id == AVCodecID.H264:
-            f = 'h264_mp4toannexb'
+            f = "h264_mp4toannexb"
         else:
             f = None
 
@@ -400,15 +426,15 @@ class VideoTrackPlayer:
 
         def decide(p):
             d = {
-                'num_pictures': p['min_num_pictures'],
-                'num_surfaces': num_surfaces,
+                "num_pictures": p["min_num_pictures"],
+                "num_surfaces": num_surfaces,
             }
             if target_size is not None:
-                d['target_size'] = target_size
+                d["target_size"] = target_size
             if cropping is not None:
-                d['cropping'] = cropping
+                d["cropping"] = cropping
             if target_rect is not None:
-                d['target_rect'] = target_rect
+                d["target_rect"] = target_rect
             return d
 
         self.decoder = BaseDecoder(
@@ -451,7 +477,12 @@ class VideoTrackPlayer:
         return self.track.mime_codec
 
     def convert(self, surface, dtype):
-        return convert(surface, self.track.color_space(AVColorSpace.BT470BG), self.track.color_range(AVColorRange.MPEG), dtype)
+        return convert(
+            surface,
+            self.track.color_space(AVColorSpace.BT470BG),
+            self.track.color_range(AVColorRange.MPEG),
+            dtype,
+        )
 
     def seek(self, target: timedelta, keyframes_only=False):
         """Seek to target position and start decoding. Call frames() after."""
@@ -571,8 +602,12 @@ class VideoTrackPlayer:
         overshot = self._decoded_surfaces[-1][0] > target_pts
         if overshot:
             # IMPORTANT: DO NOT remove these assertions. They catch real bugs.
-            assert len(self._decoded_surfaces) >= 2, "overshot target but no previous frame"
-            assert self._decoded_surfaces[-2][0] <= target_pts, "previous frame is also past target"
+            assert (
+                len(self._decoded_surfaces) >= 2
+            ), "overshot target but no previous frame"
+            assert (
+                self._decoded_surfaces[-2][0] <= target_pts
+            ), "previous frame is also past target"
             pts, surface = self._decoded_surfaces[-2]
         else:
             pts, surface = self._decoded_surfaces[-1]
@@ -622,7 +657,9 @@ class VideoTrackPlayer:
             # Seek to this keyframe and decode first frame
             self._start_decode(entry.timestamp)
             result = self._recv_surface()
-            assert result is not None, f"keyframe at ts={entry.timestamp} produced no output"
+            assert (
+                result is not None
+            ), f"keyframe at ts={entry.timestamp} produced no output"
             kf_pts, surface = result
             kf_frame = self.convert(surface, dtype)
             yield (track.pts2time(kf_pts), kf_frame, track.pts2time(entry.timestamp))
@@ -652,7 +689,10 @@ class VideoTrackPlayer:
             else:
                 # Sparse keyframes — fill the gap with evenly spaced screenshots
                 n = gap_ts // max_gap + 1
-                step_td = (track.pts2time(next_entry.timestamp) - track.pts2time(entry.timestamp)) / n
+                step_td = (
+                    track.pts2time(next_entry.timestamp)
+                    - track.pts2time(entry.timestamp)
+                ) / n
                 last_yield_time = track.pts2time(kf_pts)
                 for j in range(1, n):
                     fill_time = last_yield_time + step_td * j
@@ -690,18 +730,33 @@ class Player(VideoTrackPlayer):
             process(frame)
     """
 
-    def __init__(self, url, target_size=None, cropping=None, target_rect=None, device=None, track_idx=None):
+    def __init__(
+        self,
+        url,
+        target_size=None,
+        cropping=None,
+        target_rect=None,
+        device=None,
+        track_idx=None,
+    ):
         tracks = [t for t in parse(url) if isinstance(t, VideoTrack)]
         if not tracks:
-            raise ValueError(f'{url} has no video stream')
+            raise ValueError(f"{url} has no video stream")
         if track_idx is not None:
             track = next((t for t in tracks if t.index == track_idx), None)
             if not track:
-                raise ValueError(f'{url} has no video track with index {track_idx}')
+                raise ValueError(f"{url} has no video track with index {track_idx}")
         elif len(tracks) == 1:
             track = tracks[0]
         else:
-            raise ValueError(f'{url} has {len(tracks)} video tracks, specify track_idx')
-        super().__init__(track, num_surfaces=2, target_size=target_size, cropping=cropping, target_rect=target_rect, device=device)
+            raise ValueError(f"{url} has {len(tracks)} video tracks, specify track_idx")
+        super().__init__(
+            track,
+            num_surfaces=2,
+            target_size=target_size,
+            cropping=cropping,
+            target_rect=target_rect,
+            device=device,
+        )
         self.url = url
         self.seek(timedelta(0))

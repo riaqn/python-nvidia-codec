@@ -32,6 +32,7 @@ Example:
         return tensor
     result = decoder.send(packet_data, on_recv, pts=12345)
 """
+
 from . import cuda
 from .nvcuvid import *
 from .common import *
@@ -42,9 +43,11 @@ from ctypes import *
 from threading import Condition, Semaphore
 
 import logging
+
 log = logging.getLogger(__name__)
 
-nvcuvid = cdll.LoadLibrary('libnvcuvid.so')
+nvcuvid = cdll.LoadLibrary("libnvcuvid.so")
+
 
 class Surface:
     """Post-processed decoded frame accessible as a CUDA array.
@@ -67,20 +70,29 @@ class Surface:
 
         self.decoder = decoder
 
-
         self.params = CUVIDPROCPARAMS()
         memmove(byref(self.params), byref(params), sizeof(CUVIDEOFORMAT))
 
-        self.params.output_stream = stream        
+        self.params.output_stream = stream
 
-        self.c_devptr = c_ulonglong() # according to cuviddec, the argument type of cuvidmapvideoframe64
+        self.c_devptr = (
+            c_ulonglong()
+        )  # according to cuviddec, the argument type of cuvidmapvideoframe64
         self.c_pitch = c_uint()
 
         with self.decoder.condition:
             self.decoder.condition.wait_for(lambda: self.decoder.surfaces_sem > 0)
             with cuda.Device(self.decoder.device):
-                cuda.check(nvcuvid.cuvidMapVideoFrame64(self.decoder.cuvid_decoder, c_int(index), byref(self.c_devptr), byref(self.c_pitch), byref(self.params)))
-                    # log.warning('mapped')
+                cuda.check(
+                    nvcuvid.cuvidMapVideoFrame64(
+                        self.decoder.cuvid_decoder,
+                        c_int(index),
+                        byref(self.c_devptr),
+                        byref(self.c_pitch),
+                        byref(self.params),
+                    )
+                )
+                # log.warning('mapped')
                 self.decoder.surfaces_sem -= 1
             self.decoder.condition.notify_all()
 
@@ -102,18 +114,22 @@ class Surface:
     @property
     def size(self):
         """Frame dimensions as {'width': int, 'height': int}."""
-        return {'width':self.width, 'height':self.height}
+        return {"width": self.width, "height": self.height}
 
     def free(self):
         """Release this surface back to the decoder's pool.
 
         The underlying GPU memory remains allocated by the decoder and will be
         reused for future frames. Called automatically on garbage collection.
-        """        
+        """
         with self.decoder.condition:
             if self.c_devptr and self.decoder.cuvid_decoder:
-                with cuda.Device(self.decoder.device):   
-                    cuda.check(nvcuvid.cuvidUnmapVideoFrame64(self.decoder.cuvid_decoder, self.c_devptr))
+                with cuda.Device(self.decoder.device):
+                    cuda.check(
+                        nvcuvid.cuvidUnmapVideoFrame64(
+                            self.decoder.cuvid_decoder, self.c_devptr
+                        )
+                    )
                     self.decoder.surfaces_sem += 1
                     self.c_devptr = c_ulonglong()
                     self.decoder.condition.notify_all()
@@ -123,40 +139,41 @@ class Surface:
 
     @property
     def shape(self):
-        return self.__cuda_array_interface__['shape']
+        return self.__cuda_array_interface__["shape"]
 
     @property
     def __cuda_array_interface__(self):
         format = self.format
         if format == cudaVideoSurfaceFormat.NV12:
             assert self.height % 2 == 0
-            shape = (self.height //2 * 3, self.width)
-            typestr = '|u1'
+            shape = (self.height // 2 * 3, self.width)
+            typestr = "|u1"
             strides = (self.c_pitch.value, 1)
         elif format == cudaVideoSurfaceFormat.P016:
             assert self.height % 2 == 0
-            shape = (self.height //2 * 3, self.width)
-            typestr = '<u2'
+            shape = (self.height // 2 * 3, self.width)
+            typestr = "<u2"
             strides = (self.c_pitch.value, 2)
         elif format == cudaVideoSurfaceFormat.YUV444:
             shape = (3, self.height, self.width)
-            typestr = '|u1'
+            typestr = "|u1"
             strides = (self.c_pitch.value * self.height, self.c_pitch.value, 1)
         elif format == cudaVideoSurfaceFormat.YUV444_16Bit:
             shape = (3, self.height, self.width)
-            typestr = '<u2'
+            typestr = "<u2"
             strides = (self.c_pitch.value * self.height, self.c_pitch.value, 2)
         else:
-            raise ValueError(f'unsupported format {format}')
+            raise ValueError(f"unsupported format {format}")
         return {
-            'shape': shape,
-            'typestr': typestr,
-            'strides': strides,
-            'version': 3,
-            'data': (self.c_devptr.value, False), # false = not read-only
-            'stream': self.params.output_stream
-        }        
-        
+            "shape": shape,
+            "typestr": typestr,
+            "strides": strides,
+            "version": 3,
+            "data": (self.c_devptr.value, False),  # false = not read-only
+            "stream": self.params.output_stream,
+        }
+
+
 class Picture:
     """Decoded frame before post-processing.
 
@@ -182,19 +199,19 @@ class Picture:
         The underlying GPU memory remains allocated by the decoder and will be
         reused for future frames. Called automatically on garbage collection.
         """
-        log.debug(f'freeing picture {self.index}')
+        log.debug(f"freeing picture {self.index}")
 
         with self.decoder.condition:
             # discard instead of remove
             # so this won't trigger exception
             # which is possible
             self.decoder.pictures_used.discard(self.index)
-            self.decoder.condition.notify_all()    
+            self.decoder.condition.notify_all()
 
     def __del__(self):
         self.free()
 
-    def map(self, stream : int = 0):
+    def map(self, stream: int = 0):
         """Post-process this picture and create an accessible Surface.
 
         Applies cropping, scaling, and color format conversion as configured
@@ -209,7 +226,10 @@ class Picture:
         """
         return Surface(self.decoder, self.index, self.params, stream)
 
-def decide_surface_format(chroma_format, bit_depth, supported_surface_formats, allow_high = False):
+
+def decide_surface_format(
+    chroma_format, bit_depth, supported_surface_formats, allow_high=False
+):
     """Select the best surface format for the given video parameters.
 
     Args:
@@ -225,16 +245,27 @@ def decide_surface_format(chroma_format, bit_depth, supported_surface_formats, a
     Raises:
         Exception: If the chroma format is unsupported or no compatible
             surface format is available.
-    """    
-    if chroma_format in [cudaVideoChromaFormat.YUV420, cudaVideoChromaFormat.MONOCHROME]:
-        f = cudaVideoSurfaceFormat.P016 if bit_depth > 8 and allow_high else cudaVideoSurfaceFormat.NV12
+    """
+    if chroma_format in [
+        cudaVideoChromaFormat.YUV420,
+        cudaVideoChromaFormat.MONOCHROME,
+    ]:
+        f = (
+            cudaVideoSurfaceFormat.P016
+            if bit_depth > 8 and allow_high
+            else cudaVideoSurfaceFormat.NV12
+        )
     elif chroma_format == cudaVideoChromaFormat.YUV444:
-        f = cudaVideoSurfaceFormat.YUV444_16Bit if bit_depth > 8 and allow_high else cudaVideoSurfaceFormat.YUV444
+        f = (
+            cudaVideoSurfaceFormat.YUV444_16Bit
+            if bit_depth > 8 and allow_high
+            else cudaVideoSurfaceFormat.YUV444
+        )
     elif chroma_format == cudaVideoChromaFormat.YUV422:
         f = cudaVideoSurfaceFormat.NV12
     else:
-        raise Exception(f'unexpected chroma format {chroma_format}')
-    
+        raise Exception(f"unexpected chroma format {chroma_format}")
+
     # check if the selected format is supported. If not, check fallback options
     if f not in supported_surface_formats:
         if cudaVideoSurfaceFormat.NV12 in supported_surface_formats:
@@ -243,12 +274,16 @@ def decide_surface_format(chroma_format, bit_depth, supported_surface_formats, a
             f = cudaVideoSurfaceFormat.P016
         elif cudaVideoSurfaceFormat.YUV444 in supported_surface_formats:
             f = cudaVideoSurfaceFormat.YUV444
-        elif cudaVideoSurfaceFormat.YUV444_16Bit in supported_surface_formats and allow_high:
+        elif (
+            cudaVideoSurfaceFormat.YUV444_16Bit in supported_surface_formats
+            and allow_high
+        ):
             f = cudaVideoSurfaceFormat.YUV444_16Bit
         else:
             raise Exception("No supported surface format")
 
     return f
+
 
 class BaseDecoder:
     """NVDEC hardware decoder with callback-based frame delivery.
@@ -262,27 +297,35 @@ class BaseDecoder:
     pool sizes via the decide callback to balance memory usage and throughput.
     """
 
-    def catch_exception(self, func, return_on_error = 0):
+    def catch_exception(self, func, return_on_error=0):
         """Wrap callbacks to capture exceptions and return error codes."""
+
         def wrapper(*args, **kwargs):
             try:
                 return func(*args, **kwargs)
-            except BaseException as e: # catch keyboard interrupt as well
-                log.debug(f'callback exception logged {e}')
+            except BaseException as e:  # catch keyboard interrupt as well
+                log.debug(f"callback exception logged {e}")
                 # we record the exception; to be checked when nvcuvid propagate the error return code
                 self.exception = e
-                log.debug(f'returning error code {return_on_error}')
+                log.debug(f"returning error code {return_on_error}")
                 return return_on_error
+
         return wrapper
 
     def handleVideoSequence(self, pUserData, pVideoFormat):
-        log.debug('sequence')
+        log.debug("sequence")
         vf = pVideoFormat.contents
 
         if self.cuvid_decoder:
             # Only compare fields that affect decoder configuration
             # frame_rate and other metadata can vary after seek within the same video
-            essential = ['codec', 'coded_width', 'coded_height', 'chroma_format', 'bit_depth_luma_minus8']
+            essential = [
+                "codec",
+                "coded_width",
+                "coded_height",
+                "chroma_format",
+                "bit_depth_luma_minus8",
+            ]
             mismatches = [
                 (f, getattr(self.video_format, f), getattr(vf, f))
                 for f in essential
@@ -292,118 +335,139 @@ class BaseDecoder:
                 return self.decode_create_info.ulNumDecodeSurfaces
             else:
                 diff = ", ".join(f"{k}: {old} -> {new}" for k, old, new in mismatches)
-                raise Exception(f"decoder already initialized with different format: {diff}")
+                raise Exception(
+                    f"decoder already initialized with different format: {diff}"
+                )
         memmove(byref(self.video_format), byref(vf), sizeof(CUVIDEOFORMAT))
         # save for user use
 
         caps = CUVIDDECODECAPS(
             eCodecType=vf.codec,
             eChromaFormat=vf.chroma_format,
-            nBitDepthMinus8=vf.bit_depth_luma_minus8
+            nBitDepthMinus8=vf.bit_depth_luma_minus8,
         )
 
         with cuda.Device(self.device):
             cuda.check(nvcuvid.cuvidGetDecoderCaps(byref(caps)))
         if caps.bIsSupported != 1:
-            raise CodecNotSupportedError(f"Codec not supported: {cudaVideoCodec(vf.codec)}")
+            raise CodecNotSupportedError(
+                f"Codec not supported: {cudaVideoCodec(vf.codec)}"
+            )
         assert vf.coded_width <= caps.nMaxWidth, "width too large"
         assert vf.coded_height <= caps.nMaxHeight, "height too large"
         assert vf.coded_width >= caps.nMinWidth, "width too small"
         assert vf.coded_height >= caps.nMinHeight, "height too small"
-        assert (vf.coded_width >> 4) * (vf.coded_height >> 4) <= caps.nMaxMBCount, "too many macroblocks"
-        
+        assert (vf.coded_width >> 4) * (
+            vf.coded_height >> 4
+        ) <= caps.nMaxMBCount, "too many macroblocks"
+
         supported_surface_formats = []
-        for surface_format in range(4): # cudaVideoSurfaceFormat:
+        for surface_format in range(4):  # cudaVideoSurfaceFormat:
             if caps.nOutputFormatMask & (1 << surface_format):
                 supported_surface_formats.append(cudaVideoSurfaceFormat(surface_format))
 
         p = {
-            'chroma_format': vf.chroma_format,
-            'bit_depth' : vf.bit_depth_luma_minus8 + 8,
-            'supported_surface_formats' : supported_surface_formats,
-            'min_num_pictures' : vf.min_num_decode_surfaces,
+            "chroma_format": vf.chroma_format,
+            "bit_depth": vf.bit_depth_luma_minus8 + 8,
+            "supported_surface_formats": supported_surface_formats,
+            "min_num_pictures": vf.min_num_decode_surfaces,
         }
 
-
-        # the default values 
+        # the default values
         decision = {
-            'num_pictures' : p['min_num_pictures'] + 1, # for simplicity
-            'num_surfaces' : 1 + 1, # for simplicity
-            'surface_format' : decide_surface_format(p['chroma_format'], p['bit_depth'], p['supported_surface_formats']),
-            'cropping' : lambda height,width : { # by default no cropping 
-                'left': 0,
-                'right' : width,
-                'top': 0,
-                'bottom' : height
+            "num_pictures": p["min_num_pictures"] + 1,  # for simplicity
+            "num_surfaces": 1 + 1,  # for simplicity
+            "surface_format": decide_surface_format(
+                p["chroma_format"], p["bit_depth"], p["supported_surface_formats"]
+            ),
+            "cropping": lambda height, width: {  # by default no cropping
+                "left": 0,
+                "right": width,
+                "top": 0,
+                "bottom": height,
             },
-            'target_size': lambda cropped_height, cropped_width: (cropped_height,cropped_width),# by default no scaling
-            'target_rect': lambda target_height, target_width : { # by default no margin
-                'left': 0,
-                'right' : target_width,
-                'top': 0,
-                'bottom' : target_height
+            "target_size": lambda cropped_height, cropped_width: (
+                cropped_height,
+                cropped_width,
+            ),  # by default no scaling
+            "target_rect": lambda target_height, target_width: {  # by default no margin
+                "left": 0,
+                "right": target_width,
+                "top": 0,
+                "bottom": target_height,
             },
         }
 
         decision |= self.decide(p)
-        c = decision['cropping'](self.height, self.width)
-        target_height, target_width = decision['target_size'](c['bottom'] - c['top'], c['right'] - c['left'])
-        tr = decision['target_rect'](target_height, target_width)
+        c = decision["cropping"](self.height, self.width)
+        target_height, target_width = decision["target_size"](
+            c["bottom"] - c["top"], c["right"] - c["left"]
+        )
+        tr = decision["target_rect"](target_height, target_width)
 
-        assert decision['num_pictures'] <= 32, f"number of pictures {decision['num_pictures']} > 32 max"
-        assert decision['surface_format'] in supported_surface_formats, f"surface format {decision['surface_format']} not supported for codec {caps.eCodecType} chroma {caps.eChromaFormat} depth {caps.nBitDepthMinus8 + 8}"
-        assert decision['num_surfaces'] >= 0, "number of surfaces must be non-negative"
+        assert (
+            decision["num_pictures"] <= 32
+        ), f"number of pictures {decision['num_pictures']} > 32 max"
+        assert (
+            decision["surface_format"] in supported_surface_formats
+        ), f"surface format {decision['surface_format']} not supported for codec {caps.eCodecType} chroma {caps.eChromaFormat} depth {caps.nBitDepthMinus8 + 8}"
+        assert decision["num_surfaces"] >= 0, "number of surfaces must be non-negative"
         da = vf.display_area
-        # the provided cropping is offsetted 
+        # the provided cropping is offsetted
         display_area = SRECT(
-            left = da.left + c['left'],
-            top = da.top + c['top'],
-            right = da.left + c['right'],
-            bottom = da.top + c['bottom']
+            left=da.left + c["left"],
+            top=da.top + c["top"],
+            right=da.left + c["right"],
+            bottom=da.top + c["bottom"],
         )
         target_rect = SRECT(
-            left = tr['left'],
-            top = tr['top'],
-            right = tr['right'],
-            bottom = tr['bottom']
+            left=tr["left"], top=tr["top"], right=tr["right"], bottom=tr["bottom"]
         )
 
         self.decode_create_info = CUVIDDECODECREATEINFO(
-            ulWidth = vf.coded_width,
-            ulHeight = vf.coded_height,
-            ulNumDecodeSurfaces = decision['num_pictures'],
-            CodecType = vf.codec,
-            ChromaFormat = vf.chroma_format,
-            ulCreationFlags = cudaVideoCreateFlags.PreferCUVID,
-            bitDepthMinus8 = vf.bit_depth_luma_minus8,
-            ulIntraDecodeOnly = 0,
-            ulMaxWidth = vf.coded_width,
-            ulMaxHeight = vf.coded_height,
-            display_area = display_area,
-            OutputFormat = decision['surface_format'],
-            DeinterlaceMode = (cudaVideoDeinterlaceMode.Weave if vf.progressive_sequence else cudaVideoDeinterlaceMode.Adaptive),
-            ulTargetWidth = target_width,
-            ulTargetHeight = target_height,
-            ulNumOutputSurfaces = decision['num_surfaces'],
-            vidLock = None,
-            target_rect = target_rect,
-            enableHistogram = 0
+            ulWidth=vf.coded_width,
+            ulHeight=vf.coded_height,
+            ulNumDecodeSurfaces=decision["num_pictures"],
+            CodecType=vf.codec,
+            ChromaFormat=vf.chroma_format,
+            ulCreationFlags=cudaVideoCreateFlags.PreferCUVID,
+            bitDepthMinus8=vf.bit_depth_luma_minus8,
+            ulIntraDecodeOnly=0,
+            ulMaxWidth=vf.coded_width,
+            ulMaxHeight=vf.coded_height,
+            display_area=display_area,
+            OutputFormat=decision["surface_format"],
+            DeinterlaceMode=(
+                cudaVideoDeinterlaceMode.Weave
+                if vf.progressive_sequence
+                else cudaVideoDeinterlaceMode.Adaptive
+            ),
+            ulTargetWidth=target_width,
+            ulTargetHeight=target_height,
+            ulNumOutputSurfaces=decision["num_surfaces"],
+            vidLock=None,
+            target_rect=target_rect,
+            enableHistogram=0,
         )
 
         # for field_name, filed_type in p._fields_:
         #     print(field_name, getattr(p, field_name))
 
         with cuda.Device(self.device):
-            cuda.check(nvcuvid.cuvidCreateDecoder(byref(self.cuvid_decoder), byref(self.decode_create_info)))
+            cuda.check(
+                nvcuvid.cuvidCreateDecoder(
+                    byref(self.cuvid_decoder), byref(self.decode_create_info)
+                )
+            )
 
         # this contains all picture indices that are still being used
         # including the ones in above, and the ones passed to user via on_recv
-        self.pictures_used = set() 
+        self.pictures_used = set()
 
-        self.surfaces_sem = decision['num_surfaces'] # number of surfaces available
+        self.surfaces_sem = decision["num_surfaces"]  # number of surfaces available
 
-        log.debug('sequence successful')
-        return decision['num_pictures']
+        log.debug("sequence successful")
+        return decision["num_pictures"]
 
     @property
     def codec(self):
@@ -413,12 +477,16 @@ class BaseDecoder:
     @property
     def height(self):
         """Original video height in pixels (before scaling)."""
-        return  self.video_format.display_area.bottom - self.video_format.display_area.top
+        return (
+            self.video_format.display_area.bottom - self.video_format.display_area.top
+        )
 
     @property
     def width(self):
         """Original video width in pixels (before scaling)."""
-        return self.video_format.display_area.right - self.video_format.display_area.left
+        return (
+            self.video_format.display_area.right - self.video_format.display_area.left
+        )
 
     @property
     def target_width(self):
@@ -436,28 +504,28 @@ class BaseDecoder:
         return self.decode_create_info.OutputFormat
 
     def handlePictureDecode(self, pUserData, pPicParams):
-        log.debug('decode')
+        log.debug("decode")
         pp = pPicParams.contents
         # assert self.cuvid_decoder, "decoder not initialized"
-        log.debug(f'decode picture index: {pp.CurrPicIdx}')
+        log.debug(f"decode picture index: {pp.CurrPicIdx}")
 
         if pp.CurrPicIdx in self.pictures_used:
-            log.info(f'{self.pictures_used}')
+            log.info(f"{self.pictures_used}")
         with self.condition:
             # wait until picture slot is available again
-            log.debug('wait_for_pictures started')
-            self.condition.wait_for(lambda:pp.CurrPicIdx not in self.pictures_used)
-            log.debug('wait_for_pictures finished')
+            log.debug("wait_for_pictures started")
+            self.condition.wait_for(lambda: pp.CurrPicIdx not in self.pictures_used)
+            log.debug("wait_for_pictures finished")
 
             # now we know that the user no longer need this picture
             # we can overwrite it
             with cuda.Device(self.device):
                 cuda.check(nvcuvid.cuvidDecodePicture(self.cuvid_decoder, byref(pp)))
 
-        return 1  
+        return 1
 
     def handlePictureDisplay(self, pUserData, pDispInfo):
-        log.debug('display')
+        log.debug("display")
         if not bool(pDispInfo):
             # EOS notification
             self.on_recv(None, 0)
@@ -469,7 +537,7 @@ class BaseDecoder:
             progressive_frame=di.progressive_frame,
             second_field=di.repeat_first_field + 1,
             top_field_first=di.top_field_first,
-            unpaired_field=di.repeat_first_field < 0
+            unpaired_field=di.repeat_first_field < 0,
         )
 
         picture = Picture(self, di.picture_index, params)
@@ -490,7 +558,15 @@ class BaseDecoder:
                 return self.operating_point | (1 << 10 if self.disp_all_layers else 0)
         return -1
 
-    def __init__(self, codec: cudaVideoCodec, decide = lambda p: {}, device = None, extradata = None, coded_width = 0, coded_height = 0):
+    def __init__(
+        self,
+        codec: cudaVideoCodec,
+        decide=lambda p: {},
+        device=None,
+        extradata=None,
+        coded_width=0,
+        coded_height=0,
+    ):
         """Initialize the decoder.
 
         Args:
@@ -523,13 +599,21 @@ class BaseDecoder:
         self.operating_point = 0
         self.disp_all_layers = False
         self.condition = Condition()
-      
-        self.video_format = CUVIDEOFORMAT() # NULL, to be filled in later
 
-        self.handleVideoSequenceCallback = PFNVIDSEQUENCECALLBACK(self.catch_exception(self.handleVideoSequence))
-        self.handlePictureDecodeCallback = PFNVIDDECODECALLBACK(self.catch_exception(self.handlePictureDecode))
-        self.handlePictureDisplayCallback = PFNVIDDISPLAYCALLBACK(self.catch_exception(self.handlePictureDisplay))
-        self.handleOperatingPointCallback = PFNVIDOPPOINTCALLBACK(self.catch_exception(self.handleOperatingPoint, -1))
+        self.video_format = CUVIDEOFORMAT()  # NULL, to be filled in later
+
+        self.handleVideoSequenceCallback = PFNVIDSEQUENCECALLBACK(
+            self.catch_exception(self.handleVideoSequence)
+        )
+        self.handlePictureDecodeCallback = PFNVIDDECODECALLBACK(
+            self.catch_exception(self.handlePictureDecode)
+        )
+        self.handlePictureDisplayCallback = PFNVIDDISPLAYCALLBACK(
+            self.catch_exception(self.handlePictureDisplay)
+        )
+        self.handleOperatingPointCallback = PFNVIDOPPOINTCALLBACK(
+            self.catch_exception(self.handleOperatingPoint, -1)
+        )
 
         # Prepare extended video info with sequence header for codecs like VC1/WMV3
         self.ext_video_info = None
@@ -546,7 +630,9 @@ class BaseDecoder:
             memmove(self.ext_video_info.raw_seqhdr_data, extradata, copy_len)
             self.ext_video_info.format.seqhdr_data_length = copy_len
             pExtVideoInfo = pointer(self.ext_video_info)
-            log.debug(f"Passing {copy_len} bytes of extradata to parser, size={coded_width}x{coded_height}")
+            log.debug(
+                f"Passing {copy_len} bytes of extradata to parser, size={coded_width}x{coded_height}"
+            )
 
         p = CUVIDPARSERPARAMS(
             CodecType=codec,
@@ -558,29 +644,31 @@ class BaseDecoder:
             pfnDecodePicture=self.handlePictureDecodeCallback,
             pfnDisplayPicture=self.handlePictureDisplayCallback,
             pfnGetOperatingPoint=self.handleOperatingPointCallback,
-            pExtVideoInfo=pExtVideoInfo
-            )
-        
+            pExtVideoInfo=pExtVideoInfo,
+        )
+
         self.device = cuda.get_current_device(device)
 
         # Early codec support check before creating parser
         # (cuvidCreateVideoParser may succeed even for unsupported codecs,
         # then cuvidParseVideoData fails with an unhelpful "unknown error")
         caps = CUVIDDECODECAPS(
-            eCodecType=codec,
-            eChromaFormat=1,  # YUV420 — most common
-            nBitDepthMinus8=0
+            eCodecType=codec, eChromaFormat=1, nBitDepthMinus8=0  # YUV420 — most common
         )
         with cuda.Device(self.device):
             cuda.check(nvcuvid.cuvidGetDecoderCaps(byref(caps)))
         if caps.bIsSupported != 1:
-            raise CodecNotSupportedError(f"Codec not supported: {cudaVideoCodec(codec)}")
+            raise CodecNotSupportedError(
+                f"Codec not supported: {cudaVideoCodec(codec)}"
+            )
 
         with self.condition:
-            cuda.check(nvcuvid.cuvidCreateVideoParser(byref(self.cuvid_parser), byref(p)))
+            cuda.check(
+                nvcuvid.cuvidCreateVideoParser(byref(self.cuvid_parser), byref(p))
+            )
             self.condition.notify_all()
 
-    def send(self, packet, on_recv, pts = 0):
+    def send(self, packet, on_recv, pts=0):
         """Send a compressed packet to the decoder.
 
         The decoder will parse the packet and invoke on_recv for each decoded
@@ -603,18 +691,20 @@ class BaseDecoder:
             # this will reset the parser internal state
             # also triggers dummy display callback
             p = CUVIDSOURCEDATAPACKET(
-                flags = (CUvideopacketflags.ENDOFSTREAM | CUvideopacketflags.NOTIFY_EOS).value,
-                payload_size = 0,
-                payload = None,
-                timestamp = 0
+                flags=(
+                    CUvideopacketflags.ENDOFSTREAM | CUvideopacketflags.NOTIFY_EOS
+                ).value,
+                payload_size=0,
+                payload=None,
+                timestamp=0,
             )
         else:
             p = CUVIDSOURCEDATAPACKET(
-                flags = CUvideopacketflags.TIMESTAMP.value,
-                payload_size = packet.shape[0],
-                payload = packet.ctypes.data_as(POINTER(c_uint8)),
-                timestamp = pts
-                )
+                flags=CUvideopacketflags.TIMESTAMP.value,
+                payload_size=packet.shape[0],
+                payload=packet.ctypes.data_as(POINTER(c_uint8)),
+                timestamp=pts,
+            )
         self.exception = None
         self.on_recv = on_recv
         with cuda.Device(self.device):
@@ -641,7 +731,7 @@ class BaseDecoder:
         with self.condition:
             if self.cuvid_parser:
                 cuda.check(nvcuvid.cuvidDestroyVideoParser(self.cuvid_parser))
-                self.cuvid_parser = CUvideoparser()                     
+                self.cuvid_parser = CUvideoparser()
             if self.cuvid_decoder:
                 with cuda.Device(self.device):
                     cuda.check(nvcuvid.cuvidDestroyDecoder(self.cuvid_decoder))
