@@ -498,8 +498,16 @@ class VideoTrackPlayer:
             dtype,
         )
 
+    def seek_to_start(self, keyframes_only=False):
+        """Seek to the first keyframe in the stream."""
+        entry = FormatContext.index_get_entry_from_timestamp(
+            self.track.stream, -(2**63), 0
+        )
+        assert entry is not None, "no keyframes found in stream"
+        self._start_decode(entry.timestamp, keyframes_only=keyframes_only)
+
     def seek(self, target: timedelta, keyframes_only=False):
-        """Seek to target position and start decoding. Call frames() after."""
+        """Seek to keyframe at-or-before target position and start decoding."""
         target_pts = self.track.time2pts(target)
         entry = FormatContext.index_get_entry_from_timestamp(
             self.track.stream, target_pts, 1
@@ -692,7 +700,7 @@ class VideoTrackPlayer:
     def _screenshots_sequential(self, dtype, max_interval):
         """Fallback for files without keyframe index. Decode all keyframes sequentially."""
         track = self.track
-        self.seek(timedelta(0), keyframes_only=True)
+        self.seek_to_start(keyframes_only=True)
         last_yield_time = None
         while True:
             result = self._recv_surface()
@@ -846,4 +854,4 @@ class Player(VideoTrackPlayer):
             device=device,
         )
         self.url = url
-        self.seek(timedelta(0))
+        self.seek_to_start()
