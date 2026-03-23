@@ -90,16 +90,6 @@ class VideoTrack:
         # Time base
         self._time_base = Fraction(stream.time_base.num, stream.time_base.den)
 
-        # Eagerly read extradata and mime_codec (may be incomplete before probe)
-        self._read_extradata()
-        self.mime_codec = self._parse_mime_codec()
-
-        # If mime_codec failed, probe and retry
-        if self.mime_codec is None and self.codec_id.value != 0:
-            self._probe()
-            self._read_extradata()
-            self.mime_codec = self._parse_mime_codec()
-
         # Start time
         self._start_time = stream.start_time
         if self._start_time == AV_NOPTS_VALUE:
@@ -113,25 +103,21 @@ class VideoTrack:
                 )
 
         # Duration (lazy — probes only if needed)
-        self._duration_pts = self._infer_duration()
 
-    def _probe(self):
-        self.fc.find_stream_info()
-
-    def _read_extradata(self):
+    @functools.cached_property
+    def extradata(self):
         cp = self.stream.codecpar.contents
         if cp.extradata_size > 0 and cp.extradata:
-            self.extradata = bytes(cp.extradata[: cp.extradata_size])
-        else:
-            self.extradata = None
+            return bytes(cp.extradata[: cp.extradata_size])
+        # Probe and retry
+        self.fc.find_stream_info()
+        if cp.extradata_size > 0 and cp.extradata:
+            return bytes(cp.extradata[: cp.extradata_size])
+        return None
 
-    def _parse_mime_codec(self):
+    @functools.cached_property
+    def mime_codec(self):
         ed = self.extradata
-        # If extradata is missing, probe the stream to populate it
-        if not ed:
-            self.fc.find_stream_info()
-            self._read_extradata()
-            ed = self.extradata
         if self.codec_id == AVCodecID.H264 and ed and len(ed) >= 4:
             if ed[0] == 1:
                 # AVCDecoderConfigurationRecord: version=1, profile, compat, level
@@ -186,14 +172,15 @@ class VideoTrack:
             return "png"
         if self.codec_id == AVCodecID.WEBP:
             return "webp"
-        raise ValueError(f"unknown video mime codec for codec_id={self.codec_id}")
+        return None
 
-    def _infer_duration(self):
+    @functools.cached_property
+    def _duration_pts(self):
         tb = self._time_base
         d = self.stream.duration
         if d != AV_NOPTS_VALUE:
             return d
-        self._probe()
+        self.fc.find_stream_info()
         d = self.stream.duration
         if d != AV_NOPTS_VALUE:
             return d
@@ -252,9 +239,9 @@ class AudioTrack:
         self.codec_id = cp.codec_id
         self.sample_rate = cp.sample_rate
         self.bit_rate = cp.bit_rate
-        self.mime_codec = self._parse_mime_codec()
 
-    def _parse_mime_codec(self):
+    @functools.cached_property
+    def mime_codec(self):
         if self.codec_id == AVCodecID.AAC:
             return "mp4a.40.2"
         if self.codec_id == AVCodecID.MP3:
@@ -287,7 +274,7 @@ class AudioTrack:
             return "wmalossless"
         if self.codec_id.value in (65560,):  # pcm_bluray
             return "pcm"
-        raise ValueError(f"unknown audio mime codec for codec_id={self.codec_id}")
+        return None
 
 
 def parse(url):
