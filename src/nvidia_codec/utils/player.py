@@ -714,10 +714,10 @@ class VideoTrackPlayer:
         # Fill last frame near video end — switch out of keyframes_only mode
         if track.duration is not None and last_yield_time is not None:
             if track.duration > last_yield_time:
-                last_kts = (
+                last_pts = (
                     self._decoded_surfaces[-1][0] if self._decoded_surfaces else 0
                 )
-                self._start_decode(last_kts, keyframes_only=False)
+                self._start_decode(last_pts, keyframes_only=False)
                 t, frame = self.screenshot_forward(track.duration, dtype)
                 yield (t, frame, None)
 
@@ -772,8 +772,6 @@ class VideoTrackPlayer:
                 entry = kf
             else:
                 # Sparse gap — fill with evenly spaced screenshots
-                # Switch out of keyframes_only mode for frame-accurate fills
-                self._start_decode(entry.timestamp, keyframes_only=False)
                 end_time = (
                     track.duration if is_last else track.pts2time(next_entry.timestamp)
                 )
