@@ -339,9 +339,15 @@ class DecodeWorker:
                 out_q.put(e)
 
     def decode(self, kts, out_q, keyframes_only):
-        """Seek to keyframe timestamp, then demux and decode all packets."""
+        """Seek then demux and decode. kts=None means seek to beginning."""
         track = self.track
-        track.fc.seek_file(track.stream, kts, min_ts=kts, max_ts=kts)
+        if kts is None:
+            track.fc.seek_file(
+                track.stream, track._start_time, max_ts=track._start_time
+            )
+        else:
+            track.fc.seek_file(track.stream, kts, min_ts=kts, max_ts=kts)
+
         self.flush()
         track.stream.discard = AVDISCARD_NONKEY if keyframes_only else AVDISCARD_NONE
         packets = track.fc.read_packets(track.stream)
@@ -489,14 +495,6 @@ class VideoTrackPlayer:
             self.track.color_range(AVColorRange.MPEG),
             dtype,
         )
-
-    def seek_to_start(self, keyframes_only=False):
-        """Seek to the first keyframe in the stream."""
-        entry = FormatContext.index_get_entry_from_timestamp(
-            self.track.stream, -(2**63), 0
-        )
-        assert entry is not None, "no keyframes found in stream"
-        self._start_decode(entry.timestamp, keyframes_only=keyframes_only)
 
     def seek(self, target: timedelta, keyframes_only=False):
         """Seek to keyframe at-or-before target position and start decoding."""
@@ -675,66 +673,25 @@ class VideoTrackPlayer:
             Tuple of (timedelta, frame, kts_timedelta_or_none).
         """
         track = self.track
-
-        # Detect if file has a usable keyframe index
-        first = FormatContext.index_get_entry_from_timestamp(track.stream, -(2**63), 0)
-        assert first is not None, "no keyframes found in stream"
-        second = FormatContext.index_get_entry_from_timestamp(
-            track.stream, first.timestamp + 1, 0
-        )
-        has_index = second is not None
-
-        if has_index:
-            yield from self._screenshots_indexed(dtype, max_interval, first)
-        else:
-            yield from self._screenshots_sequential(dtype, max_interval)
-
-    def _screenshots_sequential(self, dtype, max_interval):
-        """Fallback for files without keyframe index. Decode all keyframes sequentially."""
-        track = self.track
-        self.seek_to_start(keyframes_only=True)
-        last_yield_time = None
-        while True:
-            result = self._recv_surface()
-            if result is None:
-                break
-            pts, surface = result
-            t = track.pts2time(pts)
-            if (
-                last_yield_time is None
-                or (t - last_yield_time).total_seconds() >= max_interval.total_seconds()
-            ):
-                yield (t, self.convert(surface, dtype), None)
-                last_yield_time = t
-        # Fill last frame near video end — switch out of keyframes_only mode
-        if track.duration is not None and last_yield_time is not None:
-            if track.duration > last_yield_time:
-                last_pts = (
-                    self._decoded_surfaces[-1][0] if self._decoded_surfaces else 0
-                )
-                self._start_decode(last_pts, keyframes_only=False)
-                t, frame = self.screenshot_forward(track.duration, dtype)
-                yield (t, frame, None)
-
-    def _screenshots_indexed(self, dtype, max_interval, entry):
-        """Walk keyframe index for files with a full index."""
-        track = self.track
         max_gap = int(max_interval.total_seconds() / float(track._time_base))
+
+        # None means start of file
+        timestamp = None
 
         while True:
             # Seek to this keyframe and decode first frame
-            self._start_decode(entry.timestamp)
+            self._start_decode(timestamp)
             result = self._recv_surface()
-            assert (
-                result is not None
-            ), f"keyframe at ts={entry.timestamp} produced no output"
+            assert result is not None, f"keyframe at ts={timestamp} produced no output"
             kf_pts, surface = result
+            if timestamp is None:
+                timestamp = kf_pts
             kf_frame = self.convert(surface, dtype)
-            yield (track.pts2time(kf_pts), kf_frame, track.pts2time(entry.timestamp))
+            yield (track.pts2time(kf_pts), kf_frame, track.pts2time(timestamp))
 
             # Find next keyframe entry, or use duration as end marker
             next_entry = FormatContext.index_get_entry_from_timestamp(
-                track.stream, entry.timestamp + 1, 0
+                track.stream, timestamp + 1, 0
             )
             is_last = next_entry is None
             if is_last:
@@ -742,9 +699,9 @@ class VideoTrackPlayer:
                 if track._duration_pts is None:
                     break
                 end_ts = track._duration_pts + track._start_time
-                gap_ts = end_ts - entry.timestamp
+                gap_ts = end_ts - timestamp
             else:
-                gap_ts = next_entry.timestamp - entry.timestamp
+                gap_ts = next_entry.timestamp - timestamp
 
             if gap_ts <= max_gap:
                 if is_last:
@@ -761,17 +718,17 @@ class VideoTrackPlayer:
                     )
                     if kf_after is None:
                         break
-                    if kf_after.timestamp - entry.timestamp > max_gap:
+                    if kf_after.timestamp - timestamp > max_gap:
                         break
                     kf = kf_after
-                entry = kf
+                timestamp = kf.timestamp
             else:
                 # Sparse gap — fill with evenly spaced screenshots
                 end_time = (
                     track.duration if is_last else track.pts2time(next_entry.timestamp)
                 )
                 n = gap_ts // max_gap + 1
-                step_td = (end_time - track.pts2time(entry.timestamp)) / n
+                step_td = (end_time - track.pts2time(timestamp)) / n
                 last_yield_time = track.pts2time(kf_pts)
                 end_range = n + 1 if is_last else n
                 for j in range(1, end_range):
@@ -780,7 +737,7 @@ class VideoTrackPlayer:
                     yield (t, frame, None)
                 if is_last:
                     break
-                entry = next_entry
+                timestamp = next_entry.timestamp
 
     def free(self):
         self._discard()
@@ -846,4 +803,4 @@ class Player(VideoTrackPlayer):
             device=device,
         )
         self.url = url
-        self.seek_to_start()
+        self._start_decode(None)
