@@ -5,6 +5,7 @@ identifiers and their NVIDIA CUDA equivalents, as well as utilities
 for extracting raw CUDA stream pointers from various Python wrappers.
 """
 
+
 def extract_stream_ptr(stream):
     """Extract raw CUDA stream pointer from various Python wrappers.
 
@@ -24,27 +25,28 @@ def extract_stream_ptr(stream):
 
     Raises:
         Exception: If the stream type is not recognized.
-    """    
+    """
     if stream is None:
-        return 2 # default to per-thread default stream
+        return 2  # default to per-thread default stream
     elif isinstance(stream, int):
         return int(stream)
-    elif hasattr(stream, 'ptr'):
+    elif hasattr(stream, "ptr"):
         # cupy
         return stream.ptr
-    elif hasattr(stream, 'handle'):
+    elif hasattr(stream, "handle"):
         # pycuda
         return stream.handle
-    elif hasattr(stream, '_as_parameter_'):
+    elif hasattr(stream, "_as_parameter_"):
         # torch
         return stream.cuda_stream
     else:
-        raise Exception(f'Unknown stream type {type(stream)}')
+        raise Exception(f"Unknown stream type {type(stream)}")
 
 
 from ..ffmpeg.include.libavutil import AVPixelFormat
 from ..ffmpeg.libavcodec import AVCodecID
 from ..core.cuviddec import cudaVideoCodec, cudaVideoSurfaceFormat
+
 
 def av2cuda(x):
     """Convert FFmpeg codec ID to NVIDIA CUDA video codec.
@@ -63,9 +65,11 @@ def av2cuda(x):
         - HEVC (H.265)
         - VP9
         - AV1 (requires Ampere or newer GPU)
+        - MPEG1
         - MPEG2
         - MPEG4
         - VC1 / WMV3
+        - VP8
     """
     if isinstance(x, AVCodecID):
         if x == AVCodecID.MPEG2:
@@ -82,10 +86,17 @@ def av2cuda(x):
             return cudaVideoCodec.MPEG4
         elif x == AVCodecID.VC1 or x == AVCodecID.WMV3:
             return cudaVideoCodec.VC1
+        elif x == AVCodecID.VP8:
+            return cudaVideoCodec.VP8
+        elif x == AVCodecID.MPEG1:
+            return cudaVideoCodec.MPEG1
         else:
-            raise Exception(f'unknown codec : {x}')
+            from .. import CodecNotSupportedError
+
+            raise CodecNotSupportedError(f"Codec not supported: {x}")
     else:
-        raise Exception(f'unknown object to adapt: {x}')
+        raise Exception(f"unknown object to adapt: {x}")
+
 
 def cuda2av(x):
     """Convert NVIDIA CUDA surface format to FFmpeg pixel format.
@@ -115,6 +126,6 @@ def cuda2av(x):
         elif x == cudaVideoSurfaceFormat.YUV444_16Bit:
             return AVPixelFormat.YUV444P16LE
         else:
-            raise Exception(f'unknown surface format : {x}')
+            raise Exception(f"unknown surface format : {x}")
     else:
-        raise Exception(f'unknown object to adapt: {x}')
+        raise Exception(f"unknown object to adapt: {x}")
