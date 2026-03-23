@@ -371,11 +371,11 @@ class DecodeWorker:
                         [np.frombuffer(extradata, dtype=np.uint8), arr]
                     )
                 self.prepend_extradata = False
-            self.decoder.send(arr, on_recv, pts)
+            self.decoder.send((pts, arr), on_recv)
             if keyframes_only:
-                self.decoder.send(None, on_recv, 0)
+                self.decoder.send(None, on_recv)
                 self.flush()
-        self.decoder.send(None, on_recv, 0)
+        self.decoder.send(None, on_recv)
         out_q.put(None)
 
 
