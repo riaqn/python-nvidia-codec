@@ -324,9 +324,7 @@ class DecodeWorker:
     def flush(self):
         """Flush bsf and decoder, discarding buffered frames."""
         self.bsf.flush()
-        self.decoder.send(
-            None, lambda pic, pts: pic.free() if pic is not None else None
-        )
+        self.decoder.send(None, lambda pic: pic.free() if pic is not None else None)
 
     def run(self):
         while True:
@@ -357,13 +355,12 @@ class DecodeWorker:
         packets = track.fc.read_packets(track.stream)
         it = self.bsf.filter(packets, flush=False, reuse=True)
 
-        def on_recv(pic, pts):
+        def on_recv(pic):
             if pic is None:
                 return
-            out_q.put((pts, pic))
+            out_q.put(pic)
 
         for pkt in it:
-            # workaround: use DTS when PTS is not available
             pts = pkt.av.pts if pkt.av.pts != AV_NOPTS_VALUE else pkt.av.dts
             arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
             if self.prepend_extradata:
@@ -376,7 +373,6 @@ class DecodeWorker:
                 self.prepend_extradata = False
             self.decoder.send(arr, on_recv, pts)
             if keyframes_only:
-                # force the decoder to give the keyframe
                 self.decoder.send(None, on_recv, 0)
                 self.flush()
         self.decoder.send(None, on_recv, 0)
@@ -522,21 +518,20 @@ class VideoTrackPlayer:
         """
         if self._out_q is None:
             return None
-        item = self._out_q.get()
-        if item is None:
+        pic = self._out_q.get()
+        if pic is None:
             self.assert_decoder_eof()
             return None
-        if isinstance(item, Exception):
+        if isinstance(pic, Exception):
             self.assert_decoder_eof()
-            raise item
-        pts, pic = item
+            raise pic
         try:
             if len(self._decoded_surfaces) >= self._num_surfaces:
                 self._decoded_surfaces.pop(0)[1].free()
             stream = extract_stream_ptr(torch.cuda.current_stream(self.device))
             surface = pic.map(stream)
-            self._decoded_surfaces.append((pts, surface))
-            return (pts, surface)
+            self._decoded_surfaces.append((pic.pts, surface))
+            return (pic.pts, surface)
         finally:
             pic.free()
 
@@ -547,12 +542,12 @@ class VideoTrackPlayer:
             self._out_q.shutdown()
             while True:
                 try:
-                    item = self._out_q.get()
+                    pic = self._out_q.get()
                 except ShutDown:
                     break
-                if item is None or isinstance(item, Exception):
+                if pic is None or isinstance(pic, Exception):
+                    assert self._out_q.empty(), "decoder produced more after EOF"
                     break
-                _, pic = item
                 pic.free()
             self._out_q = None
 

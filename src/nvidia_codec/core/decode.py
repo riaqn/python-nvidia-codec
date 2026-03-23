@@ -185,11 +185,12 @@ class Picture:
     passed to your on_recv callback.
     """
 
-    def __init__(self, decoder, index, proc_params):
+    def __init__(self, decoder, index, proc_params, pts):
         """Internal constructor. Pictures are created by the decoder."""
         self.decoder = decoder
         self.index = index
         self.params = proc_params
+        self.pts = pts
         with self.decoder.condition:
             self.decoder.pictures_used.add(self.index)
 
@@ -528,7 +529,7 @@ class BaseDecoder:
         log.debug("display")
         if not bool(pDispInfo):
             # EOS notification
-            self.on_recv(None, 0)
+            self.on_recv(None)
             return 1
         # di = cast(pDispInfo, POINTER(CUVIDPARSERDISPINFO)).contents
         di = pDispInfo.contents
@@ -540,9 +541,9 @@ class BaseDecoder:
             unpaired_field=di.repeat_first_field < 0,
         )
 
-        picture = Picture(self, di.picture_index, params)
+        picture = Picture(self, di.picture_index, params, di.timestamp)
         try:
-            self.on_recv(picture, di.timestamp)
+            self.on_recv(picture)
         except:
             picture.free()
             raise
@@ -677,10 +678,9 @@ class BaseDecoder:
         Args:
             packet: Compressed video data as a 1D numpy array, or None to
                 signal end-of-stream (triggers EOS callback with picture=None).
-            on_recv: Callback function(picture, pts) called for each decoded frame.
-                - picture: Picture object, or None at end of stream
-                - pts: Presentation timestamp passed to send()
-            pts: Presentation timestamp for this packet (passed to on_recv).
+            on_recv: Callback function(picture) called for each decoded frame.
+                - picture: Picture object (with .pts field), or None at end of stream
+            pts: Presentation timestamp for this packet (stored in Picture.pts).
 
         Note:
             The packet buffer can be reused immediately after send() returns.
