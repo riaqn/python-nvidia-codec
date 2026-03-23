@@ -127,6 +127,11 @@ class VideoTrack:
 
     def _parse_mime_codec(self):
         ed = self.extradata
+        # If extradata is missing, probe the stream to populate it
+        if not ed:
+            self.fc.find_stream_info()
+            self._read_extradata()
+            ed = self.extradata
         if self.codec_id == AVCodecID.H264 and ed and len(ed) >= 4:
             if ed[0] == 1:
                 # AVCDecoderConfigurationRecord: version=1, profile, compat, level
