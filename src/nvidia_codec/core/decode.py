@@ -669,27 +669,23 @@ class BaseDecoder:
             )
             self.condition.notify_all()
 
-    def send(self, packet, on_recv, pts=0):
+    def send(self, packet, on_recv):
         """Send a compressed packet to the decoder.
 
         The decoder will parse the packet and invoke on_recv for each decoded
         frame. Frames are delivered in display order (after B-frame reordering).
 
         Args:
-            packet: Compressed video data as a 1D numpy array, or None to
-                signal end-of-stream (triggers EOS callback with picture=None).
+            packet: Either (pts, data) tuple where data is a 1D numpy array,
+                or None to signal end-of-stream (triggers EOS callback with picture=None).
             on_recv: Callback function(picture) called for each decoded frame.
                 - picture: Picture object (with .pts field), or None at end of stream
-            pts: Presentation timestamp for this packet (stored in Picture.pts).
 
         Note:
             The packet buffer can be reused immediately after send() returns.
-            Call flush() to drain any remaining frames from the reorder buffer.
         """
 
         if packet is None:
-            # this will reset the parser internal state
-            # also triggers dummy display callback
             p = CUVIDSOURCEDATAPACKET(
                 flags=(
                     CUvideopacketflags.ENDOFSTREAM | CUvideopacketflags.NOTIFY_EOS
@@ -699,10 +695,11 @@ class BaseDecoder:
                 timestamp=0,
             )
         else:
+            pts, data = packet
             p = CUVIDSOURCEDATAPACKET(
                 flags=CUvideopacketflags.TIMESTAMP.value,
-                payload_size=packet.shape[0],
-                payload=packet.ctypes.data_as(POINTER(c_uint8)),
+                payload_size=data.shape[0],
+                payload=data.ctypes.data_as(POINTER(c_uint8)),
                 timestamp=pts,
             )
         self.exception = None
