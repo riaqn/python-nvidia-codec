@@ -104,13 +104,22 @@ class VideoTrack:
 
         # Duration (lazy — probes only if needed)
 
+    def _probe(self):
+        """Probe stream info, disabling all other streams to avoid errors from corrupt tracks.
+        Guarded: avformat_find_stream_info segfaults on double-call.
+        """
+        if getattr(self.fc, "_probed", False):
+            return
+        self.fc.find_stream_info()
+        self.fc._probed = True
+
     @functools.cached_property
     def extradata(self):
         cp = self.stream.codecpar.contents
         if cp.extradata_size > 0 and cp.extradata:
             return bytes(cp.extradata[: cp.extradata_size])
         # Probe and retry
-        self.fc.find_stream_info()
+        self._probe()
         if cp.extradata_size > 0 and cp.extradata:
             return bytes(cp.extradata[: cp.extradata_size])
         return None
@@ -180,7 +189,7 @@ class VideoTrack:
         d = self.stream.duration
         if d != AV_NOPTS_VALUE:
             return d
-        self.fc.find_stream_info()
+        self._probe()
         d = self.stream.duration
         if d != AV_NOPTS_VALUE:
             return d
@@ -659,11 +668,14 @@ class VideoTrackPlayer:
                 assert surface is not None, "seeked to keyframe but got no output"
             return (self.track.pts2time(surface.pts), self.convert(surface, dtype))
 
-    def screenshots(self, dtype: torch.dtype, max_interval: timedelta):
+    def screenshots(self, dtype: torch.dtype, max_interval: timedelta, start_kts=None):
         """Take screenshots throughout the video with interval <= max_interval.
 
         If the file has a keyframe index, walks it efficiently (seeking + fills).
         Otherwise, falls back to sequential keyframe decode.
+
+        Args:
+            start_kts: Starting keyframe timestamp (int, from index). None = beginning of file.
 
         Yields:
             Tuple of (timedelta, frame, kts_timedelta_or_none).
@@ -671,8 +683,7 @@ class VideoTrackPlayer:
         track = self.track
         max_gap = int(max_interval.total_seconds() / float(track._time_base))
 
-        # None means start of file
-        timestamp = None
+        timestamp = start_kts
 
         while True:
             # Seek to this keyframe and decode first frame
