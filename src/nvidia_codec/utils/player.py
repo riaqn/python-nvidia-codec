@@ -334,6 +334,13 @@ class DecodeWorker:
             if cmd is None:
                 break
             kts, out_q, keyframes_only = cmd
+            # procotol of [out_q] between DecodeWorker and the consumer: The
+            # decoder put pictures onto the queue; it's the consumer's
+            # responsibility to free those pictures promptly. The decoder will
+            # send EOF either as None or exception, then go on to the next
+            # command; it never shutdown [out_q]. The consumer can shutdown to
+            # indicate no interest in further picture. The consumer is still
+            # responsible for freeing the remaining pictures in the queue.
             try:
                 self.decode(kts, out_q, keyframes_only)
             except ShutDown:
@@ -403,11 +410,12 @@ class VideoTrackPlayer:
         self.track = track
         self._num_surfaces = num_surfaces
 
-        # the last few decoded frames, guaranteed to be continuous. i.e., if you
-        # fetch another surface from self.out_q, it's guaranteed to strictly
-        # follow the last element in this list. when in [keyframes_only] mode,
-        # it contains at most one element (the keyframe just decoded) and get
-        # cleared before decoding the next keyframe.
+        # The queue that the decoderWorker is producing into.
+        self._out_q = None
+
+        # the last few decoded frames, guaranteed to be continuous. When in
+        # [keyframes_only] mode, it contains at most one element (the keyframe
+        # just decoded) and get cleared before decoding the next keyframe.
         self._decoded_surfaces = []
 
         codec_id = track.codec_id
@@ -417,6 +425,13 @@ class VideoTrackPlayer:
             f = "h264_mp4toannexb"
         else:
             f = None
+
+        # The decoder thread and the command queue that it reads from.
+        # INVARIANT: they must be either both None, or both not None. In the
+        # latter case, _cmd_q must be the command queue that _thread is reading
+        # from.
+        self._thread = None
+        self._cmd_q = None
 
         self.bsf = BSFContext(f, track.stream.codecpar.contents, track.stream.time_base)
 
@@ -445,7 +460,6 @@ class VideoTrackPlayer:
         )
 
         self._cmd_q = Queue()
-        self._out_q = None
         self._worker = DecodeWorker(
             self._cmd_q,
             track,
@@ -497,14 +511,23 @@ class VideoTrackPlayer:
         assert entry is not None, f"no keyframe found at or before {target}"
         self._start_decode(entry.timestamp, keyframes_only=keyframes_only)
 
+    def assert_decoder_eof(self):
+        self._out_q.shutdown()
+        assert self._out_q.empty(), "decoder produced more after EOF"
+        self._out_q = None
+
     def _recv_surface(self):
         """Get next decoded frame from queue, map to surface, store in ring buffer.
         Returns (pts, surface) or None if stream ended. Raises if decode thread errored.
         """
+        if self._out_q is None:
+            return None
         item = self._out_q.get()
         if item is None:
+            self.assert_decoder_eof()
             return None
         if isinstance(item, Exception):
+            self.assert_decoder_eof()
             raise item
         pts, pic = item
         try:
@@ -688,9 +711,13 @@ class VideoTrackPlayer:
             ):
                 yield (t, self.convert(surface, dtype), None)
                 last_yield_time = t
-        # Fill last frame near video end
+        # Fill last frame near video end — switch out of keyframes_only mode
         if track.duration is not None and last_yield_time is not None:
             if track.duration > last_yield_time:
+                last_kts = (
+                    self._decoded_surfaces[-1][0] if self._decoded_surfaces else 0
+                )
+                self._start_decode(last_kts, keyframes_only=False)
                 t, frame = self.screenshot_forward(track.duration, dtype)
                 yield (t, frame, None)
 
@@ -745,6 +772,8 @@ class VideoTrackPlayer:
                 entry = kf
             else:
                 # Sparse gap — fill with evenly spaced screenshots
+                # Switch out of keyframes_only mode for frame-accurate fills
+                self._start_decode(entry.timestamp, keyframes_only=False)
                 end_time = (
                     track.duration if is_last else track.pts2time(next_entry.timestamp)
                 )
@@ -762,8 +791,13 @@ class VideoTrackPlayer:
 
     def free(self):
         self._discard()
-        self._cmd_q.put(None)
-        self._thread.join()
+        if self._cmd_q is not None:
+            self._cmd_q.put(None)
+            self._cmd_q.shutdown()
+            self._cmd_q = None
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
         self.decoder.free()
 
     def __del__(self):
