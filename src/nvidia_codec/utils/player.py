@@ -512,7 +512,7 @@ class VideoTrackPlayer:
 
     def _recv_surface(self):
         """Get next decoded frame from queue, map to surface, store in ring buffer.
-        Returns (pts, surface) or None if stream ended. Raises if decode thread errored.
+        Returns surface or None if stream ended. Raises if decode thread errored.
         """
         if self._out_q is None:
             return None
@@ -525,11 +525,11 @@ class VideoTrackPlayer:
             raise pic
         try:
             if len(self._decoded_surfaces) >= self._num_surfaces:
-                self._decoded_surfaces.pop(0)[1].free()
+                self._decoded_surfaces.pop(0).free()
             stream = extract_stream_ptr(torch.cuda.current_stream(self.device))
             surface = pic.map(stream)
-            self._decoded_surfaces.append((pic.pts, surface))
-            return (pic.pts, surface)
+            self._decoded_surfaces.append(surface)
+            return surface
         finally:
             pic.free()
 
@@ -550,8 +550,7 @@ class VideoTrackPlayer:
             self._out_q = None
 
         while len(self._decoded_surfaces) > 0:
-            _, s = self._decoded_surfaces.pop()
-            s.free()
+            self._decoded_surfaces.pop().free()
 
     def _start_decode(self, kts: int, keyframes_only=False):
         """Seek to keyframe timestamp and start decoding. Returns the output queue.
@@ -572,11 +571,10 @@ class VideoTrackPlayer:
         """
         assert self._out_q is not None, "must seek() before frames()"
         while True:
-            result = self._recv_surface()
-            if result is None:
+            surface = self._recv_surface()
+            if surface is None:
                 break
-            pts, surface = result
-            yield (self.track.pts2time(pts), self.convert(surface, dtype))
+            yield (self.track.pts2time(surface.pts), self.convert(surface, dtype))
 
     def should_seek(self, target_pts: int):
         """Return the keyframe DTS to seek to, or None if no seek needed.
@@ -592,7 +590,7 @@ class VideoTrackPlayer:
         assert entry is not None, f"no keyframe found at or before pts={target_pts}"
         kts = entry.timestamp
         if len(self._decoded_surfaces) > 0:
-            last_pts = self._decoded_surfaces[-1][0]
+            last_pts = self._decoded_surfaces[-1].pts
             # We can decode forward if:
             # 1. We haven't passed the target yet (last_pts <= target_pts)
             # 2. The keyframe we'd seek to is at-or-before where we already are
@@ -615,29 +613,28 @@ class VideoTrackPlayer:
         target_pts = self.track.time2pts(target)
 
         while True:
-            result = self._recv_surface()
-            if result is None:
+            surface = self._recv_surface()
+            if surface is None:
                 break
-            pts, surface = result
-            if pts > target_pts:
+            if surface.pts > target_pts:
                 break
 
         if len(self._decoded_surfaces) == 0:
             raise NoFrameError(f"No frame found at {target} in {self.track.fc}")
 
-        overshot = self._decoded_surfaces[-1][0] > target_pts
+        overshot = self._decoded_surfaces[-1].pts > target_pts
         if overshot:
             # IMPORTANT: DO NOT remove these assertions. They catch real bugs.
             assert (
                 len(self._decoded_surfaces) >= 2
             ), "overshot target but no previous frame"
             assert (
-                self._decoded_surfaces[-2][0] <= target_pts
+                self._decoded_surfaces[-2].pts <= target_pts
             ), "previous frame is also past target"
-            pts, surface = self._decoded_surfaces[-2]
+            surface = self._decoded_surfaces[-2]
         else:
-            pts, surface = self._decoded_surfaces[-1]
-        return (self.track.pts2time(pts), self.convert(surface, dtype))
+            surface = self._decoded_surfaces[-1]
+        return (self.track.pts2time(surface.pts), self.convert(surface, dtype))
 
     def screenshot(self, target: timedelta, dtype: torch.dtype, accurate: bool = False):
         """Extract a frame at the specified timestamp. Seeks if needed.
@@ -656,12 +653,11 @@ class VideoTrackPlayer:
             return self.screenshot_forward(target, dtype)
         else:
             if seek_kts is None:
-                pts, surface = self._decoded_surfaces[-1]
+                surface = self._decoded_surfaces[-1]
             else:
-                result = self._recv_surface()
-                assert result is not None, "seeked to keyframe but got no output"
-                pts, surface = result
-            return (self.track.pts2time(pts), self.convert(surface, dtype))
+                surface = self._recv_surface()
+                assert surface is not None, "seeked to keyframe but got no output"
+            return (self.track.pts2time(surface.pts), self.convert(surface, dtype))
 
     def screenshots(self, dtype: torch.dtype, max_interval: timedelta):
         """Take screenshots throughout the video with interval <= max_interval.
@@ -681,13 +677,12 @@ class VideoTrackPlayer:
         while True:
             # Seek to this keyframe and decode first frame
             self._start_decode(timestamp)
-            result = self._recv_surface()
-            assert result is not None, f"keyframe at ts={timestamp} produced no output"
-            kf_pts, surface = result
+            surface = self._recv_surface()
+            assert surface is not None, f"keyframe at ts={timestamp} produced no output"
             if timestamp is None:
-                timestamp = kf_pts
+                timestamp = surface.pts
             kf_frame = self.convert(surface, dtype)
-            yield (track.pts2time(kf_pts), kf_frame, track.pts2time(timestamp))
+            yield (track.pts2time(surface.pts), kf_frame, track.pts2time(timestamp))
 
             # Find next keyframe entry, or use duration as end marker
             next_entry = FormatContext.index_get_entry_from_timestamp(
@@ -706,7 +701,7 @@ class VideoTrackPlayer:
             if gap_ts <= max_gap:
                 if is_last:
                     # Fill one last frame at the end
-                    if track.duration > track.pts2time(kf_pts):
+                    if track.duration > track.pts2time(surface.pts):
                         t, frame = self.screenshot_forward(track.duration, dtype)
                         yield (t, frame, None)
                     break
@@ -729,7 +724,7 @@ class VideoTrackPlayer:
                 )
                 n = gap_ts // max_gap + 1
                 step_td = (end_time - track.pts2time(timestamp)) / n
-                last_yield_time = track.pts2time(kf_pts)
+                last_yield_time = track.pts2time(surface.pts)
                 end_range = n + 1 if is_last else n
                 for j in range(1, end_range):
                     fill_time = last_yield_time + step_td * j

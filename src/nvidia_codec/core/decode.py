@@ -65,10 +65,11 @@ class Surface:
         shape: Array shape for __cuda_array_interface__
     """
 
-    def __init__(self, decoder, index, params, stream):
+    def __init__(self, decoder, index, params, stream, pts):
         """Internal constructor. Use Picture.map() instead."""
 
         self.decoder = decoder
+        self.pts = pts
 
         self.params = CUVIDPROCPARAMS()
         memmove(byref(self.params), byref(params), sizeof(CUVIDEOFORMAT))
@@ -225,7 +226,7 @@ class Picture:
         Returns:
             Surface that can be accessed via __cuda_array_interface__.
         """
-        return Surface(self.decoder, self.index, self.params, stream)
+        return Surface(self.decoder, self.index, self.params, stream, self.pts)
 
 
 def decide_surface_format(
