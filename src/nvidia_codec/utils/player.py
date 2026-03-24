@@ -593,9 +593,13 @@ class VideoTrackPlayer:
         since we just need the nearest keyframe.
         """
         entry = FormatContext.index_get_entry_from_timestamp(
-            self.track.stream, target_pts, 1  # find keyframe at-or-before target
+            self.track.stream,
+            target_pts,
+            AVSEEK_FLAG_BACKWARD,  # find keyframe at-or-before target
         )
-        assert entry is not None, f"no keyframe found at or before pts={target_pts}"
+        if entry is None:
+            # no keyframe found, has to decode forward
+            return None
         kts = entry.timestamp
         if len(self._decoded_surfaces) > 0:
             last_pts = self._decoded_surfaces[-1].pts
@@ -638,7 +642,7 @@ class VideoTrackPlayer:
             ), "overshot target but no previous frame"
             assert (
                 self._decoded_surfaces[-2].pts <= target_pts
-            ), "previous frame is also past target"
+            ), f"previous frame pts={self._decoded_surfaces[-2].pts} also past target_pts={target_pts}, current={self._decoded_surfaces[-1].pts}, n_surfaces={len(self._decoded_surfaces)}"
             surface = self._decoded_surfaces[-2]
         else:
             surface = self._decoded_surfaces[-1]
@@ -726,14 +730,20 @@ class VideoTrackPlayer:
             step = gap / n
             for j in range(1, n):
                 fill_time = time + step * j
-                t, frame = self.screenshot_forward(fill_time, dtype)
-                yield (t, frame, None)
+                try:
+                    t, frame = self.screenshot_forward(fill_time, dtype)
+                    yield (t, frame, None)
+                except Exception as e:
+                    yield (track.time2pts(fill_time), e, None)
             if next_kts is None:
                 break
             kts = next_kts
         # outside of loop, let's do the last frame in the video
-        t, frame = self.screenshot_forward(track.duration, dtype)
-        yield (t, frame, None)
+        try:
+            t, frame = self.screenshot_forward(track.duration, dtype)
+            yield (t, frame, None)
+        except Exception as e:
+            yield (track.time2pts(track.duration), e, None)
 
     def free(self):
         self._discard()
