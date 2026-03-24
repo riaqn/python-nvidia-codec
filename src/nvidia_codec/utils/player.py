@@ -595,7 +595,7 @@ class VideoTrackPlayer:
         entry = FormatContext.index_get_entry_from_timestamp(
             self.track.stream,
             target_pts,
-            AVSEEK_FLAG_BACKWARD,  # find keyframe at-or-before target
+            1,  # find keyframe at-or-before target
         )
         if entry is None:
             # no keyframe found, has to decode forward
