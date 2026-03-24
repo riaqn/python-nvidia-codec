@@ -734,7 +734,7 @@ class VideoTrackPlayer:
                     t, frame = self.screenshot_forward(fill_time, dtype)
                     yield (t, frame, None)
                 except Exception as e:
-                    yield (track.time2pts(fill_time), e, None)
+                    yield (fill_time, e, None)
             if next_kts is None:
                 break
             kts = next_kts
@@ -743,7 +743,7 @@ class VideoTrackPlayer:
             t, frame = self.screenshot_forward(track.duration, dtype)
             yield (t, frame, None)
         except Exception as e:
-            yield (track.time2pts(track.duration), e, None)
+            yield (track.duration, e, None)
 
     def free(self):
         self._discard()
