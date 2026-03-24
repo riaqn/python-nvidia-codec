@@ -500,12 +500,13 @@ class VideoTrackPlayer:
         return self.track.mime_codec
 
     def convert(self, surface, dtype):
-        return convert(
+        frame = convert(
             surface,
             self.track.color_space(AVColorSpace.BT470BG),
             self.track.color_range(AVColorRange.MPEG),
             dtype,
         )
+        return (self.track.pts2time(surface.pts), frame)
 
     def seek(self, target: timedelta, keyframes_only=False):
         """Seek to keyframe at-or-before target position and start decoding."""
@@ -585,7 +586,7 @@ class VideoTrackPlayer:
             surface = self._recv_surface()
             if surface is None:
                 break
-            yield (self.track.pts2time(surface.pts), self.convert(surface, dtype))
+            yield self.convert(surface, dtype)
 
     def should_seek(self, target_pts: int):
         """Return the keyframe DTS to seek to, or None if no seek needed.
@@ -645,7 +646,7 @@ class VideoTrackPlayer:
             surface = self._decoded_surfaces[-2]
         else:
             surface = self._decoded_surfaces[-1]
-        return (self.track.pts2time(surface.pts), self.convert(surface, dtype))
+        return self.convert(surface, dtype)
 
     def screenshot(self, target: timedelta, dtype: torch.dtype, accurate: bool = False):
         """Extract a frame at the specified timestamp. Seeks if needed.
@@ -668,7 +669,7 @@ class VideoTrackPlayer:
             else:
                 surface = self._recv_surface()
                 assert surface is not None, "seeked to keyframe but got no output"
-            return (self.track.pts2time(surface.pts), self.convert(surface, dtype))
+            return self.convert(surface, dtype)
 
     def screenshots(self, dtype: torch.dtype, max_interval: timedelta, start_kts=None):
         """Take screenshots throughout the video with interval <= max_interval.
@@ -680,72 +681,62 @@ class VideoTrackPlayer:
             start_kts: Starting keyframe timestamp (int, from index). None = beginning of file.
 
         Yields:
-            Tuple of (timedelta, frame, kts_timedelta_or_none).
+            Tuple of (timedelta, frame_or_exception, kts_timedelta_or_none).
+            On error, frame_or_exception is an Exception; screenshots continues iterating.
         """
         track = self.track
         max_gap = int(max_interval.total_seconds() / float(track._time_base))
 
-        timestamp = start_kts
+        kts = start_kts
 
         while True:
             # Seek to this keyframe and decode first frame
-            self._start_decode(timestamp)
-            surface = self._recv_surface()
-            assert surface is not None, f"keyframe at ts={timestamp} produced no output"
-            if timestamp is None:
-                timestamp = surface.pts
-            kf_frame = self.convert(surface, dtype)
-            yield (track.pts2time(surface.pts), kf_frame, track.pts2time(timestamp))
+            try:
+                self._start_decode(kts)
+                surface = self._recv_surface()
+                assert surface is not None, f"keyframe at ts={kts} produced no output"
+                if kts is None:
+                    kts = surface.pts
+                time, frame = self.convert(surface, dtype)
+            except Exception as e:
+                time, frame = track.pts2time(kts), e
+
+            if kts is None:
+                kts_td = None
+            else:
+                kts_td = track.pts2time(kts)
+
+            yield (time, frame, kts_td)
+
+            should_seek = self.should_seek(kts + max_gap)
+            if should_seek is not None:
+                # jump to the next keyframe and take the frame
+                kts = should_seek
+                continue
+
+            # we should decode forward
 
             # Find next keyframe entry, or use duration as end marker
             next_entry = FormatContext.index_get_entry_from_timestamp(
-                track.stream, timestamp + 1, 0
+                track.stream, kts + 1, 0
             )
-            is_last = next_entry is None
-            if is_last:
-                # No more keyframes — treat video end as the boundary
-                if track._duration_pts is None:
-                    break
-                end_ts = track._duration_pts + track._start_time
-                gap_ts = end_ts - timestamp
+            if next_entry is None:
+                next_kts = None
+                gap = track.duration - time
             else:
-                gap_ts = next_entry.timestamp - timestamp
-
-            if gap_ts <= max_gap:
-                if is_last:
-                    # Fill one last frame at the end
-                    if track.duration > track.pts2time(surface.pts):
-                        t, frame = self.screenshot_forward(track.duration, dtype)
-                        yield (t, frame, None)
-                    break
-                # Dense keyframes — skip ahead to the farthest keyframe within max_interval
-                kf = next_entry
-                while True:
-                    kf_after = FormatContext.index_get_entry_from_timestamp(
-                        track.stream, kf.timestamp + 1, 0
-                    )
-                    if kf_after is None:
-                        break
-                    if kf_after.timestamp - timestamp > max_gap:
-                        break
-                    kf = kf_after
-                timestamp = kf.timestamp
-            else:
-                # Sparse gap — fill with evenly spaced screenshots
-                end_time = (
-                    track.duration if is_last else track.pts2time(next_entry.timestamp)
-                )
-                n = gap_ts // max_gap + 1
-                step_td = (end_time - track.pts2time(timestamp)) / n
-                last_yield_time = track.pts2time(surface.pts)
-                end_range = n + 1 if is_last else n
-                for j in range(1, end_range):
-                    fill_time = last_yield_time + step_td * j
-                    t, frame = self.screenshot_forward(fill_time, dtype)
-                    yield (t, frame, None)
-                if is_last:
-                    break
-                timestamp = next_entry.timestamp
+                next_kts = next_entry.timestamp
+                gap = track.pts2time(next_kts - kts)
+            n = gap // max_interval + 1
+            step = gap / n
+            for j in range(1, n):
+                fill_time = time + step * j
+                t, frame = self.screenshot_forward(fill_time, dtype)
+                yield (t, frame, None)
+            if next_kts is None:
+                break
+        # outside of loop, let's do the last frame in the video
+        t, frame = self.screenshot_forward(track.duration, dtype)
+        yield (t, frame, None)
 
     def free(self):
         self._discard()
