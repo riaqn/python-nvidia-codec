@@ -734,6 +734,7 @@ class VideoTrackPlayer:
                 yield (t, frame, None)
             if next_kts is None:
                 break
+            kts = next_kts
         # outside of loop, let's do the last frame in the video
         t, frame = self.screenshot_forward(track.duration, dtype)
         yield (t, frame, None)
