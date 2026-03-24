@@ -348,13 +348,9 @@ class DecodeWorker:
                 out_q.put(e)
 
     def decode(self, kts, out_q, keyframes_only):
-        """Seek then demux and decode. kts=None means seek to beginning."""
+        """Seek then demux and decode. kts=None means start from current position (no seek)."""
         track = self.track
-        if kts is None:
-            track.fc.seek_file(
-                track.stream, track._start_time, max_ts=track._start_time
-            )
-        else:
+        if kts is not None:
             track.fc.seek_file(track.stream, kts, min_ts=kts, max_ts=kts)
 
         self.flush()
