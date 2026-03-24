@@ -453,6 +453,8 @@ class VideoTrackPlayer:
                 d["target_rect"] = target_rect
             return d
 
+        self.decoder = None
+
         self.decoder = BaseDecoder(
             av2cuda(codec_id),
             decide=decide,
@@ -754,7 +756,8 @@ class VideoTrackPlayer:
         if self._thread is not None:
             self._thread.join()
             self._thread = None
-        self.decoder.free()
+        if self.decoder is not None:
+            self.decoder.free()
 
     def __del__(self):
         self.free()
