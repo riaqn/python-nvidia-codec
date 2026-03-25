@@ -1,25 +1,31 @@
 from ctypes import *
 from .include.libavutil import AVDictionaryEntry
 
-lib = cdll.LoadLibrary('libavutil.so')
+lib = cdll.LoadLibrary("libavutil.so")
 
 lib.av_dict_get.restype = POINTER(AVDictionaryEntry)
 lib.av_dict_get.argtypes = [c_void_p, c_char_p, c_void_p, c_int]
 
-# Suppress FFmpeg log output. AV_LOG_QUIET = -8.
+# Suppress FFmpeg log output with a no-op callback.
+# av_log_set_level(-8) alone doesn't prevent all output.
+_log_callback_type = CFUNCTYPE(None, c_void_p, c_int, c_char_p, c_void_p)
+_noop_log = _log_callback_type(lambda *_: None)
+lib.av_log_set_callback(_noop_log)
 lib.av_log_set_level(-8)
+
 
 def dict_get(metadata, key):
     """Get a metadata tag value. Returns string or None."""
-    entry = lib.av_dict_get(metadata, key.encode('utf-8'), None, 0)
+    entry = lib.av_dict_get(metadata, key.encode("utf-8"), None, 0)
     if entry:
-        return entry.contents.value.decode('utf-8')
+        return entry.contents.value.decode("utf-8")
     return None
+
 
 def strerror(errnum):
     buf = (c_char * 256)()
     lib.av_strerror(c_int(errnum), buf, 256)
-    return buf.value.decode('utf-8')
+    return buf.value.decode("utf-8")
 
 
 # def typestr(self):
@@ -29,6 +35,7 @@ def strerror(errnum):
 #         return '<u2'
 #     else:
 #         raise Exception(f'unsupported pixel format {self}')
+
 
 def atom_size(self):
     return int(self.typestr[2:])

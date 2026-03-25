@@ -315,17 +315,11 @@ class DecodeWorker:
     Pushes (pts, pic) tuples to out_q. Consumer maps pics to surfaces.
     """
 
-    def __init__(self, cmd_q, track, bsf, decoder, prepend_extradata=False):
+    def __init__(self, cmd_q, track, bsf, decoder):
         self.cmd_q = cmd_q
         self.track = track
         self.bsf = bsf
         self.decoder = decoder
-        self.prepend_extradata = prepend_extradata
-
-    def flush(self):
-        """Flush bsf and decoder, discarding buffered frames."""
-        self.bsf.flush()
-        self.decoder.send(None, lambda pic: pic.free() if pic is not None else None)
 
     def run(self):
         while True:
@@ -353,10 +347,10 @@ class DecodeWorker:
         if kts is not None:
             track.fc.seek_file(track.stream, kts, min_ts=kts, max_ts=kts)
 
-        self.flush()
         track.stream.discard = AVDISCARD_NONKEY if keyframes_only else AVDISCARD_NONE
         packets = track.fc.read_packets(track.stream)
-        it = self.bsf.filter(packets, flush=False, reuse=True)
+        it = self.bsf.filter(packets, flush=True, reuse=True)
+        self.decoder.send(None, lambda pic: pic.free() if pic is not None else None)
 
         def on_recv(pic):
             if pic is None:
@@ -366,18 +360,10 @@ class DecodeWorker:
         for pkt in it:
             pts = pkt.av.pts if pkt.av.pts != AV_NOPTS_VALUE else pkt.av.dts
             arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
-            if self.prepend_extradata:
-                par_out = self.bsf.av.par_out.contents
-                if par_out.extradata_size > 0 and par_out.extradata:
-                    extradata = bytes(par_out.extradata[: par_out.extradata_size])
-                    arr = np.concatenate(
-                        [np.frombuffer(extradata, dtype=np.uint8), arr]
-                    )
-                self.prepend_extradata = False
             self.decoder.send((pts, arr), on_recv)
             if keyframes_only:
+                self.bsf.flush()
                 self.decoder.send(None, on_recv)
-                self.flush()
         self.decoder.send(None, on_recv)
         out_q.put(None)
 
@@ -419,9 +405,11 @@ class VideoTrackPlayer:
 
         codec_id = track.codec_id
         if codec_id == AVCodecID.HEVC:
-            f = "hevc_mp4toannexb"
+            f = "hevc_mp4toannexb,dump_extra"
         elif codec_id == AVCodecID.H264:
-            f = "h264_mp4toannexb"
+            f = "h264_mp4toannexb,dump_extra"
+        elif codec_id == AVCodecID.MPEG4:
+            f = "dump_extra"
         else:
             f = None
 
@@ -466,7 +454,6 @@ class VideoTrackPlayer:
             track,
             self.bsf,
             self.decoder,
-            prepend_extradata=(f is None),
         )
         self._thread = threading.Thread(target=self._worker.run, daemon=True)
         self._thread.start()
@@ -708,10 +695,11 @@ class VideoTrackPlayer:
 
             yield (time, frame, kts_td)
 
-            should_seek = self.should_seek(kts + max_gap)
-            if should_seek is not None:
+            next_kts = self.should_seek(kts + max_gap)
+            if next_kts is not None:
+                assert next_kts > kts
                 # jump to the next keyframe and take the frame
-                kts = should_seek
+                kts = next_kts
                 continue
 
             # we should decode forward
@@ -725,6 +713,7 @@ class VideoTrackPlayer:
                 gap = track.duration - time
             else:
                 next_kts = next_entry.timestamp
+                assert next_kts > kts
                 gap = track.pts2time(next_kts - kts)
             n = gap // max_interval + 1
             step = gap / n
@@ -810,4 +799,3 @@ class Player(VideoTrackPlayer):
             device=device,
         )
         self.url = url
-        self._start_decode(None)
