@@ -343,18 +343,19 @@ class Decoder(BaseDecoder):
         kts = start_kts
 
         while True:
-            # Seek to keyframe (if kts set) and get next frame
-            current_pts = self._screenshot_keyframe(pic_q, kts)
+            try:
+                current_pts = self._screenshot_keyframe(pic_q, kts)
+            except Exception as e:
+                pic_q.put(((kts, e), kts))
+                return
             if current_pts is None:
                 raise NoFrameError("unexpected EOF during screenshots")
 
-            # Find farthest keyframe within max_gap — skip dense keyframes
             next_kf = self._keyframe_before(current_pts + max_gap)
             if next_kf is not None and next_kf > current_pts:
                 kts = next_kf
                 continue
 
-            # No keyframe within max_gap — find the next one beyond
             far_kf = self._keyframe_after(current_pts)
             if far_kf is not None:
                 target = far_kf
@@ -364,23 +365,26 @@ class Decoder(BaseDecoder):
                 target = self.track._duration_pts + self.track._start_time
             assert target > current_pts
 
-            # Fill evenly to the target
             gap = target - current_pts
             n = (gap // max_gap) + 1
             for j in range(1, n):
-                self._decode_forward_to(current_pts + gap * j // n, pic_q)
+                fill_pts = current_pts + gap * j // n
+                try:
+                    self._decode_forward_to(fill_pts, pic_q)
+                except Exception as e:
+                    pic_q.put(((fill_pts, e), None))
+                    return
             if far_kf is None:
-                self._decode_forward_to(target, pic_q)
+                try:
+                    self._decode_forward_to(target, pic_q)
+                except Exception as e:
+                    pic_q.put(((target, e), None))
                 break
             kts = far_kf
 
     def _screenshots_thread(self, max_interval, start_kts, pic_q):
-        try:
-            self._screenshots_decode(max_interval, start_kts, pic_q)
-        except Exception as e:
-            pic_q.put((e, None))
-        finally:
-            pic_q.put(None)
+        self._screenshots_decode(max_interval, start_kts, pic_q)
+        pic_q.put(None)
 
     def screenshots(self, dtype: torch.dtype, max_interval: timedelta, start_kts=None):
         """Take screenshots throughout the video with interval <= max_interval.
@@ -406,16 +410,16 @@ class Decoder(BaseDecoder):
                     break
                 payload, kts_int = item
                 kts_td = self.track.pts2time(kts_int) if kts_int is not None else None
-                if isinstance(payload, Exception):
-                    t = kts_td if kts_td is not None else timedelta(0)
-                    yield (t, payload, kts_td)
-                else:
+                if isinstance(payload, OwnedPicture):
                     try:
                         t, frame = self._map_and_convert(payload, dtype)
                         yield (t, frame, kts_td)
                     except Exception as e:
                         payload.free()
                         yield (kts_td or timedelta(0), e, kts_td)
+                else:
+                    err_pts, exc = payload
+                    yield (self.track.pts2time(err_pts), exc, kts_td)
         finally:
             while True:
                 try:
