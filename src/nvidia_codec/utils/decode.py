@@ -179,8 +179,8 @@ class Decoder(BaseDecoder):
             elif 'post_decode' in self.__dict__:
                 del self.__dict__['post_decode']
 
-    def _seek(self, kts):
-        """Seek the demuxer to the given timestamp. Flushes NVDEC parser, resets state."""
+    def _seek_to_keyframe(self, kts):
+        """Seek to a keyframe timestamp from the index. Flushes NVDEC parser, resets state."""
         self.track.fc.seek_file(self.track.stream, kts, min_ts=kts, max_ts=kts)
         self.with_callbacks(lambda: self.send(None), post_decode=lambda pic: None)
         self._recent.clear()
@@ -247,7 +247,7 @@ class Decoder(BaseDecoder):
         # Only seek if the keyframe is behind our current position
         current = self._recent[-1].pts if self._recent else None
         if kts is not None and (current is None or kts < current):
-            self._seek(kts)
+            self._seek_to_keyframe(kts)
 
         # Decode packet by packet, map+free in callback (synchronous, no deadlock risk).
         result = [None]
@@ -283,16 +283,19 @@ class Decoder(BaseDecoder):
                 return
         self.with_callbacks(lambda: self.send(None), post_decode=post_decode)
 
-    def _get_next_frame(self, pic_q):
-        """Send packets until one frame arrives. Puts OwnedPicture on pic_q immediately
-        in the callback. Returns the PTS of the emitted frame, or None at EOF.
+    def _screenshot_keyframe(self, pic_q, kts):
+        """Seek to keyframe kts (if not None), then decode until one frame arrives.
+        Puts (OwnedPicture, kts) on pic_q immediately in the callback.
+        Returns the PTS of the emitted frame, or None at EOF.
         """
+        if kts is not None:
+            self._seek_to_keyframe(kts)
         result = [None]
         def _post(pic):
             if result[0] is not None or pic is None:
                 return
             result[0] = pic.pts
-            pic_q.put((OwnedPicture(pic), None))
+            pic_q.put((OwnedPicture(pic), kts))
         self._pump(lambda: result[0] is not None, _post)
         return result[0]
 
@@ -337,18 +340,18 @@ class Decoder(BaseDecoder):
         """
         max_gap = int(max_interval.total_seconds() / float(self.track._time_base))
 
-        self._seek(start_kts if start_kts is not None else 0)
+        kts = start_kts
 
         while True:
-            # Get next frame — puts on queue immediately in callback
-            current_pts = self._get_next_frame(pic_q)
+            # Seek to keyframe (if kts set) and get next frame
+            current_pts = self._screenshot_keyframe(pic_q, kts)
             if current_pts is None:
                 raise NoFrameError("unexpected EOF during screenshots")
 
             # Find farthest keyframe within max_gap — skip dense keyframes
             next_kf = self._keyframe_before(current_pts + max_gap)
             if next_kf is not None and next_kf > current_pts:
-                self._seek(next_kf)
+                kts = next_kf
                 continue
 
             # No keyframe within max_gap — find the next one beyond
@@ -361,15 +364,15 @@ class Decoder(BaseDecoder):
                 target = self.track._duration_pts + self.track._start_time
             assert target > current_pts
 
-            # Fill evenly to the target, then seek if there's a keyframe
+            # Fill evenly to the target
             gap = target - current_pts
             n = (gap // max_gap) + 1
-            for j in range(1, n + (0 if far_kf is not None else 1)):
+            for j in range(1, n):
                 self._decode_forward_to(current_pts + gap * j // n, pic_q)
-            if far_kf is not None:
-                self._seek(far_kf)
-            else:
+            if far_kf is None:
+                self._decode_forward_to(target, pic_q)
                 break
+            kts = far_kf
 
     def _screenshots_thread(self, max_interval, start_kts, pic_q):
         try:
