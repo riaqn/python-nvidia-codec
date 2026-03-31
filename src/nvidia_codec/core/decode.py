@@ -540,10 +540,10 @@ class BaseDecoder:
             raise self.exception
 
     def free(self):
-        if self.cuvid_parser:
+        if getattr(self, 'cuvid_parser', None):
             cuda.check(nvcuvid.cuvidDestroyVideoParser(self.cuvid_parser))
             self.cuvid_parser = CUvideoparser()
-        if self.cuvid_decoder:
+        if getattr(self, 'cuvid_decoder', None):
             with cuda.Device(self.device):
                 cuda.check(nvcuvid.cuvidDestroyDecoder(self.cuvid_decoder))
                 self.cuvid_decoder = CUvideodecoder()
