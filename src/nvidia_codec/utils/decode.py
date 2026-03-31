@@ -3,7 +3,7 @@
 import collections
 from datetime import timedelta
 import numpy as np
-from queue import Queue
+from queue import Queue, ShutDown
 import threading
 
 from ..ffmpeg.libavcodec import BSFContext
@@ -17,6 +17,7 @@ from ..ffmpeg.include.libavutil import (
 )
 from .compat import av2cuda, extract_stream_ptr
 from ..core.decode import BaseDecoder, Picture, Surface
+from ..ffmpeg.common import AVException
 from .color import convert
 from .demux import VideoTrack
 from .. import NoFrameError
@@ -157,6 +158,10 @@ class Decoder(BaseDecoder):
             self._slots[pic.index] = pic
             self._recent.append(pic)
 
+    def _is_valid(self, pic):
+        """Check if a picture's slot hasn't been overwritten by NVDEC."""
+        return self._slots.get(pic.index) is pic
+
     def with_callbacks(self, func, post_decode=None):
         """Run func() with a temporary post_decode extension.
 
@@ -205,19 +210,24 @@ class Decoder(BaseDecoder):
         self.send(None)
 
     def _map_and_convert(self, pic, dtype):
-        """Map an OwnedPicture to a tensor. Frees pic and surface. Returns (timedelta, frame)."""
-        stream = extract_stream_ptr(torch.cuda.current_stream(self.device))
-        surface = pic.map(stream)  # OwnedSurface acquires surface_sem
-        pic.free()                 # releases picture slot sem
-        frame = convert(
-            surface,
-            self.track.color_space(AVColorSpace.BT470BG),
-            self.track.color_range(AVColorRange.MPEG),
-            dtype,
-        )
-        t = self.track.pts2time(surface.pts)
-        surface.free()             # releases surface sem
-        return (t, frame)
+        """Map an OwnedPicture to a tensor. Frees pic and surface.
+        Returns (timedelta, frame) on success, (timedelta, exception) on error."""
+        t = self.track.pts2time(pic.pts)
+        try:
+            stream = extract_stream_ptr(torch.cuda.current_stream(self.device))
+            surface = pic.map(stream)
+            pic.free()
+            frame = convert(
+                surface,
+                self.track.color_space(AVColorSpace.BT470BG),
+                self.track.color_range(AVColorRange.MPEG),
+                dtype,
+            )
+            surface.free()
+            return (t, frame)
+        except Exception as e:
+            pic.free()
+            return (t, e)
 
     def screenshot(self, target: timedelta, dtype: torch.dtype, accurate: bool = False):
         """Extract a frame at the specified timestamp. Synchronous (no thread).
@@ -228,24 +238,16 @@ class Decoder(BaseDecoder):
         kts = self._keyframe_before(target_pts)
 
         # Check if we can serve from _recent without seeking.
-        # Only pictures still in _slots are valid (not overwritten by NVDEC).
-        def _valid(p):
-            return self._slots.get(p.index) is p
-
-        if self._recent:
+        if len(self._recent) > 0:
             kts_pts = kts if kts is not None else 0
-            if not accurate:
-                # Best frame: from the right keyframe context, at-or-before target
-                candidates = [p for p in self._recent if kts_pts <= p.pts <= target_pts and _valid(p)]
-                if candidates:
-                    return self._map_and_convert(candidates[-1], dtype)
-            else:
-                before = [p for p in self._recent if p.pts <= target_pts and p.pts >= kts_pts and _valid(p)]
-                after = [p for p in self._recent if p.pts > target_pts]
-                if before and after:
-                    return self._map_and_convert(before[-1], dtype)
+            best = next((p for p in reversed(self._recent) if kts_pts <= p.pts <= target_pts and self._is_valid(p)), None)
+            if best is not None:
+                if not accurate:
+                    return self._map_and_convert(best, dtype)
+                elif any(p.pts > target_pts for p in self._recent):
+                    return self._map_and_convert(best, dtype)
         # Only seek if the keyframe is behind our current position
-        current = self._recent[-1].pts if self._recent else None
+        current = self._recent[-1].pts if len(self._recent) > 0 else None
         if kts is not None and (current is None or kts < current):
             self._seek_to_keyframe(kts)
 
@@ -285,18 +287,25 @@ class Decoder(BaseDecoder):
 
     def _screenshot_keyframe(self, pic_q, kts):
         """Seek to keyframe kts (if not None), then decode until one frame arrives.
-        Puts (OwnedPicture, kts) on pic_q immediately in the callback.
-        Returns the PTS of the emitted frame, or None at EOF.
+        Always puts exactly one item on pic_q: either (OwnedPicture, kts) or ((pts, exception), kts).
+        Returns the PTS of the emitted frame, or None if nothing was produced.
         """
-        if kts is not None:
-            self._seek_to_keyframe(kts)
         result = [None]
         def _post(pic):
             if result[0] is not None or pic is None:
                 return
             result[0] = pic.pts
             pic_q.put((OwnedPicture(pic), kts))
-        self._pump(lambda: result[0] is not None, _post)
+        try:
+            if kts is not None:
+                self._seek_to_keyframe(kts)
+            self._pump(lambda: result[0] is not None, _post)
+            if result[0] is None:
+                pic_q.put(((kts, NoFrameError(f"no frame at keyframe {kts}")), kts))
+        except Exception as e:
+            if isinstance(e, ShutDown):
+                raise e from None
+            pic_q.put(((kts, e), kts))
         return result[0]
 
     def _decode_forward_to(self, target_pts, pic_q):
@@ -306,13 +315,21 @@ class Decoder(BaseDecoder):
             if done[0] or pic is None:
                 return
             if pic.pts >= target_pts:
-                best = max((p for p in self._recent if p.pts <= target_pts),
-                           key=lambda p: p.pts, default=pic)
+                best = next((p for p in reversed(self._recent) if p.pts <= target_pts and self._is_valid(p)), pic)
                 pic_q.put((OwnedPicture(best), None))
                 done[0] = True
-        self._pump(lambda: done[0], _post)
-        if not done[0] and self._recent:
-            pic_q.put((OwnedPicture(self._recent[-1]), None))
+        try:
+            self._pump(lambda: done[0], _post)
+            if not done[0]:
+                best = next((p for p in reversed(self._recent) if self._is_valid(p)), None)
+                if best is not None:
+                    pic_q.put((OwnedPicture(best), None))
+                else:
+                    pic_q.put(((target_pts, NoFrameError(f"no frame at {target_pts}")), None))
+        except Exception as e:
+            if isinstance(e, ShutDown):
+                raise e from None
+            pic_q.put(((target_pts, e), None))
 
     def _keyframe_before(self, pts):
         """Find the keyframe at-or-before pts. Returns its timestamp, or None."""
@@ -343,48 +360,49 @@ class Decoder(BaseDecoder):
         kts = start_kts
 
         while True:
-            try:
-                current_pts = self._screenshot_keyframe(pic_q, kts)
-            except Exception as e:
-                pic_q.put(((kts, e), kts))
-                return
+            current_pts = self._screenshot_keyframe(pic_q, kts)
             if current_pts is None:
-                raise NoFrameError("unexpected EOF during screenshots")
+                # the keyframe failed
+                assert kts is not None, "The first frame has failed without kts, can't continue."
+                # use the kts as pts so we can continue the following frames
+                current_pts = kts
+            else:
+                if kts is None:
+                    # use the pts as kts so we can continue
+                    kts = current_pts
 
-            next_kf = self._keyframe_before(current_pts + max_gap)
-            if next_kf is not None and next_kf > current_pts:
+            next_kf = self._keyframe_before(kts + max_gap)
+            if next_kf is not None and next_kf > kts:
                 kts = next_kf
                 continue
 
-            far_kf = self._keyframe_after(current_pts)
+            far_kf = self._keyframe_after(kts)
             if far_kf is not None:
                 target = far_kf
             else:
                 if self.track._duration_pts is None:
                     raise NoFrameError("no keyframes in index and unknown duration")
                 target = self.track._duration_pts + self.track._start_time
-            assert target > current_pts
+            assert target > kts
 
-            gap = target - current_pts
+            gap = target - kts
             n = (gap // max_gap) + 1
             for j in range(1, n):
-                fill_pts = current_pts + gap * j // n
-                try:
-                    self._decode_forward_to(fill_pts, pic_q)
-                except Exception as e:
-                    pic_q.put(((fill_pts, e), None))
-                    return
+                self._decode_forward_to(current_pts + gap * j // n, pic_q)
             if far_kf is None:
-                try:
-                    self._decode_forward_to(target, pic_q)
-                except Exception as e:
-                    pic_q.put(((target, e), None))
+                self._decode_forward_to(target, pic_q)
                 break
+            assert far_kf > kts
             kts = far_kf
 
     def _screenshots_thread(self, max_interval, start_kts, pic_q):
-        self._screenshots_decode(max_interval, start_kts, pic_q)
-        pic_q.put(None)
+        try:
+            self._screenshots_decode(max_interval, start_kts, pic_q)
+            pic_q.put(None)
+        except ShutDown:
+            pass  # consumer no longer interested
+        except Exception as e:
+            pic_q.put(e)
 
     def screenshots(self, dtype: torch.dtype, max_interval: timedelta, start_kts=None):
         """Take screenshots throughout the video with interval <= max_interval.
@@ -408,28 +426,30 @@ class Decoder(BaseDecoder):
                 item = pic_q.get()
                 if item is None:
                     break
+                if isinstance(item, Exception):
+                    raise item from None
                 payload, kts_int = item
                 kts_td = self.track.pts2time(kts_int) if kts_int is not None else None
                 if isinstance(payload, OwnedPicture):
-                    try:
-                        t, frame = self._map_and_convert(payload, dtype)
-                        yield (t, frame, kts_td)
-                    except Exception as e:
-                        payload.free()
-                        yield (kts_td or timedelta(0), e, kts_td)
+                    t, frame_or_err = self._map_and_convert(payload, dtype)
+                    yield (t, frame_or_err, kts_td)
                 else:
                     err_pts, exc = payload
                     yield (self.track.pts2time(err_pts), exc, kts_td)
         finally:
-            while True:
-                try:
-                    item = pic_q.get_nowait()
-                except:
-                    break
-                if item is None:
-                    break
-                if not isinstance(item[0], Exception):
-                    item[0].free()
+            pic_q.shutdown()
+            try:
+                while True:
+                    item = pic_q.get()
+                    if item is None:
+                        break
+                    if isinstance(item, Exception):
+                        raise item from None
+                    payload, _ = item
+                    if isinstance(payload, OwnedPicture):
+                        payload.free()
+            except ShutDown:
+                pass
             thread.join(timeout=5)
 
     # free(), __del__, __enter__, __exit__ inherited from BaseDecoder
