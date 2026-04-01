@@ -212,22 +212,26 @@ class Decoder(BaseDecoder):
     def _map_and_convert(self, pic, dtype):
         """Map an OwnedPicture to a tensor. Frees pic and surface.
         Returns (timedelta, frame) on success, (timedelta, exception) on error."""
-        t = self.track.pts2time(pic.pts)
         try:
+            t = self.track.pts2time(pic.pts)
             stream = extract_stream_ptr(torch.cuda.current_stream(self.device))
             surface = pic.map(stream)
+        except Exception as e:
+            return (t, e)
+        finally:
             pic.free()
+        try:
             frame = convert(
                 surface,
                 self.track.color_space(AVColorSpace.BT470BG),
                 self.track.color_range(AVColorRange.MPEG),
                 dtype,
             )
-            surface.free()
             return (t, frame)
         except Exception as e:
-            pic.free()
             return (t, e)
+        finally:
+            surface.free()
 
     def screenshot(self, target: timedelta, dtype: torch.dtype, accurate: bool = False):
         """Extract a frame at the specified timestamp. Synchronous (no thread).
@@ -372,18 +376,22 @@ class Decoder(BaseDecoder):
                     kts = current_pts
 
             next_kf = self._keyframe_before(kts + max_gap)
-            if next_kf is not None and next_kf > kts:
+            if next_kf is not None and next_kf > kts + max_gap // 2:
                 kts = next_kf
                 continue
 
             far_kf = self._keyframe_after(kts)
+            if far_kf is not None and far_kf <= kts + max_gap:
+                # Contradicts _keyframe_before returning None — index was built by seeking.
+                # Treat as no keyframe.
+                far_kf = None
             if far_kf is not None:
                 target = far_kf
             else:
                 if self.track._duration_pts is None:
                     raise NoFrameError("no keyframes in index and unknown duration")
                 target = self.track._duration_pts + self.track._start_time
-            assert target > kts
+            assert target > kts, f"target={target} <= kts={kts}"
 
             gap = target - kts
             n = (gap // max_gap) + 1
