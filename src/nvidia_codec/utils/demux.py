@@ -65,14 +65,6 @@ class VideoTrack:
 
         # Duration (lazy — probes only if needed)
 
-    def _probe(self):
-        """Probe stream info, disabling all other streams to avoid errors from corrupt tracks.
-        Guarded: avformat_find_stream_info segfaults on double-call.
-        """
-        if getattr(self.fc, "_probed", False):
-            return
-        self.fc.find_stream_info()
-        self.fc._probed = True
 
     @functools.cached_property
     def extradata(self):
@@ -80,7 +72,7 @@ class VideoTrack:
         if cp.extradata_size > 0 and cp.extradata:
             return bytes(cp.extradata[: cp.extradata_size])
         # Probe and retry
-        self._probe()
+        self.fc.probe()
         if cp.extradata_size > 0 and cp.extradata:
             return bytes(cp.extradata[: cp.extradata_size])
         return None
@@ -150,7 +142,7 @@ class VideoTrack:
         d = self.stream.duration
         if d != AV_NOPTS_VALUE:
             return d
-        self._probe()
+        self.fc.probe()
         d = self.stream.duration
         if d != AV_NOPTS_VALUE:
             return d
@@ -256,6 +248,8 @@ def parse(url):
         audio = [t for t in tracks if isinstance(t, AudioTrack)]
     """
     fc = FormatContext(url)
+    if fc.av.nb_streams == 0:
+        fc.probe()
     tracks = []
     for s in fc.streams:
         codec_type = s.codecpar.contents.codec_type

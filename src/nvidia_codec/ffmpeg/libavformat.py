@@ -61,6 +61,13 @@ class FormatContext:
     def find_stream_info(self):
         check(lib.avformat_find_stream_info(byref(self.av), None))
 
+    def probe(self):
+        """Probe stream info. Safe to call multiple times (no-op after first)."""
+        if getattr(self, '_probed', False):
+            return
+        self.find_stream_info()
+        self._probed = True
+
     def seek_file(self, stream: AVStream, ts: int, min_ts=-(2**63), max_ts=(2**63) - 1):
         check(
             lib.avformat_seek_file(
