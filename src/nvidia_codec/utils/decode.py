@@ -313,7 +313,8 @@ class Decoder(BaseDecoder):
         return result[0]
 
     def _decode_forward_to(self, target_pts, pic_q):
-        """Decode forward (no seek) until we pass target_pts. Queue best frame."""
+        """Decode forward (no seek) until we pass target_pts. Queue best frame.
+        Returns True if target was reached, False if EOF."""
         done = [False]
         def _post(pic):
             if done[0] or pic is None:
@@ -328,12 +329,13 @@ class Decoder(BaseDecoder):
                 best = next((p for p in reversed(self._recent) if self._is_valid(p)), None)
                 if best is not None:
                     pic_q.put((OwnedPicture(best), None))
-                else:
-                    pic_q.put(((target_pts, NoFrameError(f"no frame at {target_pts}")), None))
+                return False
+            return True
         except Exception as e:
             if isinstance(e, ShutDown):
                 raise e from None
             pic_q.put(((target_pts, e), None))
+            return False
 
     def _keyframe_before(self, pts):
         """Find the keyframe at-or-before pts. Returns its timestamp, or None."""
@@ -386,22 +388,19 @@ class Decoder(BaseDecoder):
                 # Treat as no keyframe.
                 far_kf = None
             if far_kf is not None:
-                target = far_kf
+                assert far_kf > kts, f"far_kf={far_kf} <= kts={kts}"
+                gap = far_kf - kts
+                n = (gap // max_gap) + 1
+                for j in range(1, n):
+                    if not self._decode_forward_to(current_pts + gap * j // n, pic_q):
+                        break
+                kts = far_kf
             else:
-                if self.track._duration_pts is None:
-                    raise NoFrameError("no keyframes in index and unknown duration")
-                target = self.track._duration_pts + self.track._start_time
-            assert target > kts, f"target={target} <= kts={kts}"
-
-            gap = target - kts
-            n = (gap // max_gap) + 1
-            for j in range(1, n):
-                self._decode_forward_to(current_pts + gap * j // n, pic_q)
-            if far_kf is None:
-                self._decode_forward_to(target, pic_q)
+                while True:
+                    current_pts += max_gap
+                    if not self._decode_forward_to(current_pts, pic_q):
+                        break
                 break
-            assert far_kf > kts
-            kts = far_kf
 
     def _screenshots_thread(self, max_interval, start_kts, pic_q):
         try:
