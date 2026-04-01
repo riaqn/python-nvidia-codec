@@ -363,6 +363,11 @@ class Decoder(BaseDecoder):
         """
         max_gap = int(max_interval.total_seconds() / float(self.track._time_base))
 
+        # Trigger index population for containers that load it lazily (e.g. MKV Cues).
+        # If there's at most one index entry, seek to force the demuxer to load its index.
+        if self._keyframe_after(0) is None:
+            self.track.fc.seek_file(self.track.stream, -(2**63), min_ts=-(2**63), max_ts=-(2**63))
+
         kts = start_kts
 
         while True:
