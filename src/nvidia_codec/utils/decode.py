@@ -88,15 +88,16 @@ class Decoder(BaseDecoder):
     - Surface semaphore for cuvidMapVideoFrame64 (OwnedSurface manages)
 
     Args:
-        extra_pictures: Callable(min_pics) -> int, returns the number of extra
-            picture slots beyond codec minimum. Higher values allow better
-            pipelining between decode and consumer threads. Default: 2.
+        num_pictures: Callable(min_pics) -> int, returns the total number of
+            picture slots (must be >= min_pics and <= 32). Higher values allow
+            better pipelining between decode and consumer threads.
+            Default: lambda min_pics: min_pics * 2 (double the minimum).
     """
 
     def __init__(
         self,
         track,
-        extra_pictures=lambda min_pics: min_pics,
+        num_pictures=lambda min_pics: min_pics + 4,
         target_size=None,
         cropping=None,
         target_rect=None,
@@ -121,7 +122,7 @@ class Decoder(BaseDecoder):
         self.bsf = BSFContext(f, track.stream.codecpar.contents, track.stream.time_base)
 
         def decide(p):
-            num_pics = p["min_num_pictures"] + extra_pictures(p["min_num_pictures"])
+            num_pics = num_pictures(p["min_num_pictures"])
             self._slot_locks = [threading.Lock() for _ in range(num_pics)]
             self._surface_sem = threading.Semaphore(1)
             self._recent = collections.deque(maxlen=num_pics)
@@ -305,10 +306,14 @@ class Decoder(BaseDecoder):
                 self._seek_to_keyframe(kts)
             self._pump(lambda: result[0] is not None, _post)
             if result[0] is None:
+                if kts is None:
+                    raise NoFrameError("no frame at start of video")
                 pic_q.put(((kts, NoFrameError(f"no frame at keyframe {kts}")), kts))
         except Exception as e:
             if isinstance(e, ShutDown):
                 raise e from None
+            if kts is None:
+                raise
             pic_q.put(((kts, e), kts))
         return result[0]
 
@@ -373,9 +378,7 @@ class Decoder(BaseDecoder):
         while True:
             current_pts = self._screenshot_keyframe(pic_q, kts)
             if current_pts is None:
-                # the keyframe failed
-                assert kts is not None, "The first frame has failed without kts, can't continue."
-                # use the kts as pts so we can continue the following frames
+                # the keyframe failed (kts is never None here — first frame raises directly)
                 current_pts = kts
             else:
                 if kts is None:
