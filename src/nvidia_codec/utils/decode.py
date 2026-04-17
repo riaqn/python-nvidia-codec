@@ -322,29 +322,36 @@ class Decoder(BaseDecoder):
         return result[0]
 
     def _decode_forward_to(self, target_pts, pic_q):
-        """Decode forward (no seek) until we pass target_pts. Queue best frame.
-        Returns True if target was reached, False if EOF."""
-        done = [False]
+        """Decode forward (no seek) to target_pts; queue one frame, or raise.
+
+        Contract:
+        - Success: queue the most recent frame from _recent with pts <= target.
+          Returns None.
+        - Skip (first post-target frame found, but _recent has no usable frame
+          with pts <= target): raises NoFrameError. Nothing queued.
+        - EOF: raises EOFError. Nothing queued.
+        - Decoder exceptions propagate directly. Nothing queued.
+        """
+        # outcome: None=not done; True=frame queued; pts int=skip at that pts.
+        outcome = [None]
         def _post(pic):
-            if done[0] or pic is None:
+            if outcome[0] is not None or pic is None:
                 return
             if pic.pts >= target_pts:
-                best = next((p for p in reversed(self._recent) if p.pts <= target_pts and self._is_valid(p)), pic)
-                pic_q.put((OwnedPicture(best), None))
-                done[0] = True
-        try:
-            self._pump(lambda: done[0], _post)
-            if not done[0]:
-                best = next((p for p in reversed(self._recent) if self._is_valid(p)), None)
-                if best is not None:
+                best = next((p for p in reversed(self._recent) if p.pts <= target_pts and self._is_valid(p)), None)
+                if best is None:
+                    outcome[0] = pic.pts
+                else:
                     pic_q.put((OwnedPicture(best), None))
-                return False
-            return True
-        except Exception as e:
-            if isinstance(e, ShutDown):
-                raise e from None
-            pic_q.put(((target_pts, e), None))
-            return False
+                    outcome[0] = True
+        self._pump(lambda: outcome[0] is not None, _post)
+        if outcome[0] is True:
+            return
+        if outcome[0] is not None:
+            raise NoFrameError(
+                f"gap: target {target_pts}, first decoded pts {outcome[0]}"
+            )
+        raise EOFError(f"EOF at target {target_pts}")
 
     def _keyframe_before(self, pts):
         """Find the keyframe at-or-before pts. Returns its timestamp, or None."""
@@ -404,13 +411,35 @@ class Decoder(BaseDecoder):
                 gap = far_kf - kts
                 n = (gap // max_gap) + 1
                 for j in range(1, n):
-                    if not self._decode_forward_to(current_pts + gap * j // n, pic_q):
+                    target = current_pts + gap * j // n
+                    try:
+                        self._decode_forward_to(target, pic_q)
+                    except ShutDown:
+                        raise
+                    except Exception as e:
+                        # EOF or skip mid-gap → record frame-level error.
+                        # No useful "last frame" substitute here because
+                        # these are intermediate gap-fill samples.
+                        pic_q.put(((target, e), None))
                         break
                 kts = far_kf
             else:
                 while True:
                     current_pts += max_gap
-                    if not self._decode_forward_to(current_pts, pic_q):
+                    try:
+                        self._decode_forward_to(current_pts, pic_q)
+                    except ShutDown:
+                        raise
+                    except EOFError:
+                        # End of file reached during final tail sampling.
+                        # Emit the last recent frame as a best-effort last
+                        # sample and stop.
+                        best = next((p for p in reversed(self._recent) if self._is_valid(p)), None)
+                        if best is not None:
+                            pic_q.put((OwnedPicture(best), None))
+                        break
+                    except Exception as e:
+                        pic_q.put(((current_pts, e), None))
                         break
                 break
 
