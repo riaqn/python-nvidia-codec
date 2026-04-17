@@ -41,6 +41,10 @@ class OwnedSurface:
     def __getattr__(self, name):
         return getattr(self._surface, name)
 
+    @property
+    def __cuda_array_interface__(self):
+        return self._surface.__cuda_array_interface__
+
     def free(self):
         if self._surface is not None:
             self._surface.free()
