@@ -500,4 +500,150 @@ class Decoder(BaseDecoder):
                 pass
             thread.join(timeout=5)
 
+    def _frames_thread(self, dtype, end_pts, q, start_pts):
+        class _Stop(Exception):
+            pass
+
+        # If start_pts is given, the first yielded pic must be the one
+        # with the LARGEST pts <= start_pts (the frame "on screen" at
+        # `start`). Phase 1: walk forward keeping a running best
+        # candidate (held in an OwnedPicture so NVDEC can't reuse its
+        # slot). When a pic with pts > start_pts arrives, the candidate
+        # is the answer — emit it, then enter phase 2 and emit every
+        # subsequent pic normally.
+        candidate = [None]   # OwnedPicture or None
+        emitting = [start_pts is None]
+
+        def _emit(pic):
+            # Capture pic.pts (int track pts) BEFORE _map_and_convert
+            # frees the pic — the queued item carries the raw int so
+            # callers get bit-exact pts (no float round-trip loss).
+            pts_int = pic.pts
+            _, frame_or_err = self._map_and_convert(pic, dtype)
+            evt = None
+            if not isinstance(frame_or_err, Exception):
+                evt = torch.cuda.Event()
+                evt.record(stream=torch.cuda.current_stream(self.device))
+            q.put((pts_int, frame_or_err, evt))   # blocks if queue full
+
+        def _post(pic):
+            if pic is None:
+                return
+            if not emitting[0]:
+                if pic.pts <= start_pts:
+                    # Better candidate. Free the previous one (releases
+                    # its slot back to NVDEC) and own this one.
+                    if candidate[0] is not None:
+                        candidate[0].free()
+                    candidate[0] = OwnedPicture(pic)
+                    return
+                # First pic past start_pts: emit the candidate (or this
+                # pic, if no earlier frame existed) and switch to phase 2.
+                if candidate[0] is not None:
+                    _emit(candidate[0])    # _map_and_convert calls .free()
+                    candidate[0] = None
+                emitting[0] = True
+                # Fall through to emit this pic too.
+            if end_pts is not None and pic.pts > end_pts:
+                raise _Stop
+            _emit(pic)
+        try:
+            self._pump(lambda: False, _post)
+            # EOF before any pic crossed start_pts: emit the final
+            # candidate if we ever found one.
+            if not emitting[0] and candidate[0] is not None:
+                _emit(candidate[0])
+                candidate[0] = None
+        except _Stop:
+            pass
+        except ShutDown:
+            pass
+        except Exception as e:
+            try:
+                q.put(e)
+            except ShutDown:
+                pass
+        finally:
+            if candidate[0] is not None:
+                candidate[0].free()
+                candidate[0] = None
+            try:
+                q.put(None)
+            except ShutDown:
+                pass
+
+    def frames(self, dtype: torch.dtype, start: timedelta = None,
+               end: timedelta = None, start_pts: int = None,
+               end_pts: int = None, queue_size: int = 16):
+        """Yield (int_pts, frame_or_exception) for every decoded frame in
+        display order. Decodes ALL frames (B-frames included).
+
+        The yielded `int_pts` is the raw track pts (same units as
+        `pic.pts`, including the demuxer's `start_time` offset). Pass
+        through `track.pts2time(pts)` if you need a `timedelta`. Yielding
+        the integer directly avoids the lossy round-trip through float
+        seconds (`pts2time` is float-valued; `time2pts` truncates the
+        inverse) that breaks boundary-frame alignment when callers
+        re-feed timestamps back to the decoder.
+
+        `start` / `start_pts` (mutually exclusive, optional): the first
+        yielded frame is the one with the LARGEST pts ≤ start (the
+        frame "on screen" at this point). Pass `start_pts` (int) when
+        you have a raw track pts to anchor to — no rounding through
+        seconds. `start` (timedelta) is a convenience that calls
+        `time2pts` internally.
+
+        `end` / `end_pts` (mutually exclusive, optional): stop right
+        after the first frame past this point. Same `int` vs `timedelta`
+        choice as `start`.
+
+        Streams via a bounded queue: the producer thread maps + frees each
+        picture inline (so the slot is released back to NVDEC immediately),
+        then puts the converted CUDA tensor on a queue of size `queue_size`.
+        A bounded queue gives backpressure — the producer blocks when the
+        consumer is slow, capping VRAM use to roughly `queue_size` frames.
+        A CUDA Event is recorded per frame; the consumer must synchronize
+        on it before reading the tensor (the generator does this for you).
+        """
+        if end_pts is None and end is not None:
+            end_pts = self.track.time2pts(end)
+        if start_pts is None and start is not None:
+            start_pts = self.track.time2pts(start)
+        if start_pts is not None:
+            # Container index population for MKV-with-deferred-Cues etc.
+            # See screenshots() for the rationale.
+            if self._keyframe_after(0) is None:
+                self.track.fc.seek_file(self.track.stream, -(2**63),
+                                         min_ts=-(2**63), max_ts=-(2**63))
+            kts = self._keyframe_before(start_pts)
+            if kts is None:
+                kts = self._keyframe_after(0)
+            if kts is not None:
+                self._seek_to_keyframe(kts)
+
+        q = Queue(maxsize=queue_size)
+        thread = threading.Thread(
+            target=self._frames_thread,
+            args=(dtype, end_pts, q, start_pts),
+            daemon=True,
+        )
+        thread.start()
+        try:
+            while True:
+                item = q.get()
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    raise item from None
+                pts_int, frame_or_err, evt = item
+                if evt is not None:
+                    evt.synchronize()
+                yield pts_int, frame_or_err
+        finally:
+            try:
+                q.shutdown()
+            except Exception:
+                pass
+            thread.join(timeout=5)
+
     # free(), __del__, __enter__, __exit__ inherited from BaseDecoder
