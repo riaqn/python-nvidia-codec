@@ -190,7 +190,14 @@ class Decoder(BaseDecoder):
                 del self.__dict__['post_decode']
 
     def _seek_to_keyframe(self, kts):
-        """Seek to a keyframe timestamp from the index. Flushes NVDEC parser, resets state."""
+        """Seek to a keyframe by its DTS. Flushes NVDEC parser, resets state.
+
+        `kts` is the keyframe's DECODE timestamp (as returned by
+        `_keyframe_before` / `_keyframe_after`). After the seek the
+        first packet `_pump` reads will be the keyframe's packet;
+        the corresponding decoded Picture's `pts` may differ from
+        `kts` by up to `codecpar.video_delay` frames (B-frame reorder).
+        """
         self.track.fc.seek_file(self.track.stream, kts, min_ts=kts, max_ts=kts)
         self.with_callbacks(lambda: self.send(None), post_decode=lambda pic: None)
         self._recent.clear()
@@ -353,21 +360,36 @@ class Decoder(BaseDecoder):
             )
         raise EOFError(f"EOF at target {target_pts}")
 
-    def _keyframe_before(self, pts):
-        """Find the keyframe at-or-before pts. Returns its timestamp, or None."""
+    def _keyframe_before(self, dts):
+        """Find the keyframe at-or-before `dts` (in DECODE timestamp).
+
+        Returns the keyframe's DTS, or None.
+
+        DTS, NOT PTS. The container's stream index — and ffmpeg's
+        underlying `avformat_seek_file` — operate on DTS (decode order
+        is monotonic; display order isn't, with B-frames). For frames
+        with B-frame reordering, the keyframe at DTS=K may DISPLAY
+        (PTS) somewhat later, by up to `codecpar.video_delay` frames.
+        Callers wanting a PTS-based "before" must compensate for this
+        offset; this method alone does not.
+        """
         entry = FormatContext.index_get_entry_from_timestamp(
-            self.track.stream, pts, 1
+            self.track.stream, dts, 1
         )
         if entry is None:
             return None
         return entry.timestamp
 
-    def _keyframe_after(self, pts):
-        """Find the first keyframe after pts. Returns its timestamp, or None."""
+    def _keyframe_after(self, dts):
+        """Find the first keyframe after `dts` (in DECODE timestamp).
+
+        Returns the keyframe's DTS, or None. Same DTS-vs-PTS caveat as
+        `_keyframe_before` — see that docstring.
+        """
         entry = FormatContext.index_get_entry_from_timestamp(
-            self.track.stream, pts + 1, 0
+            self.track.stream, dts + 1, 0
         )
-        if entry is None or entry.timestamp <= pts:
+        if entry is None or entry.timestamp <= dts:
             return None
         return entry.timestamp
 
@@ -615,6 +637,12 @@ class Decoder(BaseDecoder):
             if self._keyframe_after(0) is None:
                 self.track.fc.seek_file(self.track.stream, -(2**63),
                                          min_ts=-(2**63), max_ts=-(2**63))
+            # KNOWN BUG: start_pts is a PTS but _keyframe_before works
+            # in DTS. For B-frame content the chosen kts can map to a
+            # keyframe whose own PTS > start_pts — the frame at PTS ==
+            # start_pts then sits in the prior GOP and the candidate-
+            # walk in _frames_thread never reaches it. Fix is pending
+            # (see docstring of _keyframe_before).
             kts = self._keyframe_before(start_pts)
             if kts is None:
                 kts = self._keyframe_after(0)
