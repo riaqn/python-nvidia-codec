@@ -26,7 +26,9 @@ class VideoTrack:
         stream: The underlying AVStream (for seeking/reading).
         fc: The parent FormatContext.
         codec_id: AVCodecID enum value.
-        mime_codec: MIME codec string (e.g. 'avc1.640028', 'hev1.1.6.L93.B0') or None.
+        mime_codec: MIME codec string (e.g. 'avc1.640028', 'hev1.1.6.L93.B0').
+            Raises NotImplementedError if the codec_id has no mapping or
+            extradata is missing/truncated.
         width: Video width in pixels.
         height: Video height in pixels.
         bit_rate: Stream bitrate.
@@ -42,8 +44,6 @@ class VideoTrack:
         self.index = stream.index
         cp = stream.codecpar.contents
         self.codec_id = cp.codec_id
-        self.width = cp.width
-        self.height = cp.height
         self.bit_rate = cp.bit_rate
         self._color_space = cp.color_space
         self._color_range = cp.color_range
@@ -67,6 +67,24 @@ class VideoTrack:
 
 
     @functools.cached_property
+    def width(self):
+        # M2TS/h264, MP4/mpeg4, MPEG-PS/mpeg2 and similar container/codec
+        # pairings leave width/height as 0 in codecpar until a packet is
+        # actually decoded — fc.probe() forces that. Same lazy-then-probe
+        # pattern as extradata below.
+        cp = self.stream.codecpar.contents
+        if cp.width == 0:
+            self.fc.probe()
+        return cp.width
+
+    @functools.cached_property
+    def height(self):
+        cp = self.stream.codecpar.contents
+        if cp.height == 0:
+            self.fc.probe()
+        return cp.height
+
+    @functools.cached_property
     def extradata(self):
         cp = self.stream.codecpar.contents
         if cp.extradata_size > 0 and cp.extradata:
@@ -80,22 +98,40 @@ class VideoTrack:
     @functools.cached_property
     def mime_codec(self):
         ed = self.extradata
-        if self.codec_id == AVCodecID.H264 and ed and len(ed) >= 4:
-            if ed[0] == 1:
-                # AVCDecoderConfigurationRecord: version=1, profile, compat, level
-                return f"avc1.{ed[1]:02x}{ed[2]:02x}{ed[3]:02x}"
-            # Annexb format (e.g. TS files): find SPS NAL (type 0x67)
-            for i in range(len(ed) - 4):
-                if ed[i : i + 3] == b"\x00\x00\x01" and (ed[i + 3] & 0x1F) == 7:
-                    sps = i + 4
-                    if sps + 2 < len(ed):
-                        return f"avc1.{ed[sps]:02x}{ed[sps+1]:02x}{ed[sps+2]:02x}"
-        if self.codec_id == AVCodecID.HEVC and ed and len(ed) >= 13:
-            profile_space = ["", "A", "B", "C"][(ed[1] >> 6) & 0x3]
-            tier = "H" if (ed[1] >> 5) & 0x1 else "L"
-            profile_idc = ed[1] & 0x1F
-            level_idc = ed[12]
-            return f"hev1.{profile_space}{profile_idc}.4.{tier}{level_idc}"
+        cp = self.stream.codecpar.contents
+        if self.codec_id == AVCodecID.H264:
+            if ed and len(ed) >= 4:
+                if ed[0] == 1:
+                    # AVCDecoderConfigurationRecord: version=1, profile, compat, level
+                    return f"avc1.{ed[1]:02x}{ed[2]:02x}{ed[3]:02x}"
+                # Annexb format (e.g. TS files): find SPS NAL (type 0x67)
+                for i in range(len(ed) - 4):
+                    if ed[i : i + 3] == b"\x00\x00\x01" and (ed[i + 3] & 0x1F) == 7:
+                        sps = i + 4
+                        if sps + 2 < len(ed):
+                            return f"avc1.{ed[sps]:02x}{ed[sps+1]:02x}{ed[sps+2]:02x}"
+            # Fallback: M2TS / MPEG-TS keep SPS/PPS in-band so codecpar.
+            # extradata stays empty. After probe(), cp.profile == SPS
+            # profile_idc and cp.level == level_idc directly. constraint_
+            # set bits (middle byte) need the raw SPS, so we emit 00 —
+            # accepted by every decoder we ship to.
+            self.fc.probe()
+            if cp.profile > 0 and cp.level > 0:
+                return f"avc1.{cp.profile:02x}00{cp.level:02x}"
+        if self.codec_id == AVCodecID.HEVC:
+            if ed and len(ed) >= 13:
+                profile_space = ["", "A", "B", "C"][(ed[1] >> 6) & 0x3]
+                tier = "H" if (ed[1] >> 5) & 0x1 else "L"
+                profile_idc = ed[1] & 0x1F
+                level_idc = ed[12]
+                return f"hev1.{profile_space}{profile_idc}.4.{tier}{level_idc}"
+            # Same M2TS fallback. cp.profile == general_profile_idc;
+            # cp.level == general_level_idc (×30 of human-readable). We
+            # assume profile_space=empty and Main tier (L) — true for
+            # essentially all consumer HEVC; compat="4" matches Main.
+            self.fc.probe()
+            if cp.profile > 0 and cp.level > 0:
+                return f"hev1.{cp.profile}.4.L{cp.level}"
         if self.codec_id == AVCodecID.VP9:
             return "vp09.00.10.08"
         if self.codec_id == AVCodecID.AV1 and ed and len(ed) >= 4:
@@ -124,6 +160,8 @@ class VideoTrack:
             return "dvvideo"
         if self.codec_id == AVCodecID.PRORES:
             return "prores"
+        if self.codec_id == AVCodecID.HQ_HQA:
+            return "hq_hqa"
         if self.codec_id == AVCodecID.RV40:
             return "rv40"
         if self.codec_id == AVCodecID.VC1:
@@ -134,7 +172,10 @@ class VideoTrack:
             return "png"
         if self.codec_id == AVCodecID.WEBP:
             return "webp"
-        return None
+        raise NotImplementedError(
+            f"no mime_codec mapping for video codec_id={self.codec_id!r} "
+            f"(or extradata too short to extract profile/level)"
+        )
 
     @functools.cached_property
     def _duration_pts(self):
@@ -189,7 +230,8 @@ class AudioTrack:
     Attributes:
         index: Stream index in the container.
         codec_id: AVCodecID enum value.
-        mime_codec: MIME codec string (e.g. 'mp4a.40.2') or None.
+        mime_codec: MIME codec string (e.g. 'mp4a.40.2').
+            Raises NotImplementedError if the codec_id has no mapping.
         sample_rate: Sample rate in Hz.
         bit_rate: Stream bitrate.
     """
@@ -236,7 +278,9 @@ class AudioTrack:
             return "wmalossless"
         if self.codec_id.value in (65560,):  # pcm_bluray
             return "pcm"
-        return None
+        raise NotImplementedError(
+            f"no mime_codec mapping for audio codec_id={self.codec_id!r}"
+        )
 
 
 def parse(url):

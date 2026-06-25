@@ -34,6 +34,7 @@ class AVCodecID(TypedCEnumeration(c_int)):
     VP8 = 139
     VP9 = 167
     HEVC = 173
+    HQ_HQA = 186
     AV1 = 225
     # Audio codecs — values must match ffmpeg's avcodec.h
     PCM_S16LE = 0x10000
