@@ -579,6 +579,16 @@ class BaseDecoder:
                 self.exception = None
 
     def free(self):
+        # __del__ can call this during interpreter shutdown, by which
+        # point module globals (nvcuvid, cuda, the ctypes types) may be
+        # torn down to None — calling through them then raises
+        # "NoneType is not callable". The OS reclaims the GPU context on
+        # process exit regardless, so just bail if our entry points are
+        # gone. (Now reachable because the decoder is refcount-collectable
+        # — its self-reference cycles were removed — so __del__ actually
+        # runs at shutdown instead of the object leaking.)
+        if nvcuvid is None or cuda is None:
+            return
         if getattr(self, 'cuvid_parser', None):
             cuda.check(nvcuvid.cuvidDestroyVideoParser(self.cuvid_parser))
             self.cuvid_parser = CUvideoparser()
@@ -588,7 +598,10 @@ class BaseDecoder:
                 self.cuvid_decoder = CUvideodecoder()
 
     def __del__(self):
-        self.free()
+        try:
+            self.free()
+        except Exception:
+            pass   # best-effort during finalization / shutdown
 
     def __enter__(self):
         return self

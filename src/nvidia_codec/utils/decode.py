@@ -681,7 +681,9 @@ class Decoder(BaseDecoder):
             # keyframe whose own PTS > start_pts — the frame at PTS ==
             # start_pts then sits in the prior GOP and the candidate-
             # walk in _frames_thread never reaches it. Fix is pending
-            # (see docstring of _keyframe_before).
+            # (see docstring of _keyframe_before). Index-less containers
+            # (raw MPEG-TS) have no usable index here and fall back to
+            # decode-from-BOF — convert them with `file.py remux`.
             kts = self._keyframe_before(start_pts)
             if kts is None:
                 kts = self._keyframe_after(0)
