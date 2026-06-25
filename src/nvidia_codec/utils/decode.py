@@ -5,6 +5,7 @@ from datetime import timedelta
 import numpy as np
 from queue import Queue, ShutDown
 import threading
+import weakref
 
 from ..ffmpeg.libavcodec import BSFContext
 from ..ffmpeg.libavformat import FormatContext, AVCodecID
@@ -56,12 +57,16 @@ class OwnedPicture:
     """Wraps a Picture with consumer ownership of the slot via lock.
 
     Acquires the slot lock on creation. free() releases it.
-    map() returns an OwnedSurface.
+    map() returns an OwnedSurface. Holds the decoder explicitly (Picture
+    no longer back-references it — see Picture's docstring); an
+    OwnedPicture is transient (a candidate or a queued item), never
+    stored in the decoder's _slots/_recent, so this ref forms no cycle.
     """
 
-    def __init__(self, pic):
+    def __init__(self, decoder, pic):
+        self._decoder = decoder
         self._pic = pic
-        pic.decoder._slot_locks[pic.index].acquire()
+        decoder._slot_locks[pic.index].acquire()
 
     @property
     def pts(self):
@@ -73,12 +78,12 @@ class OwnedPicture:
 
     def free(self):
         if self._pic is not None:
-            self._pic.decoder._slot_locks[self._pic.index].release()
+            self._decoder._slot_locks[self._pic.index].release()
             self._pic = None
 
     def map(self, stream=0):
         assert self._pic is not None, "Picture already freed"
-        return OwnedSurface(self._pic.map(stream))
+        return OwnedSurface(self._decoder.map(self._pic, stream))
 
 
 class Decoder(BaseDecoder):
@@ -125,11 +130,19 @@ class Decoder(BaseDecoder):
 
         self.bsf = BSFContext(f, track.stream.codecpar.contents, track.stream.time_base)
 
+        # BaseDecoder stores this as self.decide and calls it from the
+        # sequence callback. Capture self weakly: a strong capture here
+        # plus that storage is another self-cycle that would keep the
+        # decoder uncollectable by refcounting (same reasoning as the
+        # ctypes callbacks). decide only runs during decode, while self
+        # is alive, so the weakref always resolves.
+        selfref = weakref.ref(self)
         def decide(p):
+            s = selfref()
             num_pics = num_pictures(p["min_num_pictures"])
-            self._slot_locks = [threading.Lock() for _ in range(num_pics)]
-            self._surface_sem = threading.Semaphore(1)
-            self._recent = collections.deque(maxlen=num_pics)
+            s._slot_locks = [threading.Lock() for _ in range(num_pics)]
+            s._surface_sem = threading.Semaphore(1)
+            s._recent = collections.deque(maxlen=num_pics)
             d = {
                 "num_pictures": num_pics,
                 "num_surfaces": 1,
@@ -222,12 +235,18 @@ class Decoder(BaseDecoder):
         self.send(None)
 
     def _map_and_convert(self, pic, dtype):
-        """Map an OwnedPicture to a tensor. Frees pic and surface.
+        """Map a Picture (or OwnedPicture) to a tensor. Frees pic and surface.
         Returns (timedelta, frame) on success, (timedelta, exception) on error."""
         try:
             t = self.track.pts2time(pic.pts)
             stream = extract_stream_ptr(torch.cuda.current_stream(self.device))
-            surface = pic.map(stream)
+            # OwnedPicture carries its own slot+surface ownership (→
+            # OwnedSurface); a bare Picture maps via the decoder (→ plain
+            # Surface). Both expose .free().
+            if isinstance(pic, OwnedPicture):
+                surface = pic.map(stream)
+            else:
+                surface = self.map(pic, stream)
         except Exception as e:
             return (t, e)
         finally:
@@ -290,10 +309,23 @@ class Decoder(BaseDecoder):
             raise NoFrameError(f"No frame found at {target}")
         return result[0]
 
-    def _pump(self, done, post_decode):
+    def _pump(self, done, post_decode, out_q=None):
         """Read packets and send them one at a time, calling post_decode for each frame.
-        Stops when done() returns True or EOF. Flushes on EOF."""
+        Stops when done() returns True or EOF. Flushes on EOF.
+
+        `out_q` is the output queue this worker produces into. Shutting
+        that queue is the cancel signal — the consumer (or the generator's
+        teardown) calls out_q.shutdown() when it's no longer interested,
+        and the per-packet `is_shutdown` check below stops the worker.
+        This is what unwinds a worker stuck in a long pre-window /
+        beginning-of-file seek walk, where it decodes packet after packet
+        without ever calling out_q.put (so the put-side ShutDown never
+        fires). We reuse the queue's own shutdown state rather than a
+        separate cancel flag: one primitive, already shared between the
+        two threads. Synchronous callers (screenshot) pass no queue."""
         for pkt in self.bsf.filter(self.track.fc.read_packets(self.track.stream), reuse=True):
+            if out_q is not None and out_q.is_shutdown:
+                raise ShutDown
             self.with_callbacks(
                 lambda pkt=pkt: self.send((pkt.av.pts if pkt.av.pts != AV_NOPTS_VALUE else pkt.av.dts, np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,)))),
                 post_decode=post_decode)
@@ -311,11 +343,11 @@ class Decoder(BaseDecoder):
             if result[0] is not None or pic is None:
                 return
             result[0] = pic.pts
-            pic_q.put((OwnedPicture(pic), kts))
+            pic_q.put((OwnedPicture(self, pic), kts))
         try:
             if kts is not None:
                 self._seek_to_keyframe(kts)
-            self._pump(lambda: result[0] is not None, _post)
+            self._pump(lambda: result[0] is not None, _post, pic_q)
             if result[0] is None:
                 if kts is None:
                     raise NoFrameError("no frame at start of video")
@@ -349,9 +381,9 @@ class Decoder(BaseDecoder):
                 if best is None:
                     outcome[0] = pic.pts
                 else:
-                    pic_q.put((OwnedPicture(best), None))
+                    pic_q.put((OwnedPicture(self, best), None))
                     outcome[0] = True
-        self._pump(lambda: outcome[0] is not None, _post)
+        self._pump(lambda: outcome[0] is not None, _post, pic_q)
         if outcome[0] is True:
             return
         if outcome[0] is not None:
@@ -458,7 +490,7 @@ class Decoder(BaseDecoder):
                         # sample and stop.
                         best = next((p for p in reversed(self._recent) if self._is_valid(p)), None)
                         if best is not None:
-                            pic_q.put((OwnedPicture(best), None))
+                            pic_q.put((OwnedPicture(self, best), None))
                         break
                     except Exception as e:
                         pic_q.put(((current_pts, e), None))
@@ -493,7 +525,10 @@ class Decoder(BaseDecoder):
 
         try:
             while True:
-                item = pic_q.get()
+                try:
+                    item = pic_q.get()
+                except ShutDown:
+                    break   # someone shut our queue — stop cleanly
                 if item is None:
                     break
                 if isinstance(item, Exception):
@@ -523,6 +558,10 @@ class Decoder(BaseDecoder):
             thread.join(timeout=5)
 
     def _frames_thread(self, dtype, end_pts, q, start_pts):
+        # _Stop: reached end_pts — the requested [start, end] window is
+        # fully decoded, finish normally. Cancellation is signalled by
+        # the consumer shutting `q`; _pump sees q.is_shutdown and raises
+        # ShutDown, caught below.
         class _Stop(Exception):
             pass
 
@@ -557,7 +596,7 @@ class Decoder(BaseDecoder):
                     # its slot back to NVDEC) and own this one.
                     if candidate[0] is not None:
                         candidate[0].free()
-                    candidate[0] = OwnedPicture(pic)
+                    candidate[0] = OwnedPicture(self, pic)
                     return
                 # First pic past start_pts: emit the candidate (or this
                 # pic, if no earlier frame existed) and switch to phase 2.
@@ -570,7 +609,7 @@ class Decoder(BaseDecoder):
                 raise _Stop
             _emit(pic)
         try:
-            self._pump(lambda: False, _post)
+            self._pump(lambda: False, _post, q)
             # EOF before any pic crossed start_pts: emit the final
             # candidate if we ever found one.
             if not emitting[0] and candidate[0] is not None:
@@ -658,7 +697,10 @@ class Decoder(BaseDecoder):
         thread.start()
         try:
             while True:
-                item = q.get()
+                try:
+                    item = q.get()
+                except ShutDown:
+                    break   # someone shut our queue — stop cleanly
                 if item is None:
                     break
                 if isinstance(item, Exception):
@@ -668,10 +710,25 @@ class Decoder(BaseDecoder):
                     evt.synchronize()
                 yield pts_int, frame_or_err
         finally:
+            # The consumer is done (exhausted / break / close / error).
+            # Shutting q is the cancel signal: a producer blocked in
+            # q.put wakes with ShutDown, and a producer mid seek-walk
+            # sees q.is_shutdown on its next _pump packet and unwinds.
+            # Then join. The timeout is a backstop only — a producer
+            # truly stuck inside a single libnvcuvid C call can't be
+            # interrupted, but the seek walk never reaches that state.
             try:
                 q.shutdown()
             except Exception:
                 pass
             thread.join(timeout=5)
 
-    # free(), __del__, __enter__, __exit__ inherited from BaseDecoder
+    # free(), __del__, __enter__, __exit__ inherited from BaseDecoder.
+    # NOTE: do NOT call free() explicitly while a frames()/screenshots()
+    # producer may be running — cuvidDestroyDecoder would race the
+    # producer's in-flight cuvidDecodePicture and SEGV inside libnvcuvid.
+    # The safe path is to stop the worker first (shut its queue — which
+    # the generator's own teardown does on close/drop) and then drop all
+    # refs; the producer holds a ref to this Decoder via its bound
+    # method, so __del__ (and thus free()) only runs once the producer
+    # has exited and the last external ref is gone.

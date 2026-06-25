@@ -17,6 +17,7 @@ from .common import *
 from .. import CodecNotSupportedError
 import numpy as np
 from ctypes import *
+import weakref
 
 import logging
 
@@ -123,12 +124,19 @@ class Surface:
 class Picture:
     """Decoded frame before post-processing.
 
-    A data object — does not own the picture slot. Slot ownership is
-    managed by the caller via pre_decode/pic_release callbacks.
+    A pure data object — index, proc params, pts. Deliberately holds NO
+    reference to the decoder: the decoder tracks live Pictures in
+    _slots/_recent, and a back-reference here would form a cycle that
+    keeps the decoder (and its large NVDEC context) alive past the
+    refcount-zero point, deferring cleanup to the cyclic GC. To turn a
+    Picture into a Surface use Decoder.map(pic) (the decoder is always
+    in scope where mapping happens).
+
+    Slot ownership is managed by the caller via pre_decode/pic_release
+    callbacks.
     """
 
-    def __init__(self, decoder, index, proc_params, pts):
-        self.decoder = decoder
+    def __init__(self, index, proc_params, pts):
         self.index = index
         self.params = proc_params
         self.pts = pts
@@ -136,9 +144,6 @@ class Picture:
     def free(self):
         """No-op. Slot ownership is managed by the caller (player.py)."""
         pass
-
-    def map(self, stream: int = 0):
-        return Surface(self.decoder, self.index, self.params, stream, self.pts)
 
 
 def decide_surface_format(
@@ -192,12 +197,27 @@ class BaseDecoder:
     """
 
     def catch_exception(self, func, return_on_error=0):
+        # `func` is a bound method of self, and the wrapper records errors
+        # on self.exception — both strong refs to self. The wrapper is
+        # wrapped in a CFUNCTYPE and stored on self (self.handleXxxCallback),
+        # so capturing self strongly here forms a self-cycle that makes the
+        # decoder uncollectable by refcounting (only the cyclic GC can take
+        # it — which under streaming load lags and balloons VRAM). Hold
+        # self weakly instead; the callback only ever fires during a
+        # send()/cuvidParseVideoData while a caller keeps the decoder
+        # alive, so the weakref always resolves then. The None branch is
+        # just belt-and-suspenders for a callback racing finalization.
+        selfref = weakref.ref(self)
+        fn = func.__func__
         def wrapper(*args, **kwargs):
+            s = selfref()
+            if s is None:
+                return return_on_error
             try:
-                return func(*args, **kwargs)
+                return fn(s, *args, **kwargs)
             except BaseException as e:
                 log.debug(f"callback exception logged {e}")
-                self.exception = e
+                s.exception = e
                 log.debug(f"returning error code {return_on_error}")
                 return return_on_error
 
@@ -410,9 +430,15 @@ class BaseDecoder:
             unpaired_field=di.repeat_first_field < 0,
         )
 
-        picture = Picture(self, di.picture_index, params, di.timestamp)
+        picture = Picture(di.picture_index, params, di.timestamp)
         self.post_decode(picture)
         return 1
+
+    def map(self, pic, stream: int = 0):
+        """Map a decoded Picture to a Surface (post-processed frame).
+        Lives on the decoder (not Picture.map) so Picture needn't hold a
+        decoder back-reference — see Picture's docstring."""
+        return Surface(self, pic.index, pic.params, stream, pic.pts)
 
     def handleOperatingPoint(self, pUserData, pOPInfo):
         opi = pOPInfo.contents
@@ -528,16 +554,29 @@ class BaseDecoder:
                 payload=data.ctypes.data_as(POINTER(c_uint8)),
                 timestamp=pts,
             )
+        # self.exception relays an error out of a ctypes callback (which
+        # can't propagate through the C parser). Clear it as we consume
+        # it: a retained exception keeps its __traceback__ alive, whose
+        # frames reference self, pinning the decoder. Raise it WITHOUT
+        # binding it to a local here — a `e = self.exception; raise e`
+        # would put `e` in this frame, and the raised exception's
+        # traceback includes this same frame → e ↔ frame cycle, defeating
+        # the point. `try: raise self.exception finally: clear` keeps the
+        # exception out of this frame's locals.
         self.exception = None
-        with cuda.Device(self.device):
-            try:
+        try:
+            with cuda.Device(self.device):
                 cuda.check(nvcuvid.cuvidParseVideoData(self.cuvid_parser, byref(p)))
-            except cuda.CUError:
-                if self.exception is not None:
-                    raise self.exception
+        except cuda.CUError:
+            if self.exception is None:
                 raise
+            # else: a callback captured a more specific exception — it's
+            # raised (and cleared) below in preference to the CUError.
         if self.exception is not None:
-            raise self.exception
+            try:
+                raise self.exception
+            finally:
+                self.exception = None
 
     def free(self):
         if getattr(self, 'cuvid_parser', None):
