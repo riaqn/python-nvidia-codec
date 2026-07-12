@@ -23,6 +23,28 @@ from ..ffmpeg.include.libavutil import AVColorRange, AVColorSpace
 from ..core.cuviddec import cudaVideoSurfaceFormat
 from ..core.decode import Surface
 
+def to_yuv420p(surface : Surface):
+    """De-interleave a decoded NV12 surface into a contiguous planar I420
+    (yuv420p) uint8 CUDA tensor: Y (H·W) ++ U (H·W/4) ++ V (H·W/4).
+
+    Unlike convert() — which applies the YUV→RGB color matrix — this does NO
+    color math: NVDEC's NV12 already IS yuv420 (semi-planar), so this only
+    splits the interleaved chroma into separate U/V planes. Half the bytes of
+    rgb24 and no matrix round-trip; the encoder consumes yuv420p directly.
+    NV12 8-bit only. Returns a 1D tensor of length H·W·3//2, ready for
+    `.cpu().numpy().tobytes()` as raw planar yuv420p."""
+    if surface.format != cudaVideoSurfaceFormat.NV12:
+        raise ValueError(f"to_yuv420p: NV12 only, got {surface.format}")
+    width, height = surface.width, surface.height
+    YUV = torch.as_tensor(surface, device=f'cuda:{surface.decoder.device}')
+    Y = YUV[:height, :]          # (H, W)
+    UV = YUV[height:, :]         # (H/2, W): U,V interleaved
+    U = UV[:, 0::2]              # (H/2, W/2)
+    V = UV[:, 1::2]              # (H/2, W/2)
+    # reshape(-1) copies the (possibly pitch-strided) planes to contiguous.
+    return torch.cat([Y.reshape(-1), U.reshape(-1), V.reshape(-1)])
+
+
 def convert(surface : Surface,
         source_space : AVColorSpace,
         source_range : AVColorRange,

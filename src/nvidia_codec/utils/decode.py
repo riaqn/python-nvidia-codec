@@ -19,7 +19,7 @@ from ..ffmpeg.include.libavutil import (
 from .compat import av2cuda, extract_stream_ptr
 from ..core.decode import BaseDecoder, Picture, Surface
 from ..ffmpeg.common import AVException
-from .color import convert
+from .color import convert, to_yuv420p
 from .demux import VideoTrack
 from .. import NoFrameError
 
@@ -234,9 +234,13 @@ class Decoder(BaseDecoder):
                 self.send(None)
         self.send(None)
 
-    def _map_and_convert(self, pic, dtype):
+    def _map_and_convert(self, pic, dtype, pixel_format='rgb'):
         """Map a Picture (or OwnedPicture) to a tensor. Frees pic and surface.
-        Returns (timedelta, frame) on success, (timedelta, exception) on error."""
+        Returns (timedelta, frame) on success, (timedelta, exception) on error.
+
+        pixel_format='rgb' (default) → (3,H,W) RGB via convert() (color matrix).
+        pixel_format='yuv420p' → 1D planar I420 uint8 via to_yuv420p() (no color
+        math, half the bytes) — for piping straight to an encoder."""
         try:
             t = self.track.pts2time(pic.pts)
             stream = extract_stream_ptr(torch.cuda.current_stream(self.device))
@@ -252,12 +256,15 @@ class Decoder(BaseDecoder):
         finally:
             pic.free()
         try:
-            frame = convert(
-                surface,
-                self.track.color_space(AVColorSpace.BT470BG),
-                self.track.color_range(AVColorRange.MPEG),
-                dtype,
-            )
+            if pixel_format == 'yuv420p':
+                frame = to_yuv420p(surface)
+            else:
+                frame = convert(
+                    surface,
+                    self.track.color_space(AVColorSpace.BT470BG),
+                    self.track.color_range(AVColorRange.MPEG),
+                    dtype,
+                )
             return (t, frame)
         except Exception as e:
             return (t, e)
@@ -557,7 +564,7 @@ class Decoder(BaseDecoder):
                 pass
             thread.join(timeout=5)
 
-    def _frames_thread(self, dtype, end_pts, q, start_pts):
+    def _frames_thread(self, dtype, end_pts, q, start_pts, pixel_format='rgb'):
         # _Stop: reached end_pts — the requested [start, end] window is
         # fully decoded, finish normally. Cancellation is signalled by
         # the consumer shutting `q`; _pump sees q.is_shutdown and raises
@@ -580,7 +587,7 @@ class Decoder(BaseDecoder):
             # frees the pic — the queued item carries the raw int so
             # callers get bit-exact pts (no float round-trip loss).
             pts_int = pic.pts
-            _, frame_or_err = self._map_and_convert(pic, dtype)
+            _, frame_or_err = self._map_and_convert(pic, dtype, pixel_format)
             evt = None
             if not isinstance(frame_or_err, Exception):
                 evt = torch.cuda.Event()
@@ -635,7 +642,8 @@ class Decoder(BaseDecoder):
 
     def frames(self, dtype: torch.dtype, start: timedelta = None,
                end: timedelta = None, start_pts: int = None,
-               end_pts: int = None, queue_size: int = 16):
+               end_pts: int = None, queue_size: int = 16,
+               pixel_format: str = 'rgb'):
         """Yield (int_pts, frame_or_exception) for every decoded frame in
         display order. Decodes ALL frames (B-frames included).
 
@@ -693,7 +701,7 @@ class Decoder(BaseDecoder):
         q = Queue(maxsize=queue_size)
         thread = threading.Thread(
             target=self._frames_thread,
-            args=(dtype, end_pts, q, start_pts),
+            args=(dtype, end_pts, q, start_pts, pixel_format),
             daemon=True,
         )
         thread.start()
