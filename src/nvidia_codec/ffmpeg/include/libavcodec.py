@@ -15,6 +15,10 @@ class AVMediaType(TypedCEnumeration(c_int)):
     NB = 5
 
 class AVCodecID(TypedCEnumeration(c_int)):
+    # Values track the ffmpeg 9 enum (libavcodec 63, pinned via the versioned
+    # libavcodec.so.63 load in ffmpeg/libavcodec.py — ffmpeg 8 removed entries,
+    # shifting WEBP/VP9/HEVC/HQ_HQA/AV1 down). A mismatch surfaces as
+    # CodecNotSupportedError ("<AVCodecID.(unknown): N>") on NVDEC-supported files.
     MPEG1 = 1
     MPEG2 = 2
     MPEG4 = 12
@@ -30,12 +34,12 @@ class AVCodecID(TypedCEnumeration(c_int)):
     VP6F = 92
     GIF = 97
     PRORES = 147
-    WEBP = 171
+    WEBP = 170
     VP8 = 139
-    VP9 = 167
-    HEVC = 173
-    HQ_HQA = 186
-    AV1 = 225
+    VP9 = 166
+    HEVC = 172
+    HQ_HQA = 185
+    AV1 = 222
     # Audio codecs — values must match ffmpeg's avcodec.h
     PCM_S16LE = 0x10000
     PCM_S16BE = 0x10001

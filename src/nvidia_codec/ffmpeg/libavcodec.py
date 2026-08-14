@@ -8,7 +8,10 @@ from errno import EAGAIN
 import  logging
 log = logging.getLogger(__name__)
 
-lib = cdll.LoadLibrary('libavcodec.so')
+# Pin the ABI major: enum values + struct layouts in include/libavcodec.py
+# track ffmpeg 9 (libavcodec 63). Loading the versioned .so makes a system
+# ffmpeg upgrade fail loudly here instead of mis-decoding with shifted enums.
+lib = cdll.LoadLibrary('libavcodec.so.63')
 
 
 av_packet_alloc = lib.av_packet_alloc
