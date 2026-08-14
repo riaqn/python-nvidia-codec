@@ -85,6 +85,23 @@ class VideoTrack:
         return cp.height
 
     @functools.cached_property
+    def sample_aspect_ratio(self):
+        """Display sample aspect ratio as (num, den), or None when square/unset
+        (1:1, or 0:1 = unknown). Anamorphic sources — e.g. a 1080×1080-coded vertical
+        clip with SAR 9:16 — need this or they render squished. Prefers the AVStream
+        SAR (what ffprobe reports as effective), falling back to codecpar; probes once
+        if neither is populated yet (lazy containers leave it 0/1 until a packet)."""
+        def _norm(r):
+            return (int(r.num), int(r.den)) if r.num > 0 and r.den > 0 else None
+        sar = (_norm(self.stream.sample_aspect_ratio)
+               or _norm(self.stream.codecpar.contents.sample_aspect_ratio))
+        if sar is None:
+            self.fc.probe()
+            sar = (_norm(self.stream.sample_aspect_ratio)
+                   or _norm(self.stream.codecpar.contents.sample_aspect_ratio))
+        return None if (sar is None or sar == (1, 1)) else sar
+
+    @functools.cached_property
     def extradata(self):
         cp = self.stream.codecpar.contents
         if cp.extradata_size > 0 and cp.extradata:
