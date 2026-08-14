@@ -215,6 +215,33 @@ class Decoder(BaseDecoder):
         self.with_callbacks(lambda: self.send(None), post_decode=lambda pic: None)
         self._recent.clear()
 
+    def _seek_before_pts(self, target_pts):
+        """Seek so the next packet is the keyframe with pts <= target_pts, using the
+        demuxer's NATIVE backward seek (avformat_seek_file -> read_seek), then flush
+        NVDEC and reset state (same teardown as _seek_to_keyframe).
+
+        Why not _keyframe_before() + _seek_to_keyframe()? That reads the IN-MEMORY
+        index_entries, which avformat_find_stream_info seeds with a few near-t0 entries
+        at open. For a far target, index_get_entry_from_timestamp() then returns that
+        STALE near-start keyframe (not None) -> we seek to ~BOF and decode-walk the whole
+        file (e.g. 160s to reach a 2835s offset). The native seek instead triggers the
+        demuxer's read_seek: for MKV that LAZILY parses the on-disk Cues that probing left
+        unloaded (an O(1) index seek, exactly what `ffmpeg -ss` does); index-less
+        containers fall back to avformat's generic byte-bisection. Either way: no full
+        packet/frame traversal. Only if avformat cannot seek the container at all do we
+        fall back to the in-memory-index path (then BOF)."""
+        try:
+            self.track.fc.seek_file(self.track.stream, target_pts,
+                                    min_ts=-(2**63), max_ts=target_pts)
+        except AVException:
+            kts = self._keyframe_before(target_pts)
+            if kts is None:
+                kts = self._keyframe_after(0)
+            if kts is not None:
+                self.track.fc.seek_file(self.track.stream, kts, min_ts=kts, max_ts=kts)
+        self.with_callbacks(lambda: self.send(None), post_decode=lambda pic: None)
+        self._recent.clear()
+
     def _decode_packets(self, keyframes_only=False):
         """Read packets from current position, filter, decode.
 
@@ -277,21 +304,23 @@ class Decoder(BaseDecoder):
         Returns (timedelta, frame).
         """
         target_pts = self.track.time2pts(target)
-        kts = self._keyframe_before(target_pts)
 
-        # Check if we can serve from _recent without seeking.
-        if len(self._recent) > 0:
-            kts_pts = kts if kts is not None else 0
-            best = next((p for p in reversed(self._recent) if kts_pts <= p.pts <= target_pts and self._is_valid(p)), None)
+        # Serve from _recent without seeking only when the current contiguous decode run
+        # has already reached PAST target — then the largest cached frame ≤ target is the
+        # genuine on-screen frame. Requiring a frame > target avoids returning a stale
+        # pre-jump frame (and is what previously made far-forward targets decode-walk:
+        # the old code trusted _keyframe_before, which returns a stale near-t0 keyframe
+        # for far targets before Cues are parsed).
+        if len(self._recent) > 0 and any(p.pts > target_pts for p in self._recent):
+            best = next((p for p in reversed(self._recent)
+                         if p.pts <= target_pts and self._is_valid(p)), None)
             if best is not None:
-                if not accurate:
-                    return self._map_and_convert(best, dtype)
-                elif any(p.pts > target_pts for p in self._recent):
-                    return self._map_and_convert(best, dtype)
-        # Only seek if the keyframe is behind our current position
-        current = self._recent[-1].pts if len(self._recent) > 0 else None
-        if kts is not None and (current is None or kts < current):
-            self._seek_to_keyframe(kts)
+                return self._map_and_convert(best, dtype)
+
+        # Cache miss → native seek to the keyframe ≤ target, then decode forward. The
+        # demuxer's read_seek is O(1) (lazy-parses MKV Cues; byte-bisects otherwise), so
+        # this never BOF-walks. See _seek_before_pts.
+        self._seek_before_pts(target_pts)
 
         # Decode packet by packet, map+free in callback (synchronous, no deadlock risk).
         result = [None]
@@ -440,10 +469,17 @@ class Decoder(BaseDecoder):
         """
         max_gap = int(max_interval.total_seconds() / float(self.track._time_base))
 
-        # Trigger index population for containers that load it lazily (e.g. MKV Cues).
-        # If there's at most one index entry, seek to force the demuxer to load its index.
-        if self._keyframe_after(0) is None:
+        # Force the demuxer to load its full index (e.g. lazy MKV Cues) before the
+        # keyframe walk below relies on _keyframe_before/_keyframe_after. The old
+        # `if self._keyframe_after(0) is None` guard skipped this whenever probing had
+        # seeded a few near-t0 index_entries — leaving the walk on a STALE partial index
+        # (far keyframes missing). Seeking unconditionally triggers matroska_parse_cues
+        # (full index); it's an O(1) seek and the loop's first _seek_to_keyframe
+        # repositions. Index-less containers that can't seek here just proceed.
+        try:
             self.track.fc.seek_file(self.track.stream, -(2**63), min_ts=-(2**63), max_ts=-(2**63))
+        except AVException:
+            pass
 
         kts = start_kts
 
@@ -679,24 +715,12 @@ class Decoder(BaseDecoder):
         if start_pts is None and start is not None:
             start_pts = self.track.time2pts(start)
         if start_pts is not None:
-            # Container index population for MKV-with-deferred-Cues etc.
-            # See screenshots() for the rationale.
-            if self._keyframe_after(0) is None:
-                self.track.fc.seek_file(self.track.stream, -(2**63),
-                                         min_ts=-(2**63), max_ts=-(2**63))
-            # KNOWN BUG: start_pts is a PTS but _keyframe_before works
-            # in DTS. For B-frame content the chosen kts can map to a
-            # keyframe whose own PTS > start_pts — the frame at PTS ==
-            # start_pts then sits in the prior GOP and the candidate-
-            # walk in _frames_thread never reaches it. Fix is pending
-            # (see docstring of _keyframe_before). Index-less containers
-            # (raw MPEG-TS) have no usable index here and fall back to
-            # decode-from-BOF — convert them with `file.py remux`.
-            kts = self._keyframe_before(start_pts)
-            if kts is None:
-                kts = self._keyframe_after(0)
-            if kts is not None:
-                self._seek_to_keyframe(kts)
+            # Native demuxer seek to the keyframe <= start_pts. Delegating to
+            # read_seek (rather than the in-memory index via _keyframe_before)
+            # both parses deferred MKV Cues lazily and avoids the stale-near-t0
+            # keyframe that made far seeks decode-walk from BOF. See
+            # _seek_before_pts for the full rationale.
+            self._seek_before_pts(start_pts)
 
         q = Queue(maxsize=queue_size)
         thread = threading.Thread(
