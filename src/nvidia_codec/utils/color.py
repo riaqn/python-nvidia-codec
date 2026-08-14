@@ -24,23 +24,39 @@ from ..core.cuviddec import cudaVideoSurfaceFormat
 from ..core.decode import Surface
 
 def to_yuv420p(surface : Surface):
-    """De-interleave a decoded NV12 surface into a contiguous planar I420
+    """De-interleave/subsample a decoded surface into a contiguous planar I420
     (yuv420p) uint8 CUDA tensor: Y (H·W) ++ U (H·W/4) ++ V (H·W/4).
 
     Unlike convert() — which applies the YUV→RGB color matrix — this does NO
-    color math: NVDEC's NV12 already IS yuv420 (semi-planar), so this only
-    splits the interleaved chroma into separate U/V planes. Half the bytes of
-    rgb24 and no matrix round-trip; the encoder consumes yuv420p directly.
-    NV12 8-bit only. Returns a 1D tensor of length H·W·3//2, ready for
-    `.cpu().numpy().tobytes()` as raw planar yuv420p."""
-    if surface.format != cudaVideoSurfaceFormat.NV12:
-        raise ValueError(f"to_yuv420p: NV12 only, got {surface.format}")
+    color math, only plane layout: for NV12 (semi-planar 4:2:0) it splits the
+    interleaved chroma; for YUV444 (planar 4:4:4) it box-averages the full-res
+    chroma 2×2 down to 4:2:0. 8-bit only (NV12 / YUV444). Half the bytes of rgb24
+    and no matrix round-trip; the encoder consumes yuv420p directly. Returns a 1D
+    tensor of length H·W·3//2, ready for `.cpu().numpy().tobytes()`."""
+    fmt = surface.format
     width, height = surface.width, surface.height
     YUV = torch.as_tensor(surface, device=f'cuda:{surface.decoder.device}')
-    Y = YUV[:height, :]          # (H, W)
-    UV = YUV[height:, :]         # (H/2, W): U,V interleaved
-    U = UV[:, 0::2]              # (H/2, W/2)
-    V = UV[:, 1::2]              # (H/2, W/2)
+    if fmt == cudaVideoSurfaceFormat.NV12:
+        Y = YUV[:height, :]          # (H, W)
+        UV = YUV[height:, :]         # (H/2, W): U,V interleaved
+        U = UV[:, 0::2]              # (H/2, W/2)
+        V = UV[:, 1::2]              # (H/2, W/2)
+    elif fmt == cudaVideoSurfaceFormat.YUV444:
+        # planar 4:4:4 → 4:2:0: keep Y full-res, box-average chroma 2×2. Plane
+        # layout mirrors convert() (3-plane tensor, or 3 planes stacked H·3).
+        if YUV.ndim == 3:
+            Y, U444, V444 = YUV[0], YUV[1], YUV[2]           # each (H, W)
+        else:
+            Y = YUV[:height, :]
+            U444 = YUV[height:height * 2, :]
+            V444 = YUV[height * 2:height * 3, :]
+        eh, ew = height // 2 * 2, width // 2 * 2
+        def _sub(c):                 # (H, W) 4:4:4 → (H/2, W/2) box-average, uint8
+            c = c[:eh, :ew].contiguous().to(torch.float32).reshape(eh // 2, 2, ew // 2, 2)
+            return c.mean(dim=(1, 3)).round().clamp(0, 255).to(torch.uint8)
+        U, V = _sub(U444), _sub(V444)
+    else:
+        raise ValueError(f"to_yuv420p: NV12/YUV444 8-bit only, got {fmt}")
     # reshape(-1) copies the (possibly pitch-strided) planes to contiguous.
     return torch.cat([Y.reshape(-1), U.reshape(-1), V.reshape(-1)])
 
