@@ -22,7 +22,10 @@ class Player(Decoder):
         track_idx=None,
         **decoder_kwargs,
     ):
-        tracks = [t for t in parse(url) if isinstance(t, VideoTrack)]
+        # Cover art (attached_pic) is a "video" stream to ffmpeg but a single
+        # still image; never pick it, and don't count it as ambiguity.
+        tracks = [t for t in parse(url)
+                  if isinstance(t, VideoTrack) and not t.attached_pic]
         if not tracks:
             raise ValueError(f"{url} has no video stream")
         if track_idx is not None:

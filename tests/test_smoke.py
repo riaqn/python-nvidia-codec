@@ -86,6 +86,63 @@ def test_screenshots(clip):
         assert frame.shape == (3, H, W)
 
 
+def test_duration_property(clip):
+    with Player(clip) as p:
+        assert abs(p.duration.total_seconds() - SECONDS) < 0.2
+
+
+def test_cover_art_skipped(clip):
+    """A PNG attached_pic stream must not be selected or count as ambiguity."""
+    d = tempfile.mkdtemp(prefix="nvc-smoke-cover-")
+    try:
+        png = os.path.join(d, "cover.png")
+        out = os.path.join(d, "cover.mp4")
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+                        "-i", "color=c=red:size=64x64:duration=1", "-frames:v", "1", png],
+                       check=True, timeout=60)
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", clip, "-i", png,
+                        "-map", "0", "-map", "1", "-c", "copy",
+                        "-disposition:v:1", "attached_pic", out], check=True, timeout=60)
+        vids = [t for t in parse(out) if isinstance(t, VideoTrack)]
+        assert [t.attached_pic for t in vids] == [False, True]
+        with Player(out) as p:
+            assert p.track.index == 0
+            n = sum(1 for _ in p.frames(torch.uint8))
+        assert n == FPS * SECONDS
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_mpegts_start_time_and_first_gop(clip):
+    """MPEG-TS leaves start_time unset until probed. Probing must not swallow
+    the IDR (which used to drop the first GOP) and start_time must be real."""
+    d = tempfile.mkdtemp(prefix="nvc-smoke-ts-")
+    try:
+        out = os.path.join(d, "clip.ts")
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", clip, "-c", "copy", out],
+                       check=True, timeout=60)
+        with Player(out) as p:
+            assert p.track._start_time > 0           # ffmpeg's TS muxer starts at 1.4 s
+            frames = list(p.frames(torch.uint8))
+            assert len(frames) == FPS * SECONDS
+            first_t = p.track.pts2time(frames[0][0])
+            assert abs(first_t.total_seconds()) < 1 / FPS
+            # TS seeks by dts with no keyframe awareness; the decoder must still
+            # produce the frame actually on screen at 1.0 s, not the next IDR.
+            t, _ = p.screenshot(timedelta(seconds=1), torch.uint8, accurate=True)
+            assert abs(t.total_seconds() - 1.0) < 1 / FPS + 1e-3
+            pts0, _ = next(iter(p.frames(torch.uint8, start=timedelta(seconds=1))))
+            assert abs(p.track.pts2time(pts0).total_seconds() - 1.0) < 1 / FPS + 1e-3
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_pixel_format_enum_values():
+    from nvidia_codec.ffmpeg.include.libavutil import AVPixelFormat
+    assert AVPixelFormat.YUV420P == 0 and AVPixelFormat.RGB24 == 2
+    assert isinstance(AVPixelFormat.YUV444P, int)
+
+
 def _has_encoder(name):
     out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
                          capture_output=True, text=True, timeout=30).stdout

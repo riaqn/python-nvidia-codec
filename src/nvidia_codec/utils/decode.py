@@ -2,6 +2,7 @@
 
 import collections
 from datetime import timedelta
+from fractions import Fraction
 import numpy as np
 from queue import Queue, ShutDown
 import threading
@@ -9,6 +10,7 @@ import weakref
 
 from ..ffmpeg.libavcodec import BSFContext
 from ..ffmpeg.libavformat import FormatContext, AVCodecID
+from ..ffmpeg.include.libavcodec import AV_PKT_FLAG_KEY
 from ..ffmpeg.include.libavutil import (
     AV_NOPTS_VALUE,
     AVColorRange,
@@ -180,6 +182,11 @@ class Decoder(BaseDecoder):
             coded_height=track.height,
         )
 
+    @property
+    def duration(self):
+        """Track duration as a timedelta, or None if the container doesn't say."""
+        return self.track.duration
+
     def pre_decode(self, idx):
         """NVDEC reclaims slot idx. Clear tracking, wait for consumer if held."""
         self._slots.pop(idx, None)
@@ -247,8 +254,7 @@ class Decoder(BaseDecoder):
         packet/frame traversal. Only if avformat cannot seek the container at all do we
         fall back to the in-memory-index path (then BOF)."""
         try:
-            self.track.fc.seek_file(self.track.stream, target_pts,
-                                    min_ts=-(2**63), max_ts=target_pts)
+            self._native_seek_to_keyframe(target_pts)
         except AVException:
             kts = self._keyframe_before(target_pts)
             if kts is None:
@@ -257,6 +263,40 @@ class Decoder(BaseDecoder):
                 self.track.fc.seek_file(self.track.stream, kts, min_ts=kts, max_ts=kts)
         self.with_callbacks(lambda: self.send(None), post_decode=lambda pic: None)
         self._recent.clear()
+
+    def _native_seek_to_keyframe(self, target_pts, max_tries=16):
+        """avformat_seek_file(max_ts=target) positions on the last packet with
+        dts <= target. Indexed containers (MP4 / MKV) snap that to a keyframe.
+        Index-less ones (MPEG-TS / M2TS) use the generic dts bisection — which
+        is NOT keyframe-aware ("FIXME keyframe?" in mpegts.c) — and land
+        mid-GOP; NVDEC then discards everything up to the NEXT IDR, so the
+        frame we hand back is up to a GOP late. (ffmpeg's CLI papers over this
+        with a fixed 3/23 s dts heuristic.)
+
+        Peek at the landing packet; if it isn't a keyframe, back off by a
+        growing number of frame-durations and retry. Landing on an earlier
+        keyframe than strictly needed only costs decode-forward time, so
+        overshooting backwards is safe. The peek consumes a packet, so the
+        final seek re-runs to restore the position. Raises AVException if the
+        container can't seek at all (caller falls back to the in-memory index).
+        """
+        fc, stream = self.track.fc, self.track.stream
+        tb = self.track._time_base
+        afr = stream.avg_frame_rate
+        fps = Fraction(afr.num, afr.den) if afr.num > 0 and afr.den > 0 else Fraction(25)
+        step = max(1, int(1 / (fps * tb)))          # one frame, in pts units
+        ts = target_pts
+        for _ in range(max_tries):
+            fc.seek_file(stream, ts, min_ts=-(2**63), max_ts=ts)
+            first = next(fc.read_packets(stream), None)
+            if first is None or first.av.flags & AV_PKT_FLAG_KEY:
+                break                                # keyframe (or EOF — nothing to fix)
+            landed = first.av.dts if first.av.dts != AV_NOPTS_VALUE else first.av.pts
+            if landed == AV_NOPTS_VALUE:
+                break                                # can't reason about position
+            ts = min(ts, landed) - step
+            step *= 2
+        fc.seek_file(stream, ts, min_ts=-(2**63), max_ts=ts)
 
     def _map_and_convert(self, pic, dtype, pixel_format='rgb'):
         """Map a Picture (or OwnedPicture) to a tensor. Frees pic and surface.

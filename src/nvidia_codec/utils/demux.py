@@ -10,6 +10,7 @@ from fractions import Fraction
 import functools
 
 from ..ffmpeg.libavformat import FormatContext, AVMediaType, AVCodecID
+from ..ffmpeg.include.libavformat import AV_DISPOSITION_ATTACHED_PIC
 from ..ffmpeg.include.libavutil import (
     AV_NOPTS_VALUE,
     AV_TIME_BASE,
@@ -36,6 +37,7 @@ class VideoTrack:
         extradata: Codec extradata bytes, or None.
         color_space: AVColorSpace enum value.
         color_range: AVColorRange enum value.
+        attached_pic: True if this is embedded cover art, not real video.
     """
 
     def __init__(self, fc, stream):
@@ -51,20 +53,33 @@ class VideoTrack:
         # Time base
         self._time_base = Fraction(stream.time_base.num, stream.time_base.den)
 
-        # Start time
+        # Start time. Lazy containers (MPEG-TS, raw elementary streams) leave
+        # both the stream and the format start_time unset until probed;
+        # probing buffers the packets it reads, so nothing is lost. (The old
+        # path read the first packet directly — which both computed 0 via the
+        # packet's unset 0/1 time_base AND swallowed the IDR, dropping the
+        # whole first GOP from decode.)
         self._start_time = stream.start_time
         if self._start_time == AV_NOPTS_VALUE:
-            self._start_time = fc.av.start_time
-            if self._start_time == AV_NOPTS_VALUE:
-                start_time = fc.infer_start_time()
-                self._start_time = int(start_time / self._time_base)
-            else:
+            fc.probe()
+            self._start_time = stream.start_time
+        if self._start_time == AV_NOPTS_VALUE:
+            if fc.av.start_time != AV_NOPTS_VALUE:
                 self._start_time = int(
-                    self._start_time / AV_TIME_BASE / self._time_base
+                    fc.av.start_time / AV_TIME_BASE / self._time_base
                 )
+            else:
+                # Timestamp-less stream (e.g. raw Annex-B .h264): packets carry
+                # no pts at all; frames() yields AV_NOPTS_VALUE and pts2time
+                # returns None. Anchor at 0 so time2pts is at least defined.
+                self._start_time = 0
 
-        # Duration (lazy — probes only if needed)
 
+    @property
+    def attached_pic(self):
+        """True for cover-art / thumbnail "video" streams (AV_DISPOSITION_ATTACHED_PIC):
+        a single still image, not a decodable video track."""
+        return bool(self.stream.disposition & AV_DISPOSITION_ATTACHED_PIC)
 
     @functools.cached_property
     def width(self):

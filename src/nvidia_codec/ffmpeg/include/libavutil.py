@@ -63,10 +63,12 @@ class AVColorRange(TypedCEnumeration(c_int)):
     # NB = 3
 
 class AVPixelFormat(TypedCEnumeration(c_int)):
-    NONE = -1,
-    RGB24 = 0,
-    YUV420P = 1,
-    YUV444P = 5,
-    YUV420P16LE = 45,
+    # values per libavutil/pixfmt.h (ffmpeg 9); no trailing commas — they
+    # would make the members 1-tuples, not ints
+    NONE = -1
+    YUV420P = 0
+    RGB24 = 2
+    YUV444P = 5
+    YUV420P16LE = 45
     YUV444P16LE = 49
     # other omitted

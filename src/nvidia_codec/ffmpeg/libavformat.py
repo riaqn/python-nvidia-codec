@@ -3,7 +3,6 @@
 # not pyav
 
 from ctypes import *
-from fractions import Fraction
 
 from .include.libavutil import *
 from .include.libavcodec import *
@@ -103,15 +102,6 @@ class FormatContext:
         if result:
             return result.contents
         return None
-
-    def infer_start_time(self):
-        # log.warning('infering start time from first packet')
-        # in this case, we get the first packet
-        pkt = Packet()
-        self.read_packet(pkt)
-        start_time = pkt.av.pts
-        time_base = pkt.av.time_base
-        return start_time * Fraction(time_base.num, time_base.den)
 
     @property
     def streams(self):

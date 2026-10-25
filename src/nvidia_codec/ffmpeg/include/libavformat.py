@@ -19,6 +19,7 @@ class AVIndexEntry(Structure):
         return (self.flags_size >> 2) & 0x3FFFFFFF
 
 AVINDEX_KEYFRAME = 0x0001
+AV_DISPOSITION_ATTACHED_PIC = 0x0400
 
 class AVStream(Structure):
     _fields_ = [

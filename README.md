@@ -107,6 +107,23 @@ Codec support depends on your GPU:
 - VPF allocates the bare minimum of resources needed for most decoding tasks. PNC allows the user to specify the amount of resources to be allocated for advanced applications. Users own the resources and decide when and whether to deal with them.
 - Managing resources is not painful: similar to `pycuda`, we shift the burden of managing host/device resources to the Python garbage collector. Resources (such as `Picture` and `Surface`) are automatically freed when the user drops the reference.
 
+## Limitations
+
+- **One consumer per `Decoder`.** A `Decoder`/`Player` instance serves one
+  `frames()`, `screenshots()` or `screenshot()` call at a time. Use separate
+  instances (from any threads) for concurrent decodes of the same or different
+  files.
+- **No mid-stream resolution or codec changes.** The NVDEC decoder is created
+  from the first sequence header; a later sequence with a different coded
+  size, chroma format or bit depth raises `decoder already initialized with
+  different format`. Split such files per segment.
+- **Timestamp-less elementary streams** (e.g. raw Annex-B `.h264`/`.hevc`)
+  carry no pts: `frames()` yields `AV_NOPTS_VALUE` for every frame,
+  `pts2time` returns `None`, and `screenshot()` cannot locate a time. Mux
+  into a container first.
+- **Embedded cover art** (`attached_pic` streams) is skipped by `Player`
+  and reported by `VideoTrack.attached_pic` from `parse()`.
+
 ## Roadmap
 
 - [x] Decoding
@@ -116,7 +133,7 @@ Codec support depends on your GPU:
   - Color Ranges: MPEG (limited), JPEG (full)
   - Color Space: BT.601, BT.709, BT.2020
 - [x] Built-in cropping and scaling via NV decoder
-- [x] Thread-safe and thread-friendly
+- [x] Thread-friendly (one consumer per decoder; decoders are independent)
 - [ ] Encoder
 - [x] PyTorch integration
 
