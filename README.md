@@ -40,6 +40,11 @@ for timestamp, frame in player.frames(torch.uint8):
     print(f'{timestamp}: {frame.shape}')
 ```
 
+`frames()` without `start` continues from the demuxer's current position; it
+only begins at the first frame on a freshly opened player. After a
+`screenshot()` or a previous `frames()` pass, pass `start=timedelta(0)` to
+decode from the beginning again.
+
 ### Screenshot (single frame extraction)
 
 ```python

@@ -680,6 +680,13 @@ class Decoder(BaseDecoder):
         """Yield (int_pts, frame_or_exception) for every decoded frame in
         display order. Decodes ALL frames (B-frames included).
 
+        POSITION: without `start` / `start_pts` this does NOT rewind. It
+        decodes from wherever the demuxer currently is — the beginning on
+        a fresh Decoder, but after a `screenshot()`, `screenshots()` or an
+        exhausted `frames()` it resumes from there (and yields nothing if
+        that was EOF). Pass `start=timedelta(0)` to decode from the start
+        of the file regardless of what ran before.
+
         The yielded `int_pts` is the raw track pts (same units as
         `pic.pts`, including the demuxer's `start_time` offset). Pass
         through `track.pts2time(pts)` if you need a `timedelta`. Yielding
