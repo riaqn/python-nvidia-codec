@@ -17,14 +17,16 @@ import logging
 
 log = logging.getLogger(__name__)
 
-lib = cdll.LoadLibrary("libavformat.so")
+# Pin the ABI major to ffmpeg 9 (libavformat 63), matching the libavcodec.so.63
+# pin in ffmpeg/libavcodec.py: struct layouts + enum values in include/ track
+# ffmpeg 9, so a system upgrade fails loudly at load instead of mis-reading.
+lib = cdll.LoadLibrary("libavformat.so.63")
 
-# Check FFmpeg version compatibility (requires FFmpeg 8.x / libavformat 62+)
 _version = lib.avformat_version()
 _major = _version >> 16
-if _major < 62:
+if _major != 63:
     raise ImportError(
-        f"nvidia-codec requires FFmpeg 8.x (libavformat 62+), "
+        f"nvidia-codec requires FFmpeg 9.x (libavformat 63), "
         f"but found libavformat {_major}.{(_version >> 8) & 0xff}.{_version & 0xff}"
     )
 

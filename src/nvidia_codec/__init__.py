@@ -19,7 +19,7 @@ Quick Start:
 Requirements:
     - NVIDIA GPU with NVDEC support
     - NVIDIA driver with libnvcuvid.so
-    - FFmpeg 8.x (for demuxing)
+    - FFmpeg 9.x (for demuxing)
     - PyTorch with CUDA support
 
 Supported Codecs:

@@ -37,7 +37,7 @@ class Surface:
         self.pts = pts
 
         self.params = CUVIDPROCPARAMS()
-        memmove(byref(self.params), byref(params), sizeof(CUVIDEOFORMAT))
+        memmove(byref(self.params), byref(params), sizeof(CUVIDPROCPARAMS))
 
         self.params.output_stream = stream
 

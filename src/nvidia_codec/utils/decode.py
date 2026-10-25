@@ -13,8 +13,6 @@ from ..ffmpeg.include.libavutil import (
     AV_NOPTS_VALUE,
     AVColorRange,
     AVColorSpace,
-    AVDISCARD_NONE,
-    AVDISCARD_NONKEY,
 )
 from .compat import av2cuda, extract_stream_ptr
 from ..core.decode import BaseDecoder, Picture, Surface
@@ -100,7 +98,7 @@ class Decoder(BaseDecoder):
         num_pictures: Callable(min_pics) -> int, returns the total number of
             picture slots (must be >= min_pics and <= 32). Higher values allow
             better pipelining between decode and consumer threads.
-            Default: lambda min_pics: min_pics * 2 (double the minimum).
+            Default: lambda min_pics: min_pics + 4.
     """
 
     def __init__(
@@ -242,25 +240,6 @@ class Decoder(BaseDecoder):
         self.with_callbacks(lambda: self.send(None), post_decode=lambda pic: None)
         self._recent.clear()
 
-    def _decode_packets(self, keyframes_only=False):
-        """Read packets from current position, filter, decode.
-
-        Calls self.post_decode(pic) for each frame.
-        """
-        self.track.stream.discard = AVDISCARD_NONKEY if keyframes_only else AVDISCARD_NONE
-        packets = self.track.fc.read_packets(self.track.stream)
-        it = self.bsf.filter(packets, flush=True, reuse=True)
-        self.with_callbacks(lambda: self.send(None), post_decode=lambda pic: None)
-
-        for pkt in it:
-            pts = pkt.av.pts if pkt.av.pts != AV_NOPTS_VALUE else pkt.av.dts
-            arr = np.ctypeslib.as_array(pkt.av.data, (pkt.av.size,))
-            self.send((pts, arr))
-            if keyframes_only:
-                self.bsf.flush()
-                self.send(None)
-        self.send(None)
-
     def _map_and_convert(self, pic, dtype, pixel_format='rgb'):
         """Map a Picture (or OwnedPicture) to a tensor. Frees pic and surface.
         Returns (timedelta, frame) on success, (timedelta, exception) on error.
@@ -268,6 +247,7 @@ class Decoder(BaseDecoder):
         pixel_format='rgb' (default) → (3,H,W) RGB via convert() (color matrix).
         pixel_format='yuv420p' → 1D planar I420 uint8 via to_yuv420p() (no color
         math, half the bytes) — for piping straight to an encoder."""
+        t = None
         try:
             t = self.track.pts2time(pic.pts)
             stream = extract_stream_ptr(torch.cuda.current_stream(self.device))

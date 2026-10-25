@@ -9,7 +9,7 @@ A Pythonic library for NVIDIA Video Codec (NVDEC).
 - Python 3.10+
 - NVIDIA GPU with NVDEC support
 - NVIDIA driver with `libnvcuvid.so`
-- FFmpeg 8.x (for demuxing)
+- FFmpeg 9.x (for demuxing)
 
 ## Installation
 
