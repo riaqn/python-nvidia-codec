@@ -20,6 +20,7 @@ class Player(Decoder):
         target_rect=None,
         device=None,
         track_idx=None,
+        **decoder_kwargs,
     ):
         tracks = [t for t in parse(url) if isinstance(t, VideoTrack)]
         if not tracks:
@@ -38,5 +39,6 @@ class Player(Decoder):
             cropping=cropping,
             target_rect=target_rect,
             device=device,
+            **decoder_kwargs,
         )
         self.url = url

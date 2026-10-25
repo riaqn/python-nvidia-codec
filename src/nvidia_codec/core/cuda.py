@@ -8,7 +8,7 @@ CUcontext = c_void_p
 CUresult = c_int
 cudaError = c_int
 
-CUdeviceptr = c_uint
+CUdeviceptr = c_ulonglong  # CUdeviceptr_v2: unsigned long long
 
 lib = cdll.LoadLibrary('libcuda.so')
 librt = cdll.LoadLibrary('libcudart.so')

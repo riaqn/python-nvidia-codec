@@ -103,7 +103,6 @@ def convert(surface : Surface,
         assert height % 2 == 0
         assert width % 2 == 0
         assert height // 2 * 3 == h
-        assert YUV.dtype == torch.uint8
 
         Y = YUV[:height,:]
         UV = YUV[height:,:]
@@ -134,8 +133,8 @@ def convert(surface : Surface,
     #normalize
     if source_range == AVColorRange.MPEG:
         y = (Y.type(torch.float) - (16 << bit8)) / (220 << bit8)
-        u = (U.type(torch.float) - (128 << bit8)) / (225 << bit8)
-        v = (V.type(torch.float) - (128 << bit8)) / (225 << bit8)
+        u = (U.type(torch.float) - (128 << bit8)) / (224 << bit8)
+        v = (V.type(torch.float) - (128 << bit8)) / (224 << bit8)
     elif source_range == AVColorRange.JPEG:
         y = Y.type(torch.float) / (256 << bit8)
         u = (U.type(torch.float) - (128 << bit8)) / (256 << bit8)

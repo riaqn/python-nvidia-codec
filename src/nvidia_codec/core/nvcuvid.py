@@ -120,23 +120,6 @@ class CUVIDPARSERPARAMS(Structure):
     ]
 CUstream = c_void_p # according to /opt/cuda/include/cuda.h
 CUvideoparser = c_void_p # according to nvcuvid.h
-class CUVIDPROCPARAMS(Structure):
-    _fields_ = [('progressive_frame', c_int),
-                ('second_field', c_int),
-                ('top_field_first', c_int),
-                ('unpaired_field', c_int),
-                ('reserved_flags', c_uint),
-                ('reserved_zero', c_uint),
-                ('raw_input_dptr', c_ulonglong),
-                ('raw_input_pitch', c_uint),
-                ('raw_input_format', c_uint),
-                ('raw_output_dptr', c_ulonglong),
-                ('raw_output_pitch', c_uint),
-                ('Reserved1', c_uint),
-                ('output_stream', CUstream),
-                ('Reserved', c_uint * 46),
-                ('histogram_dptr', POINTER(c_ulonglong)),
-                ('Reserved2', c_void_p*1) ]
 class CUvideopacketflags(Flag):
     ENDOFSTREAM = 1
     TIMESTAMP = auto()

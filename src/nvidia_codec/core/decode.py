@@ -117,7 +117,9 @@ class Surface:
             "strides": strides,
             "version": 3,
             "data": (self.c_devptr.value, False),
-            "stream": self.params.output_stream,
+            # CAI v3 forbids stream 0; CUDA's stream 0 is the legacy
+            # default stream, which the protocol spells as 1.
+            "stream": self.params.output_stream or 1,
         }
 
 

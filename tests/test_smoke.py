@@ -12,6 +12,7 @@ import tempfile
 import pytest
 import torch
 
+from nvidia_codec.core.cuviddec import cudaVideoSurfaceFormat
 from nvidia_codec.utils import Player, parse, VideoTrack
 
 W, H, FPS, SECONDS = 320, 240, 25, 2
@@ -83,6 +84,47 @@ def test_screenshots(clip):
     for _, frame, _ in shots:
         assert not isinstance(frame, Exception), frame
         assert frame.shape == (3, H, W)
+
+
+def _has_encoder(name):
+    out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                         capture_output=True, text=True, timeout=30).stdout
+    return f" {name} " in out
+
+
+@pytest.fixture(scope="module")
+def clip10():
+    if not _has_encoder("libx265"):
+        pytest.skip("ffmpeg lacks libx265")
+    d = tempfile.mkdtemp(prefix="nvc-smoke10-")
+    path = os.path.join(d, "clip10.mp4")
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+         "-i", f"testsrc=size={W}x{H}:rate={FPS}:duration=1",
+         "-pix_fmt", "yuv420p10le", "-c:v", "libx265",
+         "-x265-params", "log-level=none", "-g", "12", path],
+        check=True, timeout=120,
+    )
+    yield path
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def test_10bit_allow_high_matches_8bit(clip10):
+    """P016 (allow_high) and NV12 paths must agree on the same 10-bit source."""
+    with Player(clip10) as p:
+        _, lo = p.screenshot(timedelta(seconds=0.5), torch.float32, accurate=True)
+        assert p.surface_format == cudaVideoSurfaceFormat.NV12
+    with Player(clip10, allow_high=True) as p:
+        _, hi = p.screenshot(timedelta(seconds=0.5), torch.float32, accurate=True)
+        assert p.surface_format == cudaVideoSurfaceFormat.P016
+        assert hi.shape == (3, H, W)
+        assert 0.0 <= hi.min() and hi.max() <= 1.0
+        # yuv420p export is 8-bit only: the error is reported in-band
+        _, r = next(iter(p.frames(torch.uint8, start=timedelta(0),
+                                  pixel_format="yuv420p")))
+        assert isinstance(r, ValueError)
+    # 10-bit rounds to 8-bit at most 1/255 off, plus matrix rounding
+    assert (hi - lo).abs().max() < 0.02
 
 
 if __name__ == "__main__":

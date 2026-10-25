@@ -15,7 +15,7 @@ from ..ffmpeg.include.libavutil import (
     AVColorSpace,
 )
 from .compat import av2cuda, extract_stream_ptr
-from ..core.decode import BaseDecoder, Picture, Surface
+from ..core.decode import BaseDecoder, Picture, Surface, decide_surface_format
 from ..ffmpeg.common import AVException
 from .color import convert, to_yuv420p
 from .demux import VideoTrack
@@ -31,11 +31,21 @@ log = logging.getLogger(__name__)
 
 
 class OwnedSurface:
-    """Wraps a Surface with semaphore ownership. Releases on free."""
+    """Maps a Picture under the decoder's output-surface semaphore.
 
-    def __init__(self, surface):
-        surface.decoder._surface_sem.acquire()
-        self._surface = surface
+    The semaphore (sized to ulNumOutputSurfaces) must be held BEFORE
+    cuvidMapVideoFrame64 runs — two concurrent maps with one output
+    surface would overwrite each other — so the map happens here, not
+    in the caller. free() unmaps and releases.
+    """
+
+    def __init__(self, decoder, pic, stream):
+        decoder._surface_sem.acquire()
+        try:
+            self._surface = decoder.map(pic, stream)
+        except BaseException:
+            decoder._surface_sem.release()
+            raise
 
     def __getattr__(self, name):
         return getattr(self._surface, name)
@@ -81,7 +91,7 @@ class OwnedPicture:
 
     def map(self, stream=0):
         assert self._pic is not None, "Picture already freed"
-        return OwnedSurface(self._decoder.map(self._pic, stream))
+        return OwnedSurface(self._decoder, self._pic, stream)
 
 
 class Decoder(BaseDecoder):
@@ -99,6 +109,9 @@ class Decoder(BaseDecoder):
             picture slots (must be >= min_pics and <= 32). Higher values allow
             better pipelining between decode and consumer threads.
             Default: lambda min_pics: min_pics + 4.
+        allow_high: Keep >8-bit sources at 16 bits (P016 / YUV444_16Bit
+            surfaces) instead of letting NVDEC round them to 8-bit NV12 /
+            YUV444. convert() handles both; to_yuv420p() is 8-bit only.
     """
 
     def __init__(
@@ -109,6 +122,7 @@ class Decoder(BaseDecoder):
         cropping=None,
         target_rect=None,
         device=None,
+        allow_high=False,
     ):
         self.track = track
         self._slot_locks = None  # initialized in decide(), after we know num_pictures
@@ -145,6 +159,10 @@ class Decoder(BaseDecoder):
                 "num_pictures": num_pics,
                 "num_surfaces": 1,
             }
+            if allow_high:
+                d["surface_format"] = decide_surface_format(
+                    p["chroma_format"], p["bit_depth"],
+                    p["supported_surface_formats"], allow_high=True)
             if target_size is not None:
                 d["target_size"] = target_size
             if cropping is not None:
@@ -251,13 +269,12 @@ class Decoder(BaseDecoder):
         try:
             t = self.track.pts2time(pic.pts)
             stream = extract_stream_ptr(torch.cuda.current_stream(self.device))
-            # OwnedPicture carries its own slot+surface ownership (→
-            # OwnedSurface); a bare Picture maps via the decoder (→ plain
-            # Surface). Both expose .free().
+            # Both OwnedPicture (owns its slot) and bare Picture map under
+            # the output-surface semaphore; .free() on either is safe.
             if isinstance(pic, OwnedPicture):
                 surface = pic.map(stream)
             else:
-                surface = self.map(pic, stream)
+                surface = OwnedSurface(self, pic, stream)
         except Exception as e:
             return (t, e)
         finally:
