@@ -273,12 +273,17 @@ class Decoder(BaseDecoder):
         frame we hand back is up to a GOP late. (ffmpeg's CLI papers over this
         with a fixed 3/23 s dts heuristic.)
 
-        Peek at the landing packet; if it isn't a keyframe, back off by a
-        growing number of frame-durations and retry. Landing on an earlier
-        keyframe than strictly needed only costs decode-forward time, so
-        overshooting backwards is safe. The peek consumes a packet, so the
-        final seek re-runs to restore the position. Raises AVException if the
-        container can't seek at all (caller falls back to the in-memory index).
+        Peek at the landing packet; if it isn't a keyframe — OR it is one but
+        its PTS is past the target (dts-space seek with B-frames: a keyframe's
+        dts precedes its pts by video_delay frames, so for a target inside
+        that window the seek picks a keyframe whose first displayed frame is
+        already too late; the on-screen frame belongs to the previous GOP) —
+        back off by a growing number of frame-durations and retry. Landing on
+        an earlier keyframe than strictly needed only costs decode-forward
+        time, so overshooting backwards is safe. The peek consumes a packet,
+        so the final seek re-runs to restore the position. Raises AVException
+        if the container can't seek at all (caller falls back to the
+        in-memory index).
         """
         fc, stream = self.track.fc, self.track.stream
         tb = self.track._time_base
@@ -289,8 +294,11 @@ class Decoder(BaseDecoder):
         for _ in range(max_tries):
             fc.seek_file(stream, ts, min_ts=-(2**63), max_ts=ts)
             first = next(fc.read_packets(stream), None)
-            if first is None or first.av.flags & AV_PKT_FLAG_KEY:
-                break                                # keyframe (or EOF — nothing to fix)
+            if first is None:
+                break                                # EOF — nothing to fix
+            pts_ok = first.av.pts == AV_NOPTS_VALUE or first.av.pts <= target_pts
+            if first.av.flags & AV_PKT_FLAG_KEY and pts_ok:
+                break                                # keyframe that displays at/before target
             landed = first.av.dts if first.av.dts != AV_NOPTS_VALUE else first.av.pts
             if landed == AV_NOPTS_VALUE:
                 break                                # can't reason about position

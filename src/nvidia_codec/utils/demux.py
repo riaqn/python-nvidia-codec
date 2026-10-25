@@ -246,7 +246,12 @@ class VideoTrack:
         return default if r == AVColorRange.UNSPECIFIED else r
 
     def time2pts(self, time: timedelta):
-        return int(time.total_seconds() / self._time_base) + self._start_time
+        """timedelta -> track pts (floor). Exact rational arithmetic: timedelta has
+        microsecond resolution, so 1.16 s is 1160000 us and lands on pts 14848 in a
+        1/12800 base; via float it is 14847.999... and int() would floor to the
+        PREVIOUS frame for any target exactly on a frame boundary."""
+        us = time // timedelta(microseconds=1)
+        return int(Fraction(us, 1_000_000) / self._time_base) + self._start_time
 
     def pts2time(self, pts: int):
         if pts == AV_NOPTS_VALUE:

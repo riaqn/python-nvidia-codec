@@ -133,8 +133,31 @@ def test_mpegts_start_time_and_first_gop(clip):
             assert abs(t.total_seconds() - 1.0) < 1 / FPS + 1e-3
             pts0, _ = next(iter(p.frames(torch.uint8, start=timedelta(seconds=1))))
             assert abs(p.track.pts2time(pts0).total_seconds() - 1.0) < 1 / FPS + 1e-3
+            # DTS-vs-PTS window: with B-frames the GOP-2 keyframe (pts 0.96 s) has
+            # dts ~0.88 s. A target in between must still yield the previous GOP's
+            # frame, not the keyframe (which displays after the target).
+            for target in (0.90, 0.94):
+                expect = int(target * FPS + 1e-6) / FPS
+                t, _ = p.screenshot(timedelta(seconds=target), torch.uint8, accurate=True)
+                assert abs(t.total_seconds() - expect) < 1e-3, (target, t)
+                pts0, _ = next(iter(p.frames(torch.uint8, start=timedelta(seconds=target))))
+                assert abs(p.track.pts2time(pts0).total_seconds() - expect) < 1e-3, (target, pts0)
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def test_time2pts_exact_on_frame_boundaries(clip):
+    """time2pts must not floor a target that is exactly on a frame boundary to
+    the previous frame (float 1.16 * 12800 = 14847.999...)."""
+    with Player(clip) as p:
+        tb = p.track._time_base
+        for i in range(FPS * SECONDS):
+            td = timedelta(seconds=i / FPS)
+            expect = int(round(float(td.total_seconds() / tb))) + p.track._start_time
+            assert p.track.time2pts(td) == expect, i
+        # between two frames the pts lands strictly between their pts values
+        a, b = p.track.time2pts(timedelta(seconds=1.16)), p.track.time2pts(timedelta(seconds=1.20))
+        assert a < p.track.time2pts(timedelta(seconds=1.17)) < b
 
 
 def test_pixel_format_enum_values():
